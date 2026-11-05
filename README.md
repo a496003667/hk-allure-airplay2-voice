@@ -1,8 +1,8 @@
+**简体中文** | [English](README.en.md)
+
 # Harman Kardon Allure：AirPlay 2 + 本机语音助手改造
 
 给 Harman Kardon Allure（Alexa 版智能音箱）加上 **AirPlay 2**，并用一套**跑在音箱本机**的中文语音助手替换已停用的 Alexa。原厂灯效、实体按键、音量环都接回到了新功能上。
-
-> English summary: adds AirPlay 2 (patched Shairport Sync 5.6 + NQPTP) to a Harman Kardon Allure smart speaker, wires the stock light ring, buttons and volume ring to it, and replaces Alexa with an on-device Chinese voice assistant (stock wake word → Baidu ASR → ModelScope Qwen → Baidu TTS). Root access to the speaker is required and not covered here.
 
 ## ⚠️ 风险提示
 
@@ -52,7 +52,7 @@ docs/       技术笔记与踩坑记录
 
 1. 把各模块放到 `/vendor/airplay2`、`/vendor/hk-lights`、`/vendor/hk-keys`、`/vendor/hk-voice`、`/vendor/hk-debloat`，启动脚本放到 `/etc/init.d/`。
 2. 改 `airplay2/shairport-sync.conf` 里的 `airplay_device_id`，填你音箱 wlan0 的 MAC。
-3. 语音助手：把 `voice/voice.conf.example` 复制成 `/vendor/hk-voice/voice.conf`（权限 600），填入百度语音（短语音识别 + 语音合成）和魔搭 API-Inference 的 key；运行 `hk-voice check` 检查；`hk-voice mkclips` 生成离线提示音。
+3. 语音助手：把 `voice/voice.conf.example` 复制成 `/vendor/hk-voice/voice.conf`（权限 600），填入百度语音（短语音识别 + 语音合成）和魔搭 API-Inference 的 key；运行 `hk-voice check` 检查；`hk-voice mkclips` 生成离线提示音。以后换 key 用 `voice/update-voice-keys.sh`（把 `HK_PUT` / `HK_SHELL` 设成你自己连接音箱的方式）。
 4. 设备上的 CA 证书很旧，访问 open-meteo 需要额外的 ISRG Root X1/X2 根证书，合并成 `/vendor/hk-voice/ca.pem`。
 5. 已经被 bind mount 的 AirPlay 文件**不要直接覆盖**，先上传为 `<文件>.new`，再用 `airplay2/hk-ap2-replace.sh <文件>…` 替换（先停、卸载、安装、启动，失败自动回滚）。`hk-ap2-prodctl` 会校验各文件的 SHA1，改动后要同步更新里面的哈希。
 6. 关掉某个功能：`touch /vendor/<模块>/disable`。

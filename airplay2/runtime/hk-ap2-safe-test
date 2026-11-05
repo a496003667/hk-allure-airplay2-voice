@@ -1,0 +1,454 @@
+#!/bin/sh
+
+# Controlled AP2 real-output test harness.
+#
+# The speaker is kept muted until shairport calls the audio hook.  A separate
+# watchdog process owns a hard mute deadline and remains latched after a trip,
+# so a broken or blocked shairport hook cannot leave the speaker enabled.
+
+set -u
+
+ROOT=${HK_AP2_ROOT:-/tmp/hk-ap2/opt}
+RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
+SAFE="$RUN/safe"
+AP2CTL="$ROOT/bin/hk-ap2ctl"
+AMIXER=${HK_AP2_AMIXER:-/system/workdir/bin/amixer}
+AMIXER_LIB=${HK_AP2_AMIXER_LIB:-/system/workdir/lib}
+MASTER_SAFE=${HK_AP2_MASTER_SAFE:-4}
+DIGITAL_SAFE=${HK_AP2_DIGITAL_SAFE:-128}
+PLAYBACK_SAFE=${HK_AP2_PLAYBACK_SAFE:-0}
+MAX_PLAY_SECONDS=${HK_AP2_MAX_PLAY_SECONDS:-12}
+WATCHDOG_OOM_SCORE_ADJ=${HK_AP2_WATCHDOG_OOM_SCORE_ADJ:-500}
+
+mkdir -p "$SAFE"
+
+now() {
+    # /proc/uptime is monotonic, so NTP corrections cannot extend a lease.
+    cut -d. -f1 /proc/uptime 2>/dev/null || echo 0
+}
+
+log_action() {
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
+        >>"$SAFE/actions.log" 2>/dev/null || true
+}
+
+read_file() {
+    [ -f "$1" ] && sed -n '1p' "$1" 2>/dev/null || true
+}
+
+write_file() {
+    printf '%s\n' "$2" >"$1.tmp" 2>/dev/null &&
+        mv "$1.tmp" "$1" 2>/dev/null
+}
+
+mixer_set() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "$1" "$2" \
+        >/dev/null 2>&1
+}
+
+mixer_cset() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cset "numid=$1" "$2" \
+        >/dev/null 2>&1
+}
+
+mixer_master() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sget "Master" 2>/dev/null |
+        sed -n 's/.*Front Left: \([0-9][0-9]*\).*/\1/p' |
+        sed -n '1p'
+}
+
+mixer_values() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cget "numid=$1" \
+        2>/dev/null |
+        sed -n 's/^[[:space:]]*: values=//p' |
+        tail -n 1
+}
+
+switch_state() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sget "$1" 2>/dev/null |
+        sed -n 's/.*\[\(on\|off\)\].*/\1/p' |
+        sed -n '1p'
+}
+
+hard_mute() {
+    # Keep several independent layers muted.  The speaker switch and I2S gate
+    # are stock hardware controls; Master=0 is an additional safety layer.
+    mixer_cset 1 0,0 || true
+    mixer_cset 2 0,0 || true
+    mixer_set "Ext Spk" off || true
+    mixer_set "Digital" off || true
+    mixer_set "aml audio i2s mute" on || true
+    mixer_set "Master" 0 || true
+}
+
+safe_baseline() {
+    # Leave the speaker physically off while making the digital path ready for
+    # a later test.  The watchdog or audio hook opens it only after arming.
+    mixer_cset 1 "$DIGITAL_SAFE,$DIGITAL_SAFE" || true
+    mixer_cset 2 "$PLAYBACK_SAFE,$PLAYBACK_SAFE" || true
+    mixer_set "Ext Spk" off || true
+    mixer_set "aml audio i2s mute" on || true
+    mixer_set "Digital" on || true
+    mixer_set "Master" "$MASTER_SAFE" || true
+}
+
+watchdog_pid() {
+    read_file "$SAFE/watchdog.pid"
+}
+
+watchdog_alive() {
+    pid=$(watchdog_pid)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    heartbeat=$(read_file "$SAFE/watchdog.heartbeat")
+    [ -n "$heartbeat" ] || return 1
+    current=$(now)
+    [ $((current - heartbeat)) -le 4 ]
+}
+
+wait_watchdog_ready() {
+    tries=0
+    while [ "$tries" -lt 8 ]; do
+        if watchdog_alive; then
+            return 0
+        fi
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+start_watchdog() {
+    if watchdog_alive; then
+        echo "watchdog already running: $(watchdog_pid)" >&2
+        return 1
+    fi
+
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat" "$SAFE/deadline"
+    : >"$SAFE/watchdog.log"
+    nohup setsid "$0" __watchdog </dev/null >>"$SAFE/watchdog.log" 2>&1 &
+    if ! wait_watchdog_ready; then
+        echo "watchdog failed to start" >&2
+        tail -30 "$SAFE/watchdog.log" >&2 2>/dev/null || true
+        return 1
+    fi
+    log_action "watchdog started pid=$(watchdog_pid) max_play=${MAX_PLAY_SECONDS}s master=${MASTER_SAFE}"
+}
+
+stop_watchdog() {
+    pid=$(watchdog_pid)
+    [ -n "$pid" ] || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    tries=0
+    while [ "$tries" -lt 8 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        tries=$((tries + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat"
+}
+
+watchdog_loop() {
+    printf '%s\n' "$$" >"$SAFE/watchdog.pid"
+    echo "$WATCHDOG_OOM_SCORE_ADJ" >"/proc/$$/oom_score_adj" 2>/dev/null || true
+    printf '%s\n' "$(now)" >"$SAFE/watchdog.heartbeat"
+    log_action "watchdog loop started pid=$$"
+
+    deadline=
+    last_marker=
+    while [ -f "$SAFE/armed" ]; do
+        current=$(now)
+        printf '%s\n' "$current" >"$SAFE/watchdog.heartbeat.tmp" 2>/dev/null &&
+            mv "$SAFE/watchdog.heartbeat.tmp" "$SAFE/watchdog.heartbeat" 2>/dev/null || true
+
+        marker=$(read_file "$SAFE/play.started")
+        if [ -f "$SAFE/tripped" ]; then
+            hard_mute
+            sleep 1
+            continue
+        fi
+
+        if [ -n "$marker" ] && [ "$marker" != "$last_marker" ]; then
+            last_marker=$marker
+            if [ "$MAX_PLAY_SECONDS" -gt 0 ]; then
+                deadline=$((marker + MAX_PLAY_SECONDS))
+                write_file "$SAFE/deadline" "$deadline" || true
+                log_action "playback lease started marker=$marker deadline=$deadline"
+            else
+                deadline=
+                rm -f "$SAFE/deadline"
+                log_action "playback lease started marker=$marker (unlimited)"
+            fi
+        fi
+
+        if [ -n "$deadline" ] && [ "$current" -ge "$deadline" ]; then
+            write_file "$SAFE/tripped" "watchdog deadline exceeded" || true
+            rm -f "$SAFE/play.started"
+            hard_mute
+            log_action "watchdog tripped: hard mute"
+            deadline=
+            sleep 1
+            continue
+        fi
+
+        if [ -z "$marker" ]; then
+            # No active playback lease: keep the output path physically muted.
+            mixer_set "Ext Spk" off || true
+            mixer_set "Digital" off || true
+            mixer_set "aml audio i2s mute" on || true
+            mixer_set "Master" 0 || true
+            deadline=
+            last_marker=
+        else
+            shairport_pid=$(read_file "$RUN/shairport.pid")
+            if [ -z "$shairport_pid" ] || ! kill -0 "$shairport_pid" 2>/dev/null; then
+                rm -f "$SAFE/play.started"
+                hard_mute
+                deadline=
+                last_marker=
+                log_action "AP2 stream process ended; hard mute"
+                sleep 1
+                continue
+            fi
+            master=$(mixer_master)
+            case "$master" in
+                ''|*[!0-9]*)
+                    write_file "$SAFE/tripped" "invalid Master reading" || true
+                    rm -f "$SAFE/play.started"
+                    hard_mute
+                    log_action "watchdog tripped: invalid Master"
+                    deadline=
+                    sleep 1
+                    continue
+                    ;;
+                *)
+                    if [ "$master" -gt "$MASTER_SAFE" ]; then
+                        mixer_set "Master" "$MASTER_SAFE" || true
+                        log_action "watchdog clamped Master from $master to $MASTER_SAFE"
+                    fi
+                    ;;
+            esac
+
+            digital="$(mixer_values 1)"
+            digital_left="${digital%%,*}"
+            digital_right="${digital#*,}"
+            case "$digital_left:$digital_right" in
+                *[!0-9:]*|:|*:)
+                    write_file "$SAFE/tripped" "invalid digital volume reading" || true
+                    rm -f "$SAFE/play.started"
+                    hard_mute
+                    log_action "watchdog tripped: invalid digital volume"
+                    deadline=
+                    sleep 1
+                    continue
+                    ;;
+                *)
+                    if [ "$digital_left" -gt "$DIGITAL_SAFE" ] ||
+                        [ "$digital_right" -gt "$DIGITAL_SAFE" ]; then
+                        mixer_cset 1 "$DIGITAL_SAFE,$DIGITAL_SAFE" || true
+                        log_action "watchdog clamped Digital Playback Volume to $DIGITAL_SAFE"
+                    fi
+                    ;;
+            esac
+
+            playback="$(mixer_values 2)"
+            playback_safe="$PLAYBACK_SAFE,$PLAYBACK_SAFE"
+            if [ "$playback" != "$playback_safe" ]; then
+                mixer_cset 2 "$playback_safe" || true
+                log_action "watchdog restored Playback Volume to $playback_safe"
+            fi
+        fi
+        sleep 1
+    done
+
+    hard_mute
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat" "$SAFE/deadline"
+    log_action "watchdog loop stopped"
+}
+
+status() {
+    mode=$(read_file "$RUN/mode")
+    [ -n "$mode" ] || mode="stopped"
+    echo "AP2 mode: $mode"
+    if [ -f "$SAFE/armed" ]; then
+        echo "armed: yes"
+    else
+        echo "armed: no"
+    fi
+    if watchdog_alive; then
+        echo "watchdog: running pid=$(watchdog_pid)"
+    else
+        echo "watchdog: not running"
+    fi
+    [ -f "$SAFE/play.started" ] &&
+        echo "play lease: $(read_file "$SAFE/play.started")" ||
+        echo "play lease: none"
+    [ -f "$SAFE/deadline" ] &&
+        echo "hard-mute deadline: $(read_file "$SAFE/deadline")" ||
+        echo "hard-mute deadline: none"
+    [ -f "$SAFE/tripped" ] &&
+        echo "tripped: $(read_file "$SAFE/tripped")" ||
+        echo "tripped: no"
+    echo "Master: $(mixer_master)"
+    echo "Digital Playback Volume: $(mixer_values 1)"
+    echo "Playback Volume: $(mixer_values 2)"
+    echo "Ext Spk: $(switch_state 'Ext Spk')"
+    echo "Digital: $(switch_state 'Digital')"
+    echo "I2S mute: $(switch_state 'aml audio i2s mute')"
+}
+
+arm() {
+    if [ -f "$SAFE/armed" ] || watchdog_alive; then
+        echo "safe test is already armed" >&2
+        return 1
+    fi
+    if [ -f "$SAFE/tripped" ]; then
+        echo "previous watchdog trip is latched; disarm first" >&2
+        return 1
+    fi
+
+    echo "stopping current AP2 instance"
+    "$AP2CTL" stop >/dev/null 2>&1 || true
+    hard_mute
+    safe_baseline
+    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    : >"$SAFE/armed"
+
+    if ! start_watchdog; then
+        rm -f "$SAFE/armed"
+        hard_mute
+        return 1
+    fi
+
+    if ! "$AP2CTL" start real; then
+        echo "real AP2 failed to start; disarming" >&2
+        rm -f "$SAFE/armed"
+        stop_watchdog
+        hard_mute
+        safe_baseline
+        return 1
+    fi
+
+    log_action "safe test armed"
+    echo "SAFE TEST ARMED"
+    echo "speaker remains off until playback begins"
+    echo "max playback: ${MAX_PLAY_SECONDS}s, Master cap: ${MASTER_SAFE}/32"
+    echo "digital cap: ${DIGITAL_SAFE}/255, playback attenuation: ${PLAYBACK_SAFE} (-6 dB when 0)"
+    echo "AP2 source volume is independently capped at -12 dB by shairport-sync"
+    echo "run '$0 status' before testing and '$0 disarm' afterwards"
+}
+
+disarm() {
+    rm -f "$SAFE/armed"
+    "$AP2CTL" stop >/dev/null 2>&1 || true
+    hard_mute
+    stop_watchdog
+    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    safe_baseline
+    log_action "safe test disarmed"
+    echo "AP2 stopped; output hard-muted; safe baseline restored"
+}
+
+mute_now() {
+    hard_mute
+    write_file "$SAFE/tripped" "manual mute" || true
+    rm -f "$SAFE/play.started" "$SAFE/deadline"
+    log_action "manual hard mute"
+    echo "output hard-muted"
+}
+
+selftest() {
+    if [ "$(read_file "$RUN/mode")" = "real" ]; then
+        echo "refusing selftest while real AP2 is active" >&2
+        return 1
+    fi
+    cleanup_selftest_process() {
+        if [ -n "${selftest_pid:-}" ]; then
+            kill "$selftest_pid" 2>/dev/null || true
+            wait "$selftest_pid" 2>/dev/null || true
+        fi
+        rm -f "$RUN/shairport.pid"
+    }
+
+    echo "running non-audio watchdog selftest"
+    hard_mute
+    safe_baseline
+    rm -f "$SAFE/armed" "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$RUN/shairport.pid"
+    sleep 10 >/dev/null 2>&1 &
+    selftest_pid=$!
+    write_file "$RUN/shairport.pid" "$selftest_pid" || {
+        cleanup_selftest_process
+        hard_mute
+        safe_baseline
+        return 1
+    }
+    : >"$SAFE/armed"
+    # Keep the self-test short while exercising the same watchdog path.
+    MAX_PLAY_SECONDS=1
+    export HK_AP2_MAX_PLAY_SECONDS=1
+    if ! start_watchdog; then
+        rm -f "$SAFE/armed"
+        cleanup_selftest_process
+        hard_mute
+        safe_baseline
+        return 1
+    fi
+    # This marker is intentionally not accompanied by opening the speaker.
+    write_file "$SAFE/play.started" "$(now)" || true
+    sleep 2
+    if [ -f "$SAFE/tripped" ] &&
+        [ "$(switch_state 'Ext Spk')" = "off" ] &&
+        [ "$(switch_state 'aml audio i2s mute')" = "on" ]; then
+        rm -f "$SAFE/armed"
+        stop_watchdog
+        cleanup_selftest_process
+        hard_mute
+        safe_baseline
+        rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+        log_action "watchdog selftest passed"
+        echo "watchdog selftest: PASS (speaker never enabled)"
+        return 0
+    fi
+    rm -f "$SAFE/armed"
+    stop_watchdog
+    cleanup_selftest_process
+    hard_mute
+    safe_baseline
+    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    log_action "watchdog selftest failed"
+    echo "watchdog selftest: FAIL" >&2
+    return 1
+}
+
+case "${1:-status}" in
+    __watchdog)
+        watchdog_loop
+        ;;
+    arm)
+        arm
+        ;;
+    disarm)
+        disarm
+        ;;
+    mute)
+        mute_now
+        ;;
+    selftest)
+        selftest
+        ;;
+    baseline)
+        safe_baseline
+        echo "safe baseline restored (speaker remains off)"
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "usage: $0 {arm|disarm|mute|selftest|baseline|status}" >&2
+        exit 2
+        ;;
+esac

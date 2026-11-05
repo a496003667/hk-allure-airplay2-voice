@@ -1,0 +1,11 @@
+# /vendor/hk-voice/voice.conf  (chmod 600; never commit real keys)
+BAIDU_API_KEY=your-baidu-api-key
+BAIDU_SECRET_KEY=your-baidu-secret-key
+MODELSCOPE_KEY=your-modelscope-key
+# Baidu TTS voice (4189 = natural female voice; 0 = basic)
+TTS_PER=4189
+# Optional:
+# MODEL=Qwen/Qwen3.8-Flash-Next
+# WEATHER_CITY=auto        # or a city name, e.g. 北京
+# GAIN_REF_DB=-20          # reply level at stock volume 25
+# SILICONFLOW_KEY=...      # optional SenseVoice ASR (disabled by default)

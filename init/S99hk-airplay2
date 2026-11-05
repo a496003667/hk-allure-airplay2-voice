@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# Start the optional AirPlay 2 controller in the background. It verifies all
+# runtime files and refuses to start when memory or volume checks fail.
+case "${1:-start}" in
+    start)
+        if [ -x /vendor/airplay2/hk-ap2-prodctl ]; then
+            /vendor/airplay2/hk-ap2-prodctl start >/dev/null 2>&1
+        fi
+        ;;
+    stop)
+        if [ -x /vendor/airplay2/hk-ap2-prodctl ]; then
+            /vendor/airplay2/hk-ap2-prodctl stop >/dev/null 2>&1
+        fi
+        ;;
+esac
+exit 0

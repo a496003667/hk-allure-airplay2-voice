@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# Route the physical volume/play keys to a connected AirPlay 2 sender.
+# The boot helper waits for the AP2 watchdog before touching mv_ioguard.
+# touch /vendor/hk-keys/disable to skip.
+case "${1:-start}" in
+    start)
+        if [ -x /vendor/hk-keys/hk-mv-keys-boot.sh ]; then
+            /vendor/hk-keys/hk-mv-keys-boot.sh </dev/null >/dev/null 2>&1 &
+        fi
+        ;;
+esac
+exit 0

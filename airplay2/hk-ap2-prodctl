@@ -1,0 +1,574 @@
+#!/bin/sh
+
+# Persistent controller for the optional AirPlay 2 runtime.
+# With $AP256_DIR present it also bind-mounts Shairport Sync 5.6, NQPTP
+# smi11 and the 5.6 config over the 4.3.6 runtime and uses the 5.6 runtime
+# controller (which also runs the loopback MQTT broker for remote control).
+# "touch $AP256_DIR/disable" selects plain 4.3.6.  If 5.6 fails to arm, the
+# supervisor falls back to 4.3.6 until the next reboot ($AP256_FALLBACK).
+# The verified runtime is a read-only cramfs image on /vendor.  Only sockets,
+# PID files and small bounded logs are kept in writable tmpfs directories.
+
+set -u
+
+BASE=${HK_AP2_BASE:-/vendor/airplay2}
+IMAGE="$BASE/hk-ap2-runtime.cramfs"
+EXPECTED_SHA256=26b5343b343f459f9b0fd05982ab00496beca77abea93997eeb3da05194d72b8
+INIT_SCRIPT=/etc/init.d/S99hk-airplay2
+INIT_SOURCE="$BASE/S99hk-airplay2"
+RUNDIR=/tmp/hk-ap2
+OPT="$RUNDIR/opt"
+RUN="$RUNDIR/run"
+SAFE_TEST="$OPT/bin/hk-ap2-safe-test"
+AP2CTL="$OPT/bin/hk-ap2ctl"
+AP256_DIR="$BASE/ap2-56"
+AP256_FALLBACK=/tmp/hk-ap2-56.fallback
+AP2CTL_OVERRIDE_436="$BASE/hk-ap2ctl.ap2info"
+AP2CTL_OVERRIDE_436_SHA1=a3cb6e37e236697b31fcf693343ed5df9f72a015
+AP2CTL_OVERRIDE_256="$BASE/hk-ap2ctl.ap256"
+AP2CTL_OVERRIDE_256_SHA1=eb88d61271ebaaa740c3d0a9996acce9cb049076
+AUDIO_HOOK="$OPT/hk-ap2-audio-hook.sh"
+AUDIO_HOOK_OVERRIDE="$BASE/hk-ap2-audio-hook.sh"
+INFO_SHIM="$BASE/libhk-ap2-info-shim-soft.so"
+INFO_SHIM_SHA1=78ab5f7782414b9e33154d6d6ead71c2bd2cc05a
+SPS56_SHA1=329a56eec5f521a6eeda67f5131da5b8d0a1340f
+NQPTP56_SHA1=ea5785e47f215cc9d89192a653aa616e3fb0e4f1
+CONF56_SHA1=657a86a6e5a47f3ca6e34f9d528f5e3d3c932cda
+AUDIO_HOOK_OVERRIDE_SHA1=efb833b14b5a395371139fd11c7ad0020f16c613
+REQUEST="$OPT/bin/hk-unix-request-raw"
+MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-34816}
+PLAYER_SOCKET=/tmp/Requesta01controller
+PIDFILE=/tmp/hk-ap2-supervisor.pid
+STOPFILE=/tmp/hk-ap2-supervisor.stop
+LOG=/tmp/hk-ap2-supervisor.log
+AMIXER=/system/workdir/bin/amixer
+AMIXER_LIB=/system/workdir/lib
+
+export HK_AP2_USE_STOCK_PA=1
+export HK_AP2_MASTER_SAFE=4
+export HK_AP2_DIGITAL_SAFE=192
+export HK_AP2_PLAYBACK_SAFE=1
+export HK_AP2_MAX_PLAY_SECONDS=0
+# This kernel kills processes at oom_score_adj >= 12 when the 64 MiB LMK
+# threshold is crossed, even though ample page cache is reclaimable.  Keep all
+# optional AP2 helpers immediately below that tier so normal playback survives,
+# while still leaving them killable before the stock adj=0 services.
+export HK_AP2_OOM_SCORE_ADJ=11
+export HK_AP2_WATCHDOG_OOM_SCORE_ADJ=11
+export HK_AP2_GUARD_OOM_SCORE_ADJ=11
+export HK_AP2_MIN_RUN_FREE_KIB=4096
+export HK_AP2_MIN_AVAILABLE_RUN_KIB=32768
+
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*"
+}
+
+free_kib() {
+    awk '/^MemFree:/ {print $2; exit}' /proc/meminfo 2>/dev/null
+}
+
+supervisor_pid() {
+    cat "$PIDFILE" 2>/dev/null || true
+}
+
+supervisor_alive() {
+    pid=$(supervisor_pid)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null
+}
+
+hard_mute_raw() {
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cset numid=1 0,0 \
+        >/dev/null 2>&1 || true
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cset numid=2 0,0 \
+        >/dev/null 2>&1 || true
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "Ext Spk" off \
+        >/dev/null 2>&1 || true
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "Digital" off \
+        >/dev/null 2>&1 || true
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 \
+        sset "aml audio i2s mute" on >/dev/null 2>&1 || true
+    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "Master" 0 \
+        >/dev/null 2>&1 || true
+}
+
+stop_ap2() {
+    if [ -x "$SAFE_TEST" ]; then
+        "$SAFE_TEST" disarm >/dev/null 2>&1 || true
+    elif [ -x "$AP2CTL" ]; then
+        "$AP2CTL" stop >/dev/null 2>&1 || true
+    fi
+    hard_mute_raw
+}
+
+runtime_mounted() {
+    while read -r _device mountpoint fstype options _rest; do
+        if [ "$mountpoint" = "$OPT" ] &&
+            [ "$fstype" = "cramfs" ] &&
+            printf '%s\n' ",$options," | grep -q ',ro,'; then
+            return 0
+        fi
+    done </proc/mounts
+    return 1
+}
+
+bind_mounted_at() {
+    awk -v path="$1" '$2 == path { found = 1 } END { exit !found }' /proc/mounts
+}
+
+ensure_verified_bind_mount() {
+    target_path=$1
+    source_path=$2
+    expected_sha1=$3
+    label=$4
+
+    [ -r "$source_path" ] || {
+        log "missing $label override: $source_path"
+        return 1
+    }
+    actual_sha1=$(sha1sum "$source_path" 2>/dev/null | awk '{print $1}')
+    [ "$actual_sha1" = "$expected_sha1" ] || {
+        log "$label override checksum mismatch: ${actual_sha1:-missing}"
+        return 1
+    }
+
+    if bind_mounted_at "$target_path"; then
+        current_sha1=$(sha1sum "$target_path" 2>/dev/null | awk '{print $1}')
+        [ "$current_sha1" = "$expected_sha1" ] && return 0
+        umount "$target_path" >/dev/null 2>&1 || {
+            log "failed to replace stale $label override"
+            return 1
+        }
+    fi
+
+    if ! mount --bind "$source_path" "$target_path"; then
+        log "failed to bind-mount $label override"
+        return 1
+    fi
+    current_sha1=$(sha1sum "$target_path" 2>/dev/null | awk '{print $1}')
+    [ "$current_sha1" = "$expected_sha1" ] || {
+        umount "$target_path" >/dev/null 2>&1 || true
+        log "$label override verification failed"
+        return 1
+    }
+    log "$label override mounted"
+}
+
+use_ap256() {
+    [ ! -f "$AP256_DIR/disable" ] && [ ! -f "$AP256_FALLBACK" ] &&
+        [ -x "$AP2CTL_OVERRIDE_256" ] && [ -x "$AP256_DIR/shairport-sync" ] &&
+        [ -x "$AP256_DIR/nqptp" ] && [ -r "$AP256_DIR/shairport-sync.conf" ]
+}
+
+select_runtime_controller() {
+    if use_ap256; then
+        AP2CTL_OVERRIDE=$AP2CTL_OVERRIDE_256
+        AP2CTL_OVERRIDE_SHA1=$AP2CTL_OVERRIDE_256_SHA1
+    else
+        AP2CTL_OVERRIDE=$AP2CTL_OVERRIDE_436
+        AP2CTL_OVERRIDE_SHA1=$AP2CTL_OVERRIDE_436_SHA1
+    fi
+}
+
+ensure_runtime_override() {
+    select_runtime_controller
+    if [ ! -x "$AP2CTL_OVERRIDE" ]; then
+        log "missing runtime controller override: $AP2CTL_OVERRIDE"
+        return 1
+    fi
+    if [ ! -x "$AUDIO_HOOK_OVERRIDE" ]; then
+        log "missing audio hook override: $AUDIO_HOOK_OVERRIDE"
+        return 1
+    fi
+    if [ ! -r "$INFO_SHIM" ]; then
+        log "missing volume capability shim: $INFO_SHIM"
+        return 1
+    fi
+
+    shim_sha1=$(sha1sum "$INFO_SHIM" 2>/dev/null | awk '{print $1}')
+    [ "$shim_sha1" = "$INFO_SHIM_SHA1" ] || {
+        log "volume capability shim checksum mismatch: ${shim_sha1:-missing}"
+        return 1
+    }
+    grep -q 'HK_AP2_INFO_SHIM' "$AP2CTL_OVERRIDE" || {
+        log "runtime controller override does not contain the shim hook"
+        return 1
+    }
+
+    ensure_verified_bind_mount "$AP2CTL" "$AP2CTL_OVERRIDE" \
+        "$AP2CTL_OVERRIDE_SHA1" "runtime controller" || return 1
+    ensure_verified_bind_mount "$AUDIO_HOOK" "$AUDIO_HOOK_OVERRIDE" \
+        "$AUDIO_HOOK_OVERRIDE_SHA1" "audio hook" || return 1
+    use_ap256 || return 0
+    ensure_verified_bind_mount "$OPT/bin/shairport-sync" "$AP256_DIR/shairport-sync" \
+        "$SPS56_SHA1" "shairport 5.6" || return 1
+    ensure_verified_bind_mount "$OPT/bin/nqptp" "$AP256_DIR/nqptp" \
+        "$NQPTP56_SHA1" "nqptp smi11" || return 1
+    ensure_verified_bind_mount "$OPT/etc/ap2/shairport-sync.conf" \
+        "$AP256_DIR/shairport-sync.conf" "$CONF56_SHA1" "shairport 5.6 config" || return 1
+}
+
+verify_runtime_files() {
+    for file in "$SAFE_TEST" "$AP2CTL" "$REQUEST"; do
+        if [ ! -x "$file" ]; then
+            log "runtime file is missing or not executable: $file"
+            return 1
+        fi
+    done
+}
+
+mount_runtime() {
+    if runtime_mounted; then
+        verify_runtime_files || return 1
+        ensure_runtime_override || return 1
+        return
+    fi
+
+    [ -s "$IMAGE" ] || {
+        log "missing runtime image: $IMAGE"
+        return 1
+    }
+    actual=$(sha256sum "$IMAGE" 2>/dev/null | awk '{print $1}')
+    [ "$actual" = "$EXPECTED_SHA256" ] || {
+        log "runtime image checksum mismatch: ${actual:-missing}"
+        return 1
+    }
+
+    free=$(free_kib)
+    case "$free" in
+        ''|*[!0-9]*) free=0 ;;
+    esac
+    if [ "$free" -lt "$MIN_START_FREE_KIB" ]; then
+        log "refusing AP2 start: MemFree=${free}KiB, need=${MIN_START_FREE_KIB}KiB"
+        return 1
+    fi
+
+    # This path belongs only to the optional runtime.  Remove files left by
+    # the previous unpack-to-tmpfs implementation before covering it with the
+    # read-only image.
+    rm -rf "$OPT"
+    mkdir -p "$OPT" "$RUN" || return 1
+    if ! mount -t cramfs -o loop,ro "$IMAGE" "$OPT"; then
+        log "cramfs runtime mount failed"
+        return 1
+    fi
+    if ! runtime_mounted || ! verify_runtime_files; then
+        umount "$OPT" >/dev/null 2>&1 || true
+        log "cramfs runtime verification failed"
+        return 1
+    fi
+    if ! ensure_runtime_override; then
+        umount "$OPT" >/dev/null 2>&1 || true
+        log "runtime is mounted but the controller override is unavailable"
+        return 1
+    fi
+    log "runtime mounted read-only, MemFree=$(free_kib)KiB"
+}
+
+unmount_runtime() {
+    unmount_failed=0
+    for target_path in "$OPT/etc/ap2/shairport-sync.conf" "$OPT/bin/nqptp" \
+        "$OPT/bin/shairport-sync" "$AUDIO_HOOK" "$AP2CTL"; do
+        if bind_mounted_at "$target_path"; then
+            if umount "$target_path"; then
+                log "$target_path override unmounted"
+            else
+                log "$target_path override unmount failed"
+                unmount_failed=1
+            fi
+        fi
+    done
+    [ "$unmount_failed" -eq 0 ] || return 1
+    if ! runtime_mounted; then
+        return 0
+    fi
+    if umount "$OPT"; then
+        log "runtime unmounted"
+        return 0
+    fi
+    log "runtime unmount failed"
+    return 1
+}
+
+wait_for_network() {
+    tries=0
+    while [ "$tries" -lt 120 ]; do
+        if ip -4 addr show dev wlan0 2>/dev/null | grep -q "inet "; then
+            return 0
+        fi
+        sleep 2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+wait_for_stock_player() {
+    tries=0
+    while [ "$tries" -lt 60 ]; do
+        [ -S "$PLAYER_SOCKET" ] && return 0
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+stock_status() {
+    [ -x "$REQUEST" ] || return 1
+    [ -S "$PLAYER_SOCKET" ] || return 1
+    "$REQUEST" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null
+}
+
+stock_value() {
+    key=$1
+    stock_status |
+        sed -n "s/.*\"$key\":\"\([0-9][0-9]*\)\".*/\1/p" |
+        sed -n '1p'
+}
+
+check_stock_safety() {
+    volume=$(stock_value vol)
+    case "$volume" in
+        ''|*[!0-9]*)
+            log "stock player volume is unavailable"
+            return 1
+            ;;
+    esac
+    if [ "$volume" -gt 30 ]; then
+        log "stock player volume $volume exceeds safety cap 30"
+        return 1
+    fi
+    return 0
+}
+
+# A Shairport crash makes the resource guard stop AP2.  Restart it at most 3
+# times in 30 minutes; any other reason for leaving real mode still stops
+# the supervisor.
+recent_restarts=""
+restart_allowed() {
+    now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+    kept=""
+    count=0
+    for stamp in $recent_restarts; do
+        if [ $((now - stamp)) -lt 1800 ]; then
+            kept="$kept $stamp"
+            count=$((count + 1))
+        fi
+    done
+    recent_restarts=$kept
+    [ "$count" -lt 3 ] || return 1
+    recent_restarts="$recent_restarts $now"
+}
+
+supervisor_run() {
+    if supervisor_alive; then
+        log "supervisor already running pid=$(supervisor_pid)"
+        return 0
+    fi
+    echo "$$" >"$PIDFILE"
+    echo 11 >"/proc/$$/oom_score_adj" 2>/dev/null || true
+    log "supervisor started pid=$$"
+
+    cleanup() {
+        log "supervisor stopping"
+        stop_ap2
+        unmount_runtime || true
+        rm -f "$STOPFILE" "$PIDFILE"
+        log "supervisor stopped; output hard-muted"
+    }
+    trap cleanup 0 1 2 15
+    trap '' HUP
+
+    if ! wait_for_network; then
+        log "wlan0 did not obtain an IPv4 address"
+        return 1
+    fi
+    log "wlan0 network ready"
+    if ! wait_for_stock_player; then
+        log "stock player socket did not become ready"
+        return 1
+    fi
+    log "stock player socket ready"
+    if ! mount_runtime; then
+        return 1
+    fi
+    if ! check_stock_safety; then
+        return 1
+    fi
+
+    # A manual start is an explicit request to clear a previous trip latch.
+    # Disarm always hard-mutes first and leaves the physical speaker disabled.
+    "$SAFE_TEST" disarm >/dev/null 2>&1 || true
+    if ! "$SAFE_TEST" arm; then
+        log "safe-test arm failed"
+        use_ap256 || return 1
+        # Shairport 5.6 did not come up: run the verified 4.3.6 runtime
+        # until the next reboot rather than leaving AirPlay unavailable.
+        : >"$AP256_FALLBACK"
+        log "falling back to Shairport Sync 4.3.6 until reboot"
+        stop_ap2
+        unmount_runtime || return 1
+        mount_runtime || return 1
+        check_stock_safety || return 1
+        "$SAFE_TEST" disarm >/dev/null 2>&1 || true
+        if ! "$SAFE_TEST" arm; then
+            log "safe-test arm failed with 4.3.6 as well"
+            return 1
+        fi
+    fi
+    log "AirPlay 2 armed without playback deadline"
+
+    stock_failures=0
+    while :; do
+        [ -f "$STOPFILE" ] && {
+            log "stop requested"
+            break
+        }
+        mode=$(cat "$RUN/mode" 2>/dev/null || true)
+        watchdog=$(cat "$RUN/safe/watchdog.pid" 2>/dev/null || true)
+        if [ "$mode" != "real" ]; then
+            trip=$(cat "$RUN/low-memory-trip" 2>/dev/null || true)
+            if [ "$trip" = "shairport exited" ] && [ ! -f "$STOPFILE" ] && restart_allowed; then
+                log "Shairport exited; restarting AP2"
+                "$SAFE_TEST" disarm >/dev/null 2>&1 || true
+                rm -f "$RUN/low-memory-trip"
+                # The start gate counts MemFree only; reclaim clean page
+                # cache first, as a manual start does.
+                sync
+                echo 1 >/proc/sys/vm/drop_caches 2>/dev/null || true
+                if check_stock_safety && "$SAFE_TEST" arm; then
+                    log "AP2 restarted after Shairport exit"
+                    sleep 10
+                    continue
+                fi
+                log "AP2 restart after Shairport exit failed"
+            fi
+            log "AP2 left real mode"
+            break
+        fi
+        case "$watchdog" in
+            ''|*[!0-9]*)
+                log "safe watchdog pid is missing"
+                break
+                ;;
+        esac
+        if ! kill -0 "$watchdog" 2>/dev/null; then
+            log "safe watchdog exited"
+            break
+        fi
+
+        if check_stock_safety; then
+            stock_failures=0
+        else
+            stock_failures=$((stock_failures + 1))
+            if [ "$stock_failures" -ge 3 ]; then
+                log "stock safety check failed three times"
+                break
+            fi
+        fi
+        sleep 10
+    done
+    return 0
+}
+
+start_supervisor() {
+    if supervisor_alive; then
+        echo "AirPlay 2 supervisor already running: pid $(supervisor_pid)"
+        return 0
+    fi
+    rm -f "$STOPFILE"
+    nohup "$0" __run </dev/null >>"$LOG" 2>&1 &
+    child=$!
+    sleep 2
+    if ! kill -0 "$child" 2>/dev/null; then
+        echo "AirPlay 2 supervisor failed to start"
+        tail -20 "$LOG" 2>/dev/null
+        return 1
+    fi
+    echo "AirPlay 2 supervisor started: pid $child"
+}
+
+stop_supervisor() {
+    pid=$(supervisor_pid)
+    case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            : >"$STOPFILE"
+            kill -TERM "$pid" 2>/dev/null || true
+            tries=0
+            while [ "$tries" -lt 45 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                tries=$((tries + 1))
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+            ;;
+    esac
+    stop_ap2
+    unmount_runtime || true
+    rm -f "$STOPFILE" "$PIDFILE"
+    rm -rf "$RUN"
+    echo "AirPlay 2 stopped; output hard-muted"
+}
+
+show_status() {
+    if supervisor_alive; then
+        echo "supervisor: running pid=$(supervisor_pid)"
+    else
+        echo "supervisor: stopped"
+    fi
+    if [ -x "$SAFE_TEST" ]; then
+        "$SAFE_TEST" status
+    fi
+    if [ -x "$AP2CTL" ]; then
+        "$AP2CTL" status
+    else
+        echo "runtime: not mounted"
+    fi
+    [ -f "$INIT_SCRIPT" ] && echo "boot hook: enabled" || echo "boot hook: disabled"
+}
+
+enable_boot() {
+    [ -x "$INIT_SOURCE" ] || {
+        echo "missing boot script: $INIT_SOURCE" >&2
+        return 1
+    }
+    cp "$INIT_SOURCE" "$INIT_SCRIPT.tmp" &&
+        chmod 755 "$INIT_SCRIPT.tmp" &&
+        mv "$INIT_SCRIPT.tmp" "$INIT_SCRIPT"
+    echo "boot hook enabled"
+}
+
+disable_boot() {
+    rm -f "$INIT_SCRIPT"
+    echo "boot hook disabled"
+}
+
+case "${1:-status}" in
+    __run)
+        supervisor_run
+        ;;
+    start)
+        start_supervisor
+        ;;
+    stop)
+        stop_supervisor
+        ;;
+    restart)
+        stop_supervisor
+        start_supervisor
+        ;;
+    status)
+        show_status
+        ;;
+    enable)
+        enable_boot
+        ;;
+    disable)
+        disable_boot
+        ;;
+    *)
+        echo "usage: $0 {start|stop|restart|status|enable|disable}" >&2
+        exit 2
+        ;;
+esac

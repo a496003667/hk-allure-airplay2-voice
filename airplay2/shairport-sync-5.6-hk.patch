@@ -1,0 +1,437 @@
+diff --git a/ap2_event_receiver.c b/ap2_event_receiver.c
+index 1bbdeac..7578521 100644
+--- a/ap2_event_receiver.c
++++ b/ap2_event_receiver.c
+@@ -198,6 +198,12 @@ void *ap2_event_receiver(void *arg) {
+           conn->connection_number, conn->event_socket, conn->event_channel_fd);
+     pthread_cleanup_push(ap2_event_receiver_cleanup_handler, arg);
+ 
++    // Senders reply to every event-port command; bound that read so a silent
++    // sender cannot block a caller that holds a connection lock.
++    struct timeval reply_timeout = {2, 0};
++    setsockopt(conn->event_channel_fd, SOL_SOCKET, SO_RCVTIMEO, &reply_timeout,
++               sizeof(reply_timeout));
++
+     ap2_event_send_update_info(conn);
+ 
+     while (1) {
+diff --git a/audio_alsa.c b/audio_alsa.c
+index f843fde..77742f1 100644
+--- a/audio_alsa.c
++++ b/audio_alsa.c
+@@ -178,6 +178,15 @@ char *alsa_out_dev = "default";
+ char *hw_alsa_out_dev = NULL;
+ char *alsa_mix_dev = NULL;
+ char *alsa_mix_ctrl = NULL;
++
++// Optional "alsa.fade_control_name": an integer mixer control (e.g. a DAC's
++// ramped "Digital Playback Volume") set to zero just before the output is
++// dropped, so a flush, stop or session takeover fades out instead of cutting
++// off audible audio, which pops on some DAC/amplifier combinations.  After a
++// flush within a session the saved level is restored once new audio has
++// been written, unless someone else has changed the control meanwhile.
++static char *alsa_fade_ctrl = NULL;
++static long alsa_fade_restore[2] = {-1, -1};
+ int alsa_mix_index = 0;
+ int has_softvol = 0;
+ 
+@@ -1245,6 +1254,10 @@ static int init(int argc, char **argv) {
+       alsa_mix_ctrl = (char *)str;
+     }
+ 
++    if (config_lookup_non_empty_string(config.cfg, "alsa.fade_control_name", &str)) {
++      alsa_fade_ctrl = (char *)str;
++    }
++
+     // Get the Mixer Control Index
+     if (config_lookup_int(config.cfg, "alsa.mixer_control_index", &value)) {
+       alsa_mix_index = value;
+@@ -2075,12 +2088,83 @@ static int do_open() {
+   return ret;
+ }
+ 
++// Read (write == 0) or write the two channels of the fade control on the
++// output card.  Returns 0 on success.
++static int fade_control_access(int write, long values[2]) {
++  if (alsa_fade_ctrl == NULL)
++    return -1;
++  int card_number = 0;
++  if (alsa_handle != NULL) {
++    snd_pcm_info_t *info;
++    snd_pcm_info_alloca(&info);
++    if (snd_pcm_info(alsa_handle, info) == 0)
++      card_number = snd_pcm_info_get_card(info);
++  }
++  char card[32];
++  snprintf(card, sizeof(card), "hw:%d", card_number);
++  snd_ctl_t *control;
++  if (snd_ctl_open(&control, card, 0) < 0)
++    return -1;
++  snd_ctl_elem_id_t *id;
++  snd_ctl_elem_value_t *value;
++  snd_ctl_elem_id_alloca(&id);
++  snd_ctl_elem_value_alloca(&value);
++  snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
++  snd_ctl_elem_id_set_name(id, alsa_fade_ctrl);
++  snd_ctl_elem_value_set_id(value, id);
++  int result = snd_ctl_elem_read(control, value);
++  if (result >= 0) {
++    if (write) {
++      snd_ctl_elem_value_set_integer(value, 0, values[0]);
++      snd_ctl_elem_value_set_integer(value, 1, values[1]);
++      result = snd_ctl_elem_write(control, value);
++    } else {
++      values[0] = snd_ctl_elem_value_get_integer(value, 0);
++      values[1] = snd_ctl_elem_value_get_integer(value, 1);
++    }
++  }
++  snd_ctl_close(control);
++  return result < 0 ? -1 : 0;
++}
++
++// Fade the output to silence before it is dropped.  Returns the previous
++// level in saved[] (or -1, -1 if nothing was changed).
++static void fade_out_before_drop(long saved[2]) {
++  saved[0] = saved[1] = -1;
++  if ((alsa_fade_ctrl == NULL) || (alsa_backend_state != abm_playing))
++    return;
++  long level[2];
++  if ((fade_control_access(0, level) == 0) && ((level[0] > 0) || (level[1] > 0))) {
++    long silent[2] = {0, 0};
++    if (fade_control_access(1, silent) == 0) {
++      saved[0] = level[0];
++      saved[1] = level[1];
++      usleep(40000); // let the DAC ramp down while the buffered audio still plays
++      debug(2, "alsa: faded \"%s\" from %ld,%ld before dropping the output.", alsa_fade_ctrl,
++            level[0], level[1]);
++    }
++  }
++}
++
++// After a flush within a session, restore the level once audio flows again.
++static void fade_restore_after_play(void) {
++  if (alsa_fade_restore[0] < 0)
++    return;
++  long level[2];
++  if ((fade_control_access(0, level) == 0) && (level[0] == 0) && (level[1] == 0))
++    fade_control_access(1, alsa_fade_restore);
++  alsa_fade_restore[0] = alsa_fade_restore[1] = -1;
++}
++
+ static int do_close() {
+   if (alsa_backend_state == abm_disconnected)
+     debug(3, "alsa: do_close() -- output device is already disconnected");
+   int derr = 0;
+   if (alsa_handle) {
+     debug(3, "alsa: do_close() -- closing the output device");
++    long saved[2];
++    fade_out_before_drop(saved); // the session is ending: the audio hook re-opens the path
++    alsa_fade_restore[0] = alsa_fade_restore[1] = -1;
+     if ((derr = snd_pcm_drop(alsa_handle)))
+       debug(1, "Error %d (\"%s\") dropping output device.", derr, snd_strerror(derr));
+     usleep(20000); // wait for the hardware to do its trick. BTW, this make the function pthread
+@@ -2108,6 +2192,12 @@ static int sub_flush() {
+   if (alsa_handle) {
+     debug(3, "alsa: do_flush() -- flushing the output device");
+     frames_sent_break_occurred = 1;
++    long saved[2];
++    fade_out_before_drop(saved);
++    if (saved[0] >= 0) {
++      alsa_fade_restore[0] = saved[0];
++      alsa_fade_restore[1] = saved[1];
++    }
+     if ((derr = snd_pcm_drop(alsa_handle)))
+       debug(1, "Error %d (\"%s\") dropping output device.", derr, snd_strerror(derr));
+     if ((derr = snd_pcm_prepare(alsa_handle)))
+@@ -2134,6 +2224,12 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
+ 
+   int ret = 0;
+ 
++  // HK local patch: while the voice assistant holds the DAC (flag present),
++  // do not reopen it; drop these frames (the sender is paused anyway).
++  if ((alsa_backend_state == abm_disconnected) &&
++      (access("/tmp/hk-ap2/run/release-dac", F_OK) == 0))
++    return 0;
++
+   pthread_mutex_lock_and_cleanup_push(&alsa_mutex);
+ 
+   if (alsa_backend_state == abm_disconnected) {
+@@ -2154,6 +2250,8 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
+       // do_mute(0); // unmute for backend's reason
+     }
+     ret = do_play(buf, samples);
++    if (ret >= 0)
++      fade_restore_after_play();
+   }
+ 
+   pthread_mutex_unlock(&alsa_mutex);
+@@ -2164,6 +2262,13 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
+ static void flush(void) {
+   pthread_mutex_lock_and_cleanup_push(&alsa_mutex);
+   if (alsa_backend_state != abm_disconnected) { // must be playing or connected...
++    // HK local patch: the on-device voice assistant needs the DAC while the
++    // sender is paused.  It creates this flag before pausing us; release the
++    // device instead of just flushing.  play() reopens it on resume.
++    if (access("/tmp/hk-ap2/run/release-dac", F_OK) == 0) {
++      warn("hk: flush with release-dac flag; closing the output device");
++      do_close();
++    } else
+     // do nothing for a flush if config.keep_dac_busy is true
+     if (config.keep_dac_busy == 0) {
+       sub_flush();
+diff --git a/bonjour_strings.c b/bonjour_strings.c
+index eae9121..321b2a5 100644
+--- a/bonjour_strings.c
++++ b/bonjour_strings.c
+@@ -198,7 +198,9 @@ void build_bonjour_strings(__attribute((unused)) rtsp_conn_info *conn) {
+         bnprintf(srcversString, sizeof(srcversString), "srcvers=%s", config.srcvers);
+     // secondary_txt_records[entry_number++] =
+     //     bnprintf(osversString, sizeof(osversString), "osvers=%s", config.osvers);
+-    // secondary_txt_records[entry_number++] = "vv=2";
++    if (config.vv != 0)
++      secondary_txt_records[entry_number++] =
++          bnprintf(vvString, sizeof(vvString), "vv=%u", config.vv);
+     secondary_txt_records[entry_number++] = fwString; // already calculated
+   }
+ #endif
+diff --git a/plists/get_info_response.xml b/plists/get_info_response.xml
+index 558ff60..48a3be8 100644
+--- a/plists/get_info_response.xml
++++ b/plists/get_info_response.xml
+@@ -46,7 +46,7 @@
+ 		<!-- 0x00000400000 is AAC-LC/44.1K/F24/2 -->
+ 		<!-- 0x00000200000 is ALAC/48K/F24/2 -->
+ 
+-	</dict>
++	<!-- </dict> --> <!-- closes the commented-out supportedFormats dict -->
+ 	<!-- <key>sourceVersion</key> --> <!-- added programmatically -->
+ 	<!-- <string>620.8.2</string> -->
+ 	<!-- <key>macAddress</key> --> <!-- hoping we don't need this -->
+diff --git a/remote/remote.c b/remote/remote.c
+index 29ce6c0..7ff1134 100644
+--- a/remote/remote.c
++++ b/remote/remote.c
+@@ -418,6 +418,28 @@ void ap2_remote_set_volume(double volume) {
+ #endif
+ 
+ #ifdef CONFIG_AIRPLAY_2
++// While a sender is connected but nothing is playing there is no principal
++// connection.  These send to the newest connection with an open event
++// channel instead, so local controls keep the sender in sync.
++
++static ssize_t send_unit_volume_to(rtsp_conn_info *conn, void *arg) {
++  return ap2_event_send_unit_volume_notification(conn, *(double *)arg);
++}
++
++static ssize_t send_simple_command_to(rtsp_conn_info *conn, void *arg) {
++  if (conn->airplay_gid == NULL) // the command's destination is the sender's group
++    return -1;
++  return ap2_event_send_simple_modern_media_remote_command(conn, *(unsigned int *)arg);
++}
++
++static void ap2_remote_volume_without_session(double airplay_volume) {
++  double unit_volume = airplayVolumeToUnitVolume(airplay_volume);
++  ssize_t result = rtsp_with_event_capable_conn(send_unit_volume_to, &unit_volume);
++  debug(2, "remote volume %.3f sent without a session, result %zd.", airplay_volume, result);
++  if (result > 0)
++    command_set_volume(airplay_volume); // tell run_this_when_volume_is_set listeners
++}
++
+ void remote_increment_volume(int up) {
+   const double increment = 1.875;
+ 
+@@ -437,6 +459,7 @@ void remote_increment_volume(int up) {
+   else if (desired_volume > 0.0)
+     desired_volume = 0.0;
+ 
++  int no_principal = 0;
+   pthread_rwlock_rdlock(&principal_conn_lock); // don't let the principal_conn be changed
+   pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+   if ((principal_conn != NULL) && (principal_conn->airplay_type == ap_2)) {
+@@ -451,8 +474,11 @@ void remote_increment_volume(int up) {
+     }
+   } else {
+     config.airplay_volume = desired_volume;
++    no_principal = 1;
+   }
+   pthread_cleanup_pop(1); // release the principal_conn lock
++  if (no_principal)
++    ap2_remote_volume_without_session(desired_volume);
+ }
+ #endif
+ 
+@@ -541,8 +567,11 @@ void remote_simple_command(simple_command_t command) {
+   }
+ #endif
+ #ifdef CONFIG_AIRPLAY_2
++  int no_principal = 0;
+   pthread_rwlock_rdlock(&principal_conn_lock); // don't let the principal_conn be changed
+   pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
++  if ((available == 0) && (principal_conn == NULL))
++    no_principal = 1;
+   if ((available == 0) && (principal_conn != NULL) && (principal_conn->airplay_type == ap_2)) {
+     if (principal_conn != NULL) {
+       switch (command) {
+@@ -565,6 +594,24 @@ void remote_simple_command(simple_command_t command) {
+     }
+   }
+   pthread_cleanup_pop(1); // release the principal_conn lock
++  if (no_principal) {
++    switch (command) {
++    case rcsc_volume_up:
++      remote_volumeup();
++      break;
++    case rcsc_volume_down:
++      remote_volumedown();
++      break;
++    case rcsc_not_a_command:
++    case rcsc_disconnect:
++      break;
++    default: {
++      unsigned int command_number = command;
++      ssize_t result = rtsp_with_event_capable_conn(send_simple_command_to, &command_number);
++      debug(2, "remote_simple_command %u sent without a session, result %zd.", command, result);
++    } break;
++    }
++  }
+ #endif
+ }
+ 
+diff --git a/rtsp.c b/rtsp.c
+index 3e66903..7ff2c5b 100644
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -180,6 +180,26 @@ static void track_thread(rtsp_conn_info *conn) {
+   pthread_mutex_unlock(&conns_lock);
+ }
+ 
++#ifdef CONFIG_AIRPLAY_2
++ssize_t rtsp_with_event_capable_conn(ssize_t (*fn)(rtsp_conn_info *conn, void *arg), void *arg) {
++  ssize_t result = -1;
++  pthread_mutex_lock(&conns_lock);
++  rtsp_conn_info *chosen = NULL;
++  int i;
++  for (i = 0; i < nconns; i++) {
++    rtsp_conn_info *candidate = conns[i];
++    if ((candidate != NULL) && (candidate->running != 0) && (candidate->airplay_type == ap_2) &&
++        (candidate->event_channel_fd > 0) &&
++        ((chosen == NULL) || (candidate->connection_number > chosen->connection_number)))
++      chosen = candidate;
++  }
++  if (chosen != NULL)
++    result = fn(chosen, arg);
++  pthread_mutex_unlock(&conns_lock);
++  return result;
++}
++#endif
++
+ // note: connection numbers start at 1, so an except_this_one value of zero means "all threads"
+ void cancel_all_RTSP_threads(airplay_stream_c stream_category, int except_this_one) {
+   // if the stream category is unspecified_stream_category
+@@ -1499,10 +1519,12 @@ void handle_setrateanchori(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
+ #ifdef CONFIG_METADATA
+         send_ssnc_metadata('paus', NULL, 0, 1); // pause -- contains cancellation points
+ #endif
+-        // if (config.output->stop) {
+-        //   debug(1, "Connection %d: SETRATEANCHORI would stop the output backend.",
+-        //   conn->connection_number); config.output->stop();
+-        // }
++        // HK local patch: the on-device voice assistant needs the DAC while
++        // the sender is paused.  It creates this flag before pausing us.
++        if ((access("/tmp/hk-ap2/run/release-dac", F_OK) == 0) && (config.output->stop)) {
++          warn("hk: pause with release-dac flag; closing the output device");
++          config.output->stop();
++        }
+       }
+       pthread_cleanup_pop(1); // unlock the conn->flush_mutex
+     }
+@@ -1677,7 +1699,35 @@ void handle_pair_remove(rtsp_conn_info *conn __attribute__((unused)), rtsp_messa
+   debug_log_rtsp_message_conn(conn, 1, "pair-remove response", resp);
+ }
+ 
++// Local change: when a different sender starts pairing (the user picked this
++// receiver on another device), end the current sender's session at once
++// instead of when the newcomer starts streaming.  Until then the receiver
++// advertises the old session (ReceiverSessionIsActive, the old sender's
++// group), and a Mac joining such a receiver does not take over its volume.
++// Opening the AirPlay picker only fetches /info and does not pair, so it
++// does not interrupt playback.
++static void preempt_other_sender(rtsp_conn_info *conn) {
++  rtsp_conn_info *previous = NULL;
++  int previous_number = 0;
++  char previous_ip[INET6_ADDRSTRLEN] = "";
++  pthread_rwlock_rdlock(&principal_conn_lock);
++  if ((principal_conn != NULL) && (principal_conn != conn) &&
++      (strcmp(principal_conn->client_ip_string, conn->client_ip_string) != 0)) {
++    previous = principal_conn;
++    previous_number = previous->connection_number;
++    strncpy(previous_ip, previous->client_ip_string, sizeof(previous_ip) - 1);
++  }
++  pthread_rwlock_unlock(&principal_conn_lock);
++  if (previous != NULL) {
++    debug(1, "Connection %d: %s is pairing; ending connection %d from %s now.",
++          conn->connection_number, conn->client_ip_string, previous_number, previous_ip);
++    release_play_lock(previous); // no-op if it is no longer the principal
++    terminate_conn(previous_number);
++  }
++}
++
+ void handle_pair_verify(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
++  preempt_other_sender(conn);
+   // try to pick up the stages
+   uint8_t *b = (uint8_t *)req->content;
+   char mstage = '-';
+@@ -1753,6 +1803,7 @@ void handle_pair_pin_start(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
+ }
+ 
+ void handle_pair_setup(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
++  preempt_other_sender(conn);
+   debug(4, "Connection %d from \"%s\": handle_pair_setup, Content-Length %d",
+         conn->connection_number, conn->ap2_client_name, req->contentlength);
+   debug_log_rtsp_message_conn(conn, 4, "pair-setup request", req);
+diff --git a/rtsp.h b/rtsp.h
+index 312763c..cb677d3 100644
+--- a/rtsp.h
++++ b/rtsp.h
+@@ -41,6 +41,13 @@ ssize_t write_encrypted(int fd, pair_cipher_bundle *ctx, const void *buf, size_t
+ 
+ void generateTxtDataValueInfo(rtsp_conn_info *conn, void **response, size_t *responseLength);
+ plist_t generateInfoPlist(rtsp_conn_info *conn);
++
++// Run fn on the newest AirPlay 2 connection with an open event channel while
++// holding the connection-list lock, so the connection cannot be freed
++// meanwhile.  Returns -1 if there is no such connection.  Used to send remote
++// commands while a sender is connected but no session is principal (nothing
++// is playing).  Do not call it while holding principal_conn_lock.
++ssize_t rtsp_with_event_capable_conn(ssize_t (*fn)(rtsp_conn_info *conn, void *arg), void *arg);
+ char *plist_as_xml_text(plist_t the_plist); // caller must free the returned NUL-terminated string
+ #endif
+ 
+diff --git a/shairport.c b/shairport.c
+index eca9c3e..d1044fe 100644
+--- a/shairport.c
++++ b/shairport.c
+@@ -612,7 +612,10 @@ int parse_options(int argc, char **argv) {
+                                 // player. 0 -- 4. 3 seems normal.
+ #endif
+ 
+-  config.vv = 0;
++  // Advertise volume-control version 2 (Stage 1 txtAirPlay, /info and the
++  // mDNS TXT record).  macOS senders only drive the receiver's volume with
++  // vv=2; with 0 the Mac slider changes nothing on this receiver.
++  config.vv = 2;
+ 
+   // make up a firmware version
+ #ifdef CONFIG_USE_GIT_VERSION_STRING
+@@ -1952,8 +1955,9 @@ int parse_options(int argc, char **argv) {
+   // Bit 46 seems to mean	SupportsHKPairingAndAccessControl	HomeKit-based pairing and
+   // access control support Bit 47 seems necessary too, but is undocumented.
+ 
+-  // This is undocumented, but is set on the APX.
+-  // config.airplay_features |= (uint64_t)1 << 22 ;
++  // This is undocumented, but is set on the APX.  Shairport 4.3.6 advertised
++  // it too; without it macOS senders do not drive this receiver's volume.
++  config.airplay_features |= (uint64_t)1 << 22;
+ 
+   // debug(1, "Features: 0x%" PRIx64 ", unmask: 0x%" PRIx64 ", mask: 0x%" PRIx64 ".",
+   // config.airplay_features, unmask, mask);

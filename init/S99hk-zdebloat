@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# Stop the stock OTA client and Alexa alert helper after rootApp starts them.
+# Runtime only: nothing stock is modified.  touch /vendor/hk-debloat/disable
+# to skip.
+case "${1:-start}" in
+    start)
+        if [ -x /vendor/hk-debloat/hk-debloat.sh ]; then
+            /vendor/hk-debloat/hk-debloat.sh boot >/dev/null 2>&1 &
+        fi
+        ;;
+esac
+exit 0

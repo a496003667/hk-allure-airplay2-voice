@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Mirror AirPlay 2 playback/volume onto the stock lights and volume ring.
+# Never touches audio.  touch /vendor/hk-lights/disable to skip.
+case "${1:-start}" in
+    start)
+        if [ -x /vendor/hk-lights/hk-ap2-lights.sh ]; then
+            HK_LIGHTS_BIN=/vendor/hk-lights \
+                nice -n 10 /vendor/hk-lights/hk-ap2-lights.sh boot \
+                </dev/null >/dev/null 2>&1 &
+        fi
+        ;;
+esac
+exit 0

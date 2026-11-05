@@ -1,0 +1,14 @@
+#!/bin/sh
+# On-device voice assistant (wake word -> Baidu ASR -> ModelScope -> Baidu TTS).
+# touch /vendor/hk-voice/disable to skip.
+case "${1:-start}" in
+    start)
+        if [ -x /vendor/hk-voice/hk-voice.sh ]; then
+            /vendor/hk-voice/hk-voice.sh boot </dev/null >/dev/null 2>&1 &
+        fi
+        ;;
+    stop)
+        [ -x /vendor/hk-voice/hk-voice.sh ] && /vendor/hk-voice/hk-voice.sh stop
+        ;;
+esac
+exit 0

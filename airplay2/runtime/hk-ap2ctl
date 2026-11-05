@@ -1,0 +1,528 @@
+#!/bin/sh
+
+set -u
+
+ROOT=${HK_AP2_ROOT:-/tmp/hk-ap2/opt}
+RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
+LOADER="$ROOT/lib/ld-linux.so.3"
+LIBRARY_PATH="$ROOT/lib"
+NSS_SHIM="$ROOT/lib/libhk-nss-shim.so"
+INFO_SHIM=${HK_AP2_INFO_SHIM:-/vendor/airplay2/libhk-ap2-info-shim-soft.so}
+DBUS_CONF="$ROOT/etc/ap2/dbus-system.conf"
+AVAHI_CONF="$ROOT/etc/ap2/avahi-daemon.conf"
+DRY_RUN_CONF="$ROOT/etc/ap2/shairport-sync-dryrun.conf"
+REAL_CONF="$ROOT/etc/ap2/shairport-sync.conf"
+LOCK="$RUN/lock"
+GUARD="$ROOT/bin/hk-ap2-guard.sh"
+# Shairport Sync 5.6 remote control: local-only MQTT broker (loopback).
+AP256_DIR=${HK_AP2_AP256_DIR:-/vendor/airplay2/ap2-56}
+BROKER="$AP256_DIR/mosquitto"
+BROKER_CONF="$AP256_DIR/mosquitto.conf"
+
+# AP2 is optional.  Keep it killable before the stock audio and maintenance
+# services, and reserve enough RAM for the stock firmware after startup.
+MIN_FREE_KIB=${HK_AP2_MIN_FREE_KIB:-30720}
+AP2_OOM_SCORE_ADJ=${HK_AP2_OOM_SCORE_ADJ:-700}
+DEBUG=${HK_AP2_DEBUG:-0}
+
+export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$RUN/dbus/system_bus_socket"
+
+# NQPTP 1.2.5 (smi11) answers on UDP 9000 once its shared memory is set up.
+# Shairport 5.6 exits if it starts first, so wait for the port and give NQPTP
+# a moment to publish its version.
+wait_for_nqptp() {
+    tries=0
+    while [ "$tries" -lt 20 ]; do
+        if grep -qE '^ *[0-9]+: [0-9A-F]+:2328 ' /proc/net/udp /proc/net/udp6 2>/dev/null; then
+            sleep 2
+            return 0
+        fi
+        sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+pidfile() {
+    printf '%s/%s.pid\n' "$RUN" "$1"
+}
+
+free_kib() {
+    awk '/^MemFree:/ {print $2; exit}' /proc/meminfo 2>/dev/null
+}
+
+check_resources() {
+    free=$(free_kib)
+    case "$free" in
+        ''|*[!0-9]*)
+            echo "unable to read MemFree from /proc/meminfo" >&2
+            return 1
+            ;;
+    esac
+    if [ "$free" -lt "$MIN_FREE_KIB" ]; then
+        echo "refusing to start AP2: only ${free} KiB free, need ${MIN_FREE_KIB} KiB" >&2
+        return 1
+    fi
+}
+
+rotate_log() {
+    log=$1
+    [ -f "$log" ] || return 0
+    size=$(wc -c <"$log" 2>/dev/null || echo 0)
+    case "$size" in
+        ''|*[!0-9]*) size=0 ;;
+    esac
+    if [ "$size" -gt 131072 ]; then
+        rm -f "$log.1"
+        mv "$log" "$log.1" 2>/dev/null || :
+    fi
+}
+
+expected_comm() {
+    case "$1" in
+        dbus) echo dbus-daemon ;;
+        avahi) echo avahi-daemon ;;
+        nqptp) echo nqptp ;;
+        shairport) echo shairport-sync ;;
+        mosquitto) echo mosquitto ;;
+        *) return 1 ;;
+    esac
+}
+
+expected_path() {
+    case "$1" in
+        dbus) echo "$ROOT/bin/dbus-daemon" ;;
+        avahi) echo "$ROOT/sbin/avahi-daemon" ;;
+        nqptp) echo "$ROOT/bin/nqptp" ;;
+        shairport) echo "$ROOT/bin/shairport-sync" ;;
+        mosquitto) echo "$BROKER" ;;
+        *) return 1 ;;
+    esac
+}
+
+running_pid() {
+    kind=$1
+    file=$(pidfile "$kind")
+    pid=$(cat "$file" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+    case "$comm" in
+        "$(expected_comm "$kind")") ;;
+        ld-linux.so.3)
+            cmdline=$(strings "/proc/$pid/cmdline" 2>/dev/null || true)
+            case "$cmdline" in
+                *"$(expected_path "$kind")"*) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$pid"
+}
+
+set_optional_oom_priority() {
+    pid=$1
+    [ -n "$pid" ] || return 0
+    # A larger adjustment means "kill this process sooner".  Do not protect
+    # optional AP2 helpers ahead of stock audio or the maintenance channel.
+    echo "$AP2_OOM_SCORE_ADJ" >"/proc/$pid/oom_score_adj" 2>/dev/null || true
+}
+
+wait_for_pid() {
+    kind=$1
+    attempts=${2:-15}
+    while [ "$attempts" -gt 0 ]; do
+        pid=$(running_pid "$kind" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+    return 1
+}
+
+wait_for_socket() {
+    path=$1
+    attempts=${2:-15}
+    while [ "$attempts" -gt 0 ]; do
+        [ -S "$path" ] && return 0
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+    return 1
+}
+
+wait_for_airplay_port() {
+    attempts=${1:-15}
+    while [ "$attempts" -gt 0 ]; do
+        if grep -Eq ':1B58 00000000:0000 0A ' \
+            /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+    return 1
+}
+
+show_log() {
+    log=$1
+    [ -f "$log" ] || return 0
+    echo "---- $log ----" >&2
+    tail -40 "$log" >&2
+}
+
+stop_kind() {
+    kind=$1
+    pid=$(running_pid "$kind" 2>/dev/null || true)
+    file=$(pidfile "$kind")
+    if [ -z "$pid" ]; then
+        rm -f "$file"
+        return 0
+    fi
+
+    echo "stopping $kind pid $pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    tries=0
+    while [ "$tries" -lt 8 ]; do
+        kill -0 "$pid" 2>/dev/null || {
+            rm -f "$file"
+            return 0
+        }
+        sleep 1
+        tries=$((tries + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "killing $kind pid $pid"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$file"
+}
+
+cleanup_run_dir() {
+    mkdir -p "$RUN/dbus"
+    rm -f "$RUN/dbus/system_bus_socket"
+    rm -f "$RUN/dbus.pid" "$RUN/avahi.pid" "$RUN/nqptp.pid" "$RUN/shairport.pid"
+    rm -f "$RUN/mode"
+}
+
+ensure_runtime_paths() {
+    mkdir -p "$RUN/dbus" /tmp/hk-ap2/var/run/avahi-daemon
+    if [ ! -e /opt/var ]; then
+        ln -s /tmp/hk-ap2/var /opt/var
+    fi
+    if [ ! -d /opt/var/run/avahi-daemon ]; then
+        mkdir -p /opt/var/run/avahi-daemon
+    fi
+    mkdir -p /opt/share
+    if [ ! -e /opt/share/alsa ]; then
+        ln -s /system/workdir/lib/alsa /opt/share/alsa
+    fi
+}
+
+acquire_lock() {
+    mkdir -p "$RUN"
+    if mkdir "$LOCK" 2>/dev/null; then
+        echo "$$" >"$LOCK/pid"
+        return 0
+    fi
+
+    old_pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        echo "another hk-ap2ctl operation is running: pid $old_pid" >&2
+        return 1
+    fi
+
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || return 1
+    echo "$$" >"$LOCK/pid"
+}
+
+release_lock() {
+    [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$$" ] || return 0
+    rm -rf "$LOCK"
+}
+
+launch_kind() {
+    kind=$1
+    log=$2
+    preload=$3
+    shift 3
+
+    rotate_log "$log"
+    case "$preload" in
+        yes) preload_file=$NSS_SHIM ;;
+        info) preload_file=$INFO_SHIM ;;
+        *) preload_file= ;;
+    esac
+    if [ -n "$preload_file" ]; then
+        nohup env LD_PRELOAD="$preload_file" \
+            "$LOADER" --library-path "$LIBRARY_PATH" "$@" \
+            </dev/null >"$log" 2>&1 &
+    else
+        nohup "$LOADER" --library-path "$LIBRARY_PATH" "$@" \
+            </dev/null >"$log" 2>&1 &
+    fi
+
+    pid=$!
+    echo "$pid" >"$(pidfile "$kind")"
+    if ! launched_pid=$(wait_for_pid "$kind" 10); then
+        echo "$kind failed to start" >&2
+        show_log "$log"
+        rm -f "$(pidfile "$kind")"
+        return 1
+    fi
+    set_optional_oom_priority "$launched_pid"
+    printf '%s\n' "$launched_pid"
+}
+
+preflight() {
+    for file in \
+        "$LOADER" \
+        "$NSS_SHIM" \
+        "$INFO_SHIM" \
+        "$GUARD" \
+        "$ROOT/bin/dbus-daemon" \
+        "$ROOT/sbin/avahi-daemon" \
+        "$ROOT/bin/nqptp" \
+        "$ROOT/bin/shairport-sync"; do
+        if [ ! -e "$file" ]; then
+            echo "missing runtime file: $file" >&2
+            return 1
+        fi
+    done
+
+    for file in "$DBUS_CONF" "$AVAHI_CONF"; do
+        if [ ! -r "$file" ]; then
+            echo "missing config: $file" >&2
+            return 1
+        fi
+    done
+}
+
+stop_guard() {
+    file="$RUN/guard.pid"
+    pid=$(cat "$file" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*)
+            rm -f "$file"
+            return 0
+            ;;
+    esac
+    if [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        tries=0
+        while [ "$tries" -lt 5 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            tries=$((tries + 1))
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$file"
+}
+
+start_guard() {
+    rm -f "$RUN/guard.pid" "$RUN/low-memory-trip"
+    rotate_log "$RUN/guard.log"
+    nohup setsid "$GUARD" </dev/null >>"$RUN/guard.log" 2>&1 &
+    guard_pid=$!
+    tries=0
+    while [ "$tries" -lt 8 ]; do
+        if kill -0 "$guard_pid" 2>/dev/null; then
+            echo "$guard_pid" >"$RUN/guard.pid"
+            return 0
+        fi
+        sleep 1
+        tries=$((tries + 1))
+    done
+    echo "AP2 resource guard failed to start" >&2
+    show_log "$RUN/guard.log"
+    return 1
+}
+
+stop_all() {
+    stop_guard
+    stop_kind mosquitto
+    stop_kind shairport
+    if [ -x "$ROOT/hk-ap2-audio-hook.sh" ]; then
+        "$ROOT/hk-ap2-audio-hook.sh" mute >/dev/null 2>&1 || true
+    fi
+    stop_kind nqptp
+    stop_kind avahi
+    stop_kind dbus
+}
+
+start_ap2() {
+    mode=${1:-dry-run}
+    case "$mode" in
+        dry-run) conf=$DRY_RUN_CONF ;;
+        real) conf=$REAL_CONF ;;
+        *)
+            echo "usage: $0 start [dry-run|real]" >&2
+            return 2
+            ;;
+    esac
+
+    [ -r "$conf" ] || {
+        echo "missing config: $conf" >&2
+        return 1
+    }
+    preflight || return 1
+    check_resources || return 1
+    acquire_lock || return 1
+    trap 'release_lock' 0 1 2 15
+
+    for kind in dbus avahi nqptp shairport mosquitto; do
+        pid=$(running_pid "$kind" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            echo "$kind already running: pid $pid" >&2
+            return 1
+        fi
+    done
+
+    cleanup_run_dir
+    ensure_runtime_paths
+
+    if ! dbus_pid=$(launch_kind dbus "$RUN/dbus.log" yes \
+        "$ROOT/bin/dbus-daemon" \
+        --config-file="$DBUS_CONF" --nofork --nopidfile); then
+        stop_all
+        return 1
+    fi
+    if ! wait_for_socket "$RUN/dbus/system_bus_socket" 10; then
+        echo "dbus-daemon socket did not appear" >&2
+        show_log "$RUN/dbus.log"
+        stop_all
+        return 1
+    fi
+
+    if ! avahi_pid=$(launch_kind avahi "$RUN/avahi.log" yes \
+        "$ROOT/sbin/avahi-daemon" \
+        --file="$AVAHI_CONF" --no-drop-root --no-rlimits --no-proc-title); then
+        stop_all
+        return 1
+    fi
+
+    if ! nqptp_pid=$(launch_kind nqptp "$RUN/nqptp.log" no \
+        "$ROOT/bin/nqptp"); then
+        stop_all
+        return 1
+    fi
+
+    if [ "$DEBUG" = "1" ]; then
+        shairport_debug=-vv
+    else
+        shairport_debug=
+    fi
+    # Shairport 5.6 returns vv, volumeControlType and initialVolume itself,
+    # so the 4.3.6 /info shim is not preloaded.
+    if ! wait_for_nqptp; then
+        echo "nqptp did not open its control port" >&2
+        show_log "$RUN/nqptp.log"
+        stop_all
+        return 1
+    fi
+
+    # Start the broker before Shairport so its MQTT client connects at once
+    # (its reconnect back-off can take a minute).  A broker problem only
+    # disables the local remote control.
+    if [ -x "$BROKER" ] && [ -r "$BROKER_CONF" ]; then
+        if ! broker_pid=$(launch_kind mosquitto "$RUN/mosquitto.log" no \
+            "$BROKER" -c "$BROKER_CONF"); then
+            echo "mosquitto failed to start; local remote control disabled" >&2
+            broker_pid=
+        fi
+    fi
+
+    # One retry covers a Shairport that still lost the race with NQPTP.
+    attempt=1
+    while :; do
+        if shairport_pid=$(launch_kind shairport "$RUN/shairport.log" no \
+            "$ROOT/bin/shairport-sync" -c "$conf" $shairport_debug) &&
+            wait_for_airplay_port 15; then
+            break
+        fi
+        echo "shairport-sync attempt $attempt did not reach TCP 7000" >&2
+        show_log "$RUN/shairport.log"
+        stop_kind shairport
+        if [ "$attempt" -ge 2 ]; then
+            stop_all
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+
+
+    if ! start_guard; then
+        stop_all
+        return 1
+    fi
+
+    echo "$mode" >"$RUN/mode"
+    echo "AP2 started in $mode mode"
+    echo "dbus=$dbus_pid"
+    echo "avahi=$avahi_pid"
+    echo "nqptp=$nqptp_pid"
+    echo "shairport=$shairport_pid"
+    echo "mosquitto=${broker_pid:-none}"
+    echo "guard=$guard_pid"
+    echo "free_kib=$(free_kib)"
+}
+
+stop_ap2() {
+    acquire_lock || return 1
+    trap 'release_lock' 0 1 2 15
+    stop_all
+    cleanup_run_dir
+    echo "AP2 stopped and audio muted"
+}
+
+status_ap2() {
+    mode=$(cat "$RUN/mode" 2>/dev/null || true)
+    echo "mode: ${mode:-stopped}"
+    for kind in dbus avahi nqptp shairport mosquitto; do
+        pid=$(running_pid "$kind" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            echo "$kind running: pid $pid"
+        else
+            echo "$kind stopped"
+        fi
+    done
+    if grep -Eq ':1B58 00000000:0000 0A ' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+        echo "airplay port 7000: listening"
+    else
+        echo "airplay port 7000: not listening"
+    fi
+    guard_pid=$(cat "$RUN/guard.pid" 2>/dev/null || true)
+    if [ -n "$guard_pid" ] && kill -0 "$guard_pid" 2>/dev/null; then
+        echo "resource guard running: pid $guard_pid"
+    else
+        echo "resource guard stopped"
+    fi
+    echo "free_kib=$(free_kib)"
+    if [ -f "$RUN/low-memory-trip" ]; then
+        echo "low-memory trip: $(cat "$RUN/low-memory-trip")"
+    fi
+}
+
+case "${1:-}" in
+    start) start_ap2 "${2:-dry-run}" ;;
+    stop) stop_ap2 ;;
+    restart)
+        stop_ap2 || exit 1
+        start_ap2 "${2:-dry-run}"
+        ;;
+    status) status_ap2 ;;
+    *)
+        echo "usage: $0 {start [dry-run|real]|stop|restart [dry-run|real]|status}" >&2
+        exit 2
+        ;;
+esac

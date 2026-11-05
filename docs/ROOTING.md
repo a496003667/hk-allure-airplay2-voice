@@ -1,8 +1,19 @@
-# Harman Kardon Allure：临时 root 访问方法
+# Harman Kardon Allure：首次 root 入口与后续维护
 
 [返回项目说明](../README.md)
 
-这台 Allure 的原厂 UPnP 闹钟接口接受 `Method=RunScript`，并以 root 身份执行 `Context` 中的 shell 命令。利用一次性闹钟启动原厂自带的 `inetd`，即可取得临时 root shell。整个入口不需要刷固件、解锁 bootloader、拆机或启用原厂 Telnet。
+这台 Allure 的 root 访问分为两个阶段：
+
+| 阶段 | 用途 | 实现 |
+|---|---|---|
+| 首次取得 root | 安装维护工具、备份 | 原厂 UPnP `SetAlarmQueue / RunScript` → 临时 inetd shell |
+| 后续日常维护 | 重启后仍可连接 | 原厂 stunnel + mTLS 客户端证书认证 + 独立 supervisor + 开机启动项 |
+
+**后来已经安装了常驻维护通道**，并验证过完整重启后恢复。日常操作请看 [mTLS 常驻维护通道](MAINTENANCE.md)，无需每次重新创建 UPnP 闹钟。
+
+这两个阶段都曾使用 TCP `23232`，但协议不同：早期是明文 shell，后期是需要客户端证书的 TLS。已经部署 mTLS 时，不要再用本文的临时 inetd 配置占用同一端口，也不能用普通 `nc` 判断认证是否成功。
+
+下文保留首次入口的具体记录：原厂 UPnP 闹钟接口接受 `Method=RunScript`，并以 root 身份执行 `Context` 中的 shell 命令。利用一次性闹钟启动原厂自带的 `inetd`，即可取得临时 root shell。整个入口不需要刷固件、解锁 bootloader、拆机或启用原厂 Telnet。
 
 本文依据 **2026-11-01 在作者自有的一台 Harman Kardon Allure 上的实际操作记录**整理，2026-11-05 成文。测试系统为 Linux `3.10.33`、ARMv7、约 110 MB 内存、2019-09 系列固件。其他型号、固件或已经精简掉原厂 UPnP 的系统未经验证。
 
@@ -30,7 +41,7 @@
 
 “Once”只限制闹钟触发次数，**不会自动关闭已经启动的 shell 服务**。最后必须执行第 5 节的清理步骤。
 
-此端口没有密码、认证或加密，只应在自己控制的局域网中短时使用。本文不提供常驻入口；不要将端口转发到公网。
+本节的临时 inetd 端口没有密码、认证或加密，只应在自己控制的局域网中短时使用；不要将它转发到公网。后来的常驻入口使用 mTLS，配置和认证方式见单独的维护文档。
 
 ## 2. 查找真实 UPnP 端口
 
@@ -209,6 +220,8 @@ amixer -c 0 sset 'Auto Mute' on
 不要在内存紧张时同时拉起多套播放器或原厂主控。`rootApp` 会管理原厂进程，误启动第二份 `rootApp`、Boa 端口冲突或 OOM 都曾导致报警。不要通过运行原厂守护进程的 `--help` 来探测参数：部分程序会直接启动另一份实例。
 
 ## 5. 关闭 shell，并删除测试闹钟
+
+本节只针对早期 `/tmp/hk-inetd.conf` 临时入口，不用于关闭后来的 stunnel 维护通道。
 
 这两项是独立操作：删除闹钟不会停止 inetd，停止 inetd 也不会删除闹钟记录。
 

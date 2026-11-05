@@ -6,7 +6,7 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 ## ⚠️ Read this first
 
-- You need a **root shell** on the speaker. See [temporary root access on the Allure](docs/ROOTING.md) (Chinese) for the verified UPnP entry point and shutdown/cleanup steps. Maintenance-channel certificates and keys are not included.
+- You need a **root shell** on the speaker. See [initial root access](docs/ROOTING.md) and the [persistent mTLS maintenance channel](docs/MAINTENANCE.md) (Chinese). The latter starts at boot and is used for routine maintenance. Certificates and keys are not included.
 - The speaker has **no offline recovery path**. This project only touches the `/vendor` user-data partition and `/etc/init.d` start scripts; it never writes the bootloader, kernel or firmware partitions, and every feature can be switched off with `touch …/disable`. Please keep to the same boundary.
 - Tested on one Allure only (Amlogic quad-core Cortex‑A5, ~110 MB RAM, Linux 3.10.33, firmware from 2019-09).
 - Not affiliated with Harman Kardon, Amazon, Apple, Baidu or ModelScope; all names are trademarks of their respective owners.

@@ -6,7 +6,7 @@
 
 ## ⚠️ 风险提示
 
-- 需要音箱的 **root shell**；获取方法见 [Allure 临时 root 访问记录](docs/ROOTING.md)，包含已验证的 UPnP 入口及关闭、清理步骤。仓库不包含维护通道的证书和密钥。
+- 需要音箱的 **root shell**；[首次获取 root](docs/ROOTING.md) 使用原厂 UPnP 入口，后续日常使用[开机自启的 mTLS 维护通道](docs/MAINTENANCE.md)。仓库不包含维护通道的证书和密钥。
 - 这台音箱**没有离线救砖手段**。本项目只改 `/vendor` 用户数据区和 `/etc/init.d` 启动脚本，从不写 bootloader、内核或固件分区；所有功能都可以用 `touch …/disable` 关掉。请你也遵守这个边界。
 - 只在作者自己的一台 Allure 上验证过（Amlogic 4 核 Cortex‑A5，约 110 MB 内存，Linux 3.10.33，2019-09 固件）。
 - 与哈曼卡顿、Amazon、Apple、百度、魔搭无任何关联；相关名称为各自所有者的商标。

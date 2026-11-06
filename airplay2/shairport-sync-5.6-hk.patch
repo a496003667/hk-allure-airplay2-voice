@@ -298,7 +298,7 @@ index 29ce6c0..7ff1134 100644
  }
  
 diff --git a/rtsp.c b/rtsp.c
-index 3e66903..7ff2c5b 100644
+index 3e66903..0ddf6a8 100644
 --- a/rtsp.c
 +++ b/rtsp.c
 @@ -180,6 +180,26 @@ static void track_thread(rtsp_conn_info *conn) {
@@ -345,7 +345,7 @@ index 3e66903..7ff2c5b 100644
        }
        pthread_cleanup_pop(1); // unlock the conn->flush_mutex
      }
-@@ -1677,7 +1699,35 @@ void handle_pair_remove(rtsp_conn_info *conn __attribute__((unused)), rtsp_messa
+@@ -1677,7 +1699,37 @@ void handle_pair_remove(rtsp_conn_info *conn __attribute__((unused)), rtsp_messa
    debug_log_rtsp_message_conn(conn, 1, "pair-remove response", resp);
  }
  
@@ -356,7 +356,7 @@ index 3e66903..7ff2c5b 100644
 +// group), and a Mac joining such a receiver does not take over its volume.
 +// Opening the AirPlay picker only fetches /info and does not pair, so it
 +// does not interrupt playback.
-+static void preempt_other_sender(rtsp_conn_info *conn) {
++static void preempt_other_sender(rtsp_conn_info *conn, const char *why) {
 +  rtsp_conn_info *previous = NULL;
 +  int previous_number = 0;
 +  char previous_ip[INET6_ADDRSTRLEN] = "";
@@ -369,26 +369,68 @@ index 3e66903..7ff2c5b 100644
 +  }
 +  pthread_rwlock_unlock(&principal_conn_lock);
 +  if (previous != NULL) {
-+    debug(1, "Connection %d: %s is pairing; ending connection %d from %s now.",
-+          conn->connection_number, conn->client_ip_string, previous_number, previous_ip);
++    warn("hk: connection %d from %s is doing %s; ending connection %d from %s.",
++         conn->connection_number, conn->client_ip_string, why, previous_number, previous_ip);
 +    release_play_lock(previous); // no-op if it is no longer the principal
 +    terminate_conn(previous_number);
 +  }
 +}
 +
  void handle_pair_verify(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
-+  preempt_other_sender(conn);
++  // No preemption here: pair-verify also comes from devices that only check
++  // on the receiver in the background (home hubs, nearby iPhones), and it cut
++  // off the playing sender.  A sender the user picks does pair-setup.
    // try to pick up the stages
    uint8_t *b = (uint8_t *)req->content;
    char mstage = '-';
-@@ -1753,6 +1803,7 @@ void handle_pair_pin_start(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
+@@ -1753,6 +1805,7 @@ void handle_pair_pin_start(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
  }
  
  void handle_pair_setup(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
-+  preempt_other_sender(conn);
++  preempt_other_sender(conn, "pair-setup");
    debug(4, "Connection %d from \"%s\": handle_pair_setup, Content-Length %d",
          conn->connection_number, conn->ap2_client_name, req->contentlength);
    debug_log_rtsp_message_conn(conn, 4, "pair-setup request", req);
+@@ -2259,6 +2312,8 @@ void handle_teardown_2(rtsp_conn_info *conn, __attribute__((unused)) rtsp_messag
+     if (streams != NULL) {
+       // just drop the player, leave the connection open
+       if (conn->player_thread) {
++        warn("hk: connection %d from %s: sender stopped the stream (TEARDOWN)",
++             conn->connection_number, conn->client_ip_string);
+         debug(4,
+               "Connection %d from \"%s\": TEARDOWN (AP2 %s) %s Content-Length %d is stopping a "
+               "player thread",
+@@ -3950,6 +4005,8 @@ void rtsp_conversation_thread_cleanup_function(void *arg) {
+           conn->connection_number, get_category_string(conn->airplay_stream_category));
+ 
+     if (conn->player_thread) {
++      warn("hk: connection %d from %s closed while playing", conn->connection_number,
++           conn->client_ip_string);
+       debug(4, "player stop in rtsp_conversation_thread_cleanup_function");
+       player_stop(conn); // this nulls the player_thread and cancels the threads...
+       activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
+@@ -4126,7 +4183,10 @@ static void *rtsp_conversation_thread_func(void *pconn) {
+   rtsp_message *req = NULL, *resp = NULL;
+ 
+ #ifdef CONFIG_AIRPLAY_2
+-  conn->ap2_audio_buffer_size = 1024 * 1024 * 8;
++  // HK local change: the sender fills whatever we advertise, so 8 MB cost
++  // ~8 MB of RAM a few minutes into every song on this 110 MB speaker.
++  // 2 MB is still about a minute of 256 kbit/s AAC.
++  conn->ap2_audio_buffer_size = 1024 * 1024 * 2;
+ #endif
+ 
+   while (conn->stop == 0) {
+@@ -4252,6 +4312,9 @@ static void *rtsp_conversation_thread_func(void *pconn) {
+       pthread_cleanup_pop(1);
+     } else { // if the response is not rtsp_read_request_response_ok
+       conn->stop = 1;
++      if (conn->player_thread)
++        warn("hk: connection %d from %s: RTSP connection lost while playing (reason %d)",
++             conn->connection_number, conn->client_ip_string, reply);
+       if (reply == rtsp_read_request_response_read_error) {
+         debug(1, "bad packet received.");
+         struct linger so_linger;
 diff --git a/rtsp.h b/rtsp.h
 index 312763c..cb677d3 100644
 --- a/rtsp.h

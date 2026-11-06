@@ -18,6 +18,14 @@ PA_UNMUTE_LIB=${HK_AP2_PA_UNMUTE_LIB:-$ROOT/lib/libhk-airplay-unmute.so}
 PA_MUTE_LIB=${HK_AP2_PA_MUTE_LIB:-$ROOT/lib/libhk-airplay-mute.so}
 PA_LOG="$RUN/pa-hook.log"
 HOOK_LOG="$RUN/hook.log"
+# Speaker hand-off with the on-device voice assistant, which calls this hook
+# with HK_AP2_VOICE=1.  While it has the speaker (voice-owns), AirPlay's own
+# start/stop calls must not touch the path: the start is deferred and the
+# voice assistant hands the speaker over when its reply ends.
+VOICE_OWNS="$RUN/voice-owns"
+DEFERRED="$RUN/ap2-deferred"
+CLAIM="$RUN/ap2-claim"
+SPEAKER_LOCK="$RUN/speaker.lock"
 
 # The AP2 loader must not leak its glibc path into stock shell commands.
 unset LD_LIBRARY_PATH
@@ -62,6 +70,30 @@ switch_state() {
     env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sget "$1" 2>/dev/null |
         sed -n 's/.*\[\(on\|off\)\].*/\1/p' |
         sed -n '1p'
+}
+
+speaker_lock() {
+    n=0
+    while ! mkdir "$SPEAKER_LOCK" 2>/dev/null; do
+        n=$((n + 1))
+        if [ "$n" -ge 30 ]; then             # stale lock (holder killed)
+            rmdir "$SPEAKER_LOCK" 2>/dev/null
+            mkdir "$SPEAKER_LOCK" 2>/dev/null
+            return 0
+        fi
+        usleep 100000 2>/dev/null || sleep 1
+    done
+}
+
+speaker_unlock() { rmdir "$SPEAKER_LOCK" 2>/dev/null || true; }
+
+# The voice flag holds the uptime it was taken; ignore it after 5 minutes
+# in case the voice assistant died without clearing it.
+voice_owns() {
+    t=$(sed -n 1p "$VOICE_OWNS" 2>/dev/null)
+    case "$t" in ''|*[!0-9]*) return 1 ;; esac
+    now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+    [ $((now - t)) -lt 300 ]
 }
 
 read_file() {
@@ -169,6 +201,17 @@ start_failed() {
 case "${1:-}" in
     start)
         hook_log "start requested armed=$([ -f "$SAFE/armed" ] && echo yes || echo no) tripped=$([ -f "$SAFE/tripped" ] && echo yes || echo no)"
+        if [ -z "${HK_AP2_VOICE:-}" ]; then
+            speaker_lock
+            if voice_owns; then
+                : >"$DEFERRED"
+                speaker_unlock
+                hook_log "start deferred: the voice assistant has the speaker"
+                exit 0
+            fi
+            cut -d. -f1 /proc/uptime >"$CLAIM" 2>/dev/null
+            speaker_unlock
+        fi
         [ -f "$SAFE/armed" ] || exit 1
         [ ! -f "$SAFE/tripped" ] || exit 1
         watchdog_alive || exit 1
@@ -243,6 +286,13 @@ case "${1:-}" in
         exit 0
         ;;
     stop|mute)
+        if [ -z "${HK_AP2_VOICE:-}" ]; then
+            rm -f "$DEFERRED" "$CLAIM"
+            if voice_owns; then
+                hook_log "${1:-stop} ignored: the voice assistant has the speaker"
+                exit 0
+            fi
+        fi
         hook_log "${1:-stop} requested"
         hard_mute
         [ "$USE_STOCK_PA" != "1" ] || stock_pa_mute 1 || true

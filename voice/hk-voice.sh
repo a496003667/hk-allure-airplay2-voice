@@ -75,8 +75,47 @@ led_keeper() {
     done
 }
 
-HOOK_ENV="HK_AP2_USE_STOCK_PA=1 HK_AP2_MASTER_SAFE=4 HK_AP2_DIGITAL_SAFE=192 HK_AP2_PLAYBACK_SAFE=1"
+HOOK_ENV="HK_AP2_VOICE=1 HK_AP2_USE_STOCK_PA=1 HK_AP2_MASTER_SAFE=4 HK_AP2_DIGITAL_SAFE=192 HK_AP2_PLAYBACK_SAFE=1"
 PREPARED=$RUN/prepared
+
+# Speaker hand-off with AirPlay (see hk-ap2-audio-hook.sh): we take the
+# speaker only under the shared lock, and only if AirPlay has not just
+# claimed it; while we hold voice-owns, AirPlay's hook defers its start.
+VOICE_OWNS=/tmp/hk-ap2/run/voice-owns
+AP2_DEFERRED=/tmp/hk-ap2/run/ap2-deferred
+AP2_CLAIM=/tmp/hk-ap2/run/ap2-claim
+SPEAKER_LOCK=/tmp/hk-ap2/run/speaker.lock
+speaker_lock() {
+    n=0
+    while ! mkdir "$SPEAKER_LOCK" 2>/dev/null; do
+        n=$((n + 1))
+        if [ "$n" -ge 30 ]; then
+            rmdir "$SPEAKER_LOCK" 2>/dev/null
+            mkdir "$SPEAKER_LOCK" 2>/dev/null
+            return 0
+        fi
+        usleep 100000
+    done
+}
+speaker_unlock() { rmdir "$SPEAKER_LOCK" 2>/dev/null; }
+ap2_claimed() {   # AirPlay's hook started the path in the last 8 s
+    t=$(sed -n 1p "$AP2_CLAIM" 2>/dev/null)
+    case "$t" in ''|*[!0-9]*) return 1 ;; esac
+    [ $(( $(cut -d. -f1 /proc/uptime) - t )) -lt 8 ]
+}
+# Drop voice-owns; if AirPlay asked for the speaker meanwhile, hand it over.
+voice_release() {
+    speaker_lock
+    rm -f "$VOICE_OWNS"
+    deferred=
+    [ -f "$AP2_DEFERRED" ] && deferred=1
+    rm -f "$AP2_DEFERRED"
+    speaker_unlock
+    if [ -n "$deferred" ]; then
+        log "AirPlay started during the reply; handing the speaker over"
+        reopen_watch </dev/null >/dev/null 2>&1 &
+    fi
+}
 
 AMIXER=/system/workdir/bin/amixer
 mx() { env LD_LIBRARY_PATH=/system/workdir/lib "$AMIXER" -c 0 "$@" >/dev/null 2>&1; }
@@ -164,8 +203,16 @@ prepare_output() {
         usleep 100000
         i=$((i + 1))
     done
-    if ! pcm_closed; then
-        log "output busy; reply will not be played"
+    speaker_lock
+    if pcm_closed && ! ap2_claimed; then
+        cut -d. -f1 /proc/uptime >"$VOICE_OWNS"
+        mine=1
+    else
+        mine=
+    fi
+    speaker_unlock
+    if [ -z "$mine" ]; then
+        log "output busy (AirPlay); reply will not be played"
     elif [ ! -f "$SAFE/armed" ] || [ -f "$SAFE/tripped" ]; then
         log "speaker path not armed or tripped"
     else
@@ -180,6 +227,7 @@ prepare_output() {
             stop_stream
         fi
     fi
+    [ "$st" = ok ] || [ -z "$mine" ] || voice_release
     echo "$st" >"$PREPARED.tmp" && mv "$PREPARED.tmp" "$PREPARED"
 }
 
@@ -191,6 +239,7 @@ close_output() {
     if [ "$(cat "$PREPARED" 2>/dev/null)" = ok ]; then
         env $HOOK_ENV "$HOOK" stop      # fades out while silence still flows
         stop_stream
+        voice_release
     fi
     rm -f "$PREPARED"
 }
@@ -279,7 +328,7 @@ do_action() {
 # part from just before the wake.  asr_tts writes <file>.swp while recording.
 PRE_A=/dev/shm/hk-voice-pre-a.wav
 PRE_B=/dev/shm/hk-voice-pre-b.wav
-PREROLL_MAX=${HK_VOICE_PREROLL_MAX:-3528000}   # 20 s of 44.1 kHz stereo S16
+PREROLL_MAX=${HK_VOICE_PREROLL_MAX:-1764000}   # 10 s of 44.1 kHz stereo S16 (RAM)
 BYTES_PER_S=176400
 CUR=
 
@@ -376,6 +425,7 @@ cleanup_output() {
     fi
     rm -f "$QD"/* "$LED_FLAG" "$PREPARED" "$ACTION" /tmp/hk-ap2/run/release-dac 2>/dev/null
     rmdir "$RUN/reopen.lock" 2>/dev/null
+    [ -f "$VOICE_OWNS" ] && voice_release
 }
 
 # Speak a short text (reminders), handling AirPlay like a wake does.
@@ -439,6 +489,7 @@ pcm_running() { [ "$(cat "$PCM_STATUS" 2>/dev/null | sed -n 1p)" = "state: RUNNI
 release_airplay() {
     pcm_running && PAUSED=1
     env $HOOK_ENV "$HOOK" stop
+    rm -f "$AP2_CLAIM"
     : >"$RELEASE"
     "$MQTT" hk-ap2/remote pause >/dev/null 2>&1
     RELEASED=1
@@ -594,6 +645,34 @@ loop() {
     done
 }
 
+# Memory watch (runs in the supervisor, which is not a low-memory-killer
+# target): when free + page cache drops under 24 MB, log a snapshot of the
+# largest processes and kernel memory, at most once a minute.
+MEMLOG=$RUN/mem.log
+mem_watch() {
+    set -- $(awk '/^MemFree:/{f=$2} /^Cached:/{c=$2} /^Shmem:/{s=$2}
+                  END{print f, c - s}' /proc/meminfo)
+    [ $(( $1 + $2 )) -lt 24576 ] || return 0
+    now=$(cut -d. -f1 /proc/uptime)
+    [ $((now - ${MEM_LAST:-0})) -ge 60 ] || return 0
+    MEM_LAST=$now
+    {
+        echo "== $(date '+%m-%d %H:%M:%S') free ${1} kB, file cache ${2} kB"
+        grep -E '^(AnonPages|Shmem|Slab|SUnreclaim|KernelStack|PageTables|VmallocUsed):' /proc/meminfo |
+            tr -s ' ' | tr '\n' ' '
+        echo
+        df -k /dev/shm /tmp 2>/dev/null | awk 'NR>1{print "tmpfs", $6, $3 " kB"}'
+        for p in /proc/[0-9]*; do
+            r=$(awk '/^VmRSS:/{print $2}' "$p/status" 2>/dev/null)
+            [ -n "$r" ] && [ "$r" -gt 400 ] &&
+                echo "$r ${p#/proc/} $(tr '\0' ' ' <"$p/cmdline" 2>/dev/null | cut -c1-60)"
+        done | sort -rn | head -12
+    } >>"$MEMLOG" 2>/dev/null
+    if [ "$(wc -c <"$MEMLOG")" -gt 32768 ]; then
+        tail -c 16384 "$MEMLOG" >"$MEMLOG.tmp" && mv "$MEMLOG.tmp" "$MEMLOG"
+    fi
+}
+
 case "${1:-start}" in
     boot)
         [ -f "$D/disable" ] && exit 0
@@ -609,8 +688,12 @@ case "${1:-start}" in
         echo $$ >"$RUN/supervisor.pid"
         "$0" start
         back=10
+        tick=0
         while :; do
-            sleep 10
+            sleep 5
+            mem_watch
+            tick=$((tick + 1))
+            [ $((tick % 2)) = 0 ] || continue
             [ -f "$D/disable" ] && continue
             pid=$(cat "$PIDFILE" 2>/dev/null)
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then

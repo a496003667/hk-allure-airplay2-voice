@@ -32,7 +32,8 @@
 - 修正 get_info plist 里多出的 `</dict>`（严格的 plist 解析会得到空 plist）。
 - 没有会话时的远程控制回退；事件 socket 接收 2 秒超时。
 - ALSA 丢弃数据前先用 `Digital Playback Volume` 淡出，避免暂停、拖进度时爆音。
-- 另一台设备 pair-setup/verify 时立即让出旧会话，解决 iPhone 和 Mac 互相接管时的爆音。
+- 另一台设备 pair-setup 时立即让出旧会话，解决 iPhone 和 Mac 互相接管时的爆音。最初 pair-verify 也会触发，但后台做 pair-verify 的设备会把正在播放的发送端踢掉，已去掉。抢占、TEARDOWN、播放中断线都会以 `hk:` 开头写进 shairport.log。
+- 告诉发送端的缓冲区（audioBufferSize）从 8 MB 改成 2 MB：发送端会把它填满，原来播放几分钟后 Shairport 会多占约 8 MB 内存。
 - `/tmp/hk-ap2/run/release-dac` 存在时，暂停（SETRATEANCHORTIME rate 0）和 flush 都会关闭声卡，并且不自动重开。语音助手靠这个在 AirPlay 会话中途借用喇叭。AirPlay 2 暂停时原本不会释放声卡。
 - 已知现象：AirPlay 重启后，Mac 不会主动重发音量，手动断开再重连一次就好。
 
@@ -56,9 +57,12 @@
 - 播放：`hk-voice feedq | aplay` 一直输出静音流，回复按句插入，喇叭只在静音时开关（见"出声路径"）。
 - 原厂 CA 证书太旧，没有 ISRG Root X1/X2，访问 open-meteo 要用自带的 CA 包。
 - 音箱没有可路由的 IPv6，curl 强制只走 IPv4。
+- 语音助手和 AirPlay 交接喇叭：两边都在 `/tmp/hk-ap2/run/speaker.lock` 下判断归属。语音占着喇叭时（`voice-owns`），AirPlay hook 的 start 推迟、stop 忽略；回答结束后由语音助手按无爆音顺序把喇叭交还给 AirPlay。没有这个机制时，两边会在同一秒开关功放，导致爆音，AirPlay 还会没声音。
 - 直接 kill 语音循环可能留下静音流占着声卡，导致 AirPlay 报 "hw:0,0 is busy"；要用 `hk-voice.sh stop/start`，它们会清理残留。
 
 ## 内存
 
 - 正常空闲约 18–30 MB（按 MemFree 算，页缓存多时会显得偏低）。
 - 语音循环 `oom_score_adj=15`，AirPlay 是 11，原厂进程是 0：内存紧张时先杀语音助手。
+- 低内存杀手（lowmemorykiller）只在空闲内存和文件缓存**同时**低于 6 MB 时才会杀 `oom_score_adj` 为 15 的语音循环。语音监护进程每 5 秒检查一次，两者之和低于 24 MB 时，把内存快照写进 `/tmp/hk-voice/mem.log`。
+- 预录每 10 秒轮换一次，内存盘里最多约 1.7 MB。

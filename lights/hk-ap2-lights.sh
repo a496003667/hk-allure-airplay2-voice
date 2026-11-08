@@ -20,7 +20,7 @@
 D=${HK_LIGHTS_DIR:-/tmp/hk-lights}
 SHM=${HK_LIGHTS_BIN:-$D}/hk-shm-play
 REQUEST=/tmp/hk-ap2/opt/bin/hk-unix-request-raw
-RUN=/tmp/hk-ap2/run
+RUN=${HK_LIGHTS_RUN:-/tmp/hk-ap2/run}
 PCM_STATUS=/proc/asound/card0/pcm0p/sub0/status
 PIDFILE=$D/lights.pid
 LOG=$D/lights.log
@@ -33,13 +33,26 @@ log() {
     fi
 }
 
-shairport_running_pcm() {
+voice_owns() {
+    stamp=$(sed -n 1p "$RUN/voice-owns" 2>/dev/null)
+    case "$stamp" in ''|*[!0-9]*) return 1 ;; esac
+    now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+    [ $((now - stamp)) -lt 300 ]
+}
+
+airplay_playback_active() {
     # Shairport keeps the PCM running (feeding silence) for the whole active
     # session to avoid DAC pops, so "playing" is the audio hook's playback
-    # lease: created when play begins, removed when it ends.
+    # lease plus the AirPlay-only claim: both are created when play begins
+    # and removed when it ends. The claim prevents voice/Bluetooth playback
+    # from lighting the AirPlay animation.
     pid=$(sed -n 1p "$RUN/shairport.pid" 2>/dev/null)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-    [ -f "$RUN/safe/play.started" ]
+    [ -f "$RUN/safe/play.started" ] || return 1
+    [ -f "$RUN/ap2-claim" ] || return 1
+    [ ! -f "$RUN/bt-owner.pid" ] || return 1
+    voice_owns && return 1
+    return 0
 }
 
 sender_connected() {
@@ -115,7 +128,7 @@ run() {
             continue
         fi
 
-        if shairport_running_pcm; then
+        if airplay_playback_active; then
             idle=0
             if [ "$owned" = 0 ]; then
                 claim && owned=1
@@ -164,8 +177,20 @@ case "${1:-}" in
         else
             echo "stopped"
         fi
+        if airplay_playback_active; then
+            echo "AirPlay playback: active"
+        else
+            echo "AirPlay playback: idle"
+        fi
         "$SHM" get
         tail -n 5 "$LOG" 2>/dev/null
         ;;
-    *) echo "usage: $0 run|boot|stop|status"; exit 2 ;;
+    state)
+        if airplay_playback_active; then
+            echo active
+        else
+            echo idle
+        fi
+        ;;
+    *) echo "usage: $0 run|boot|stop|status|state"; exit 2 ;;
 esac

@@ -25,7 +25,7 @@ release_runtime() {
     /vendor/airplay2/hk-ap2-prodctl stop >>"$LOG" 2>&1
     for round in 1 2 3; do
         for p in "$OPT/etc/ap2/shairport-sync.conf" "$OPT/bin/nqptp" "$OPT/bin/shairport-sync" \
-            "$OPT/hk-ap2-audio-hook.sh" "$OPT/bin/hk-ap2ctl"; do
+            "$OPT/hk-ap2-audio-hook.sh" "$OPT/bin/hk-ap2ctl" "$OPT/bin/hk-ap2-safe-test"; do
             umount "$p" 2>/dev/null && log "unmounted $p"
         done
     done

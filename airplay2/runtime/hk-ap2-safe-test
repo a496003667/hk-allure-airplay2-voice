@@ -11,12 +11,17 @@ set -u
 ROOT=${HK_AP2_ROOT:-/tmp/hk-ap2/opt}
 RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
 SAFE="$RUN/safe"
+BT_OWNER="$RUN/bt-owner.pid"
+BT_HEARTBEAT="$RUN/bt-heartbeat"
+HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
 AP2CTL="$ROOT/bin/hk-ap2ctl"
 AMIXER=${HK_AP2_AMIXER:-/system/workdir/bin/amixer}
 AMIXER_LIB=${HK_AP2_AMIXER_LIB:-/system/workdir/lib}
 MASTER_SAFE=${HK_AP2_MASTER_SAFE:-4}
 DIGITAL_SAFE=${HK_AP2_DIGITAL_SAFE:-128}
 PLAYBACK_SAFE=${HK_AP2_PLAYBACK_SAFE:-0}
+BT_DIGITAL_SAFE=${HK_AP2_BT_DIGITAL_SAFE:-207}
+BT_PLAYBACK_SAFE=${HK_AP2_BT_PLAYBACK_SAFE:-0}
 MAX_PLAY_SECONDS=${HK_AP2_MAX_PLAY_SECONDS:-12}
 WATCHDOG_OOM_SCORE_ADJ=${HK_AP2_WATCHDOG_OOM_SCORE_ADJ:-500}
 
@@ -171,6 +176,44 @@ watchdog_loop() {
             continue
         fi
 
+        # Bluetooth borrows the same playback lease. If its independent
+        # bridge dies or stops refreshing its heartbeat, revoke the lease
+        # immediately rather than trusting the still-running AP2 process.
+        if [ -f "$BT_OWNER" ]; then
+            bt_pid=$(read_file "$BT_OWNER")
+            bt_heartbeat=$(read_file "$BT_HEARTBEAT")
+            bt_valid=1
+            bt_current=unknown
+            case "$bt_pid:$bt_heartbeat" in
+                ''|*[!0-9:]*|:*|*:) bt_valid=0 ;;
+            esac
+            if [ "$bt_valid" = 1 ]; then
+                kill -0 "$bt_pid" 2>/dev/null || bt_valid=0
+                # The bridge can publish a new heartbeat after this loop's
+                # initial clock read. Read the clock again after the heartbeat
+                # so a second boundary cannot look like a future timestamp.
+                bt_current=$(now)
+                [ "$bt_heartbeat" -le "$bt_current" ] &&
+                    [ $((bt_current - bt_heartbeat)) -le 4 ] || bt_valid=0
+            fi
+            if [ "$bt_valid" = 0 ] && [ ! -f "$BT_OWNER" ] &&
+               [ ! -s "$SAFE/play.started" ]; then
+                # A normal release removes the lease, owner and heartbeat.
+                # The owner may disappear after our initial existence check.
+                bt_valid=1
+            fi
+            if [ "$bt_valid" = 0 ]; then
+                write_file "$SAFE/tripped" "Bluetooth bridge lost" || true
+                rm -f "$SAFE/play.started" "$BT_OWNER" "$BT_HEARTBEAT"
+                hard_mute
+                deadline=
+                last_marker=
+                log_action "Bluetooth bridge lost; hard mute pid=$bt_pid heartbeat=$bt_heartbeat now=${bt_current:-unknown}"
+                sleep 1
+                continue
+            fi
+        fi
+
         if [ -n "$marker" ] && [ "$marker" != "$last_marker" ]; then
             last_marker=$marker
             if [ "$MAX_PLAY_SECONDS" -gt 0 ]; then
@@ -213,6 +256,17 @@ watchdog_loop() {
                 sleep 1
                 continue
             fi
+            # Bluetooth follows the stock 0..32 Master control. The AP2
+            # path retains its existing setting; both retain the separate
+            # digital and physical output protection.
+            master_limit=$MASTER_SAFE
+            digital_limit=$DIGITAL_SAFE
+            playback_safe="$PLAYBACK_SAFE,$PLAYBACK_SAFE"
+            if [ -f "$BT_OWNER" ]; then
+                master_limit=32
+                digital_limit=$BT_DIGITAL_SAFE
+                playback_safe="$BT_PLAYBACK_SAFE,$BT_PLAYBACK_SAFE"
+            fi
             master=$(mixer_master)
             case "$master" in
                 ''|*[!0-9]*)
@@ -225,9 +279,9 @@ watchdog_loop() {
                     continue
                     ;;
                 *)
-                    if [ "$master" -gt "$MASTER_SAFE" ]; then
-                        mixer_set "Master" "$MASTER_SAFE" || true
-                        log_action "watchdog clamped Master from $master to $MASTER_SAFE"
+                    if [ "$master" -gt "$master_limit" ]; then
+                        mixer_set "Master" "$master_limit" || true
+                        log_action "watchdog clamped Master from $master to $master_limit"
                     fi
                     ;;
             esac
@@ -246,16 +300,15 @@ watchdog_loop() {
                     continue
                     ;;
                 *)
-                    if [ "$digital_left" -gt "$DIGITAL_SAFE" ] ||
-                        [ "$digital_right" -gt "$DIGITAL_SAFE" ]; then
-                        mixer_cset 1 "$DIGITAL_SAFE,$DIGITAL_SAFE" || true
-                        log_action "watchdog clamped Digital Playback Volume to $DIGITAL_SAFE"
+                    if [ "$digital_left" -gt "$digital_limit" ] ||
+                        [ "$digital_right" -gt "$digital_limit" ]; then
+                        mixer_cset 1 "$digital_limit,$digital_limit" || true
+                        log_action "watchdog clamped Digital Playback Volume to $digital_limit"
                     fi
                     ;;
             esac
 
             playback="$(mixer_values 2)"
-            playback_safe="$PLAYBACK_SAFE,$PLAYBACK_SAFE"
             if [ "$playback" != "$playback_safe" ]; then
                 mixer_cset 2 "$playback_safe" || true
                 log_action "watchdog restored Playback Volume to $playback_safe"
@@ -323,6 +376,19 @@ arm() {
         return 1
     fi
 
+    # A maintenance hold survives runtime-directory cleanup. Latch it before
+    # starting Shairport, so a reconnect cannot open the speaker during an
+    # installation or recovery restart.
+    if [ -f "$HOLD_MUTE" ]; then
+        if ! write_file "$SAFE/tripped" "manual mute"; then
+            rm -f "$SAFE/armed"
+            stop_watchdog
+            hard_mute
+            return 1
+        fi
+        hard_mute
+    fi
+
     if ! "$AP2CTL" start real; then
         echo "real AP2 failed to start; disarming" >&2
         rm -f "$SAFE/armed"
@@ -337,7 +403,7 @@ arm() {
     echo "speaker remains off until playback begins"
     echo "max playback: ${MAX_PLAY_SECONDS}s, Master cap: ${MASTER_SAFE}/32"
     echo "digital cap: ${DIGITAL_SAFE}/255, playback attenuation: ${PLAYBACK_SAFE} (-6 dB when 0)"
-    echo "AP2 source volume is independently capped at -12 dB by shairport-sync"
+    echo "AP2 source volume is independently capped at -9 dB by shairport-sync"
     echo "run '$0 status' before testing and '$0 disarm' afterwards"
 }
 

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Install the Bluetooth-player wrapper after /vendor is mounted and before
+# S05linkplay starts rootApp.  A failure leaves the stock player untouched.
+set -u
+
+BASE=${HK_BT_BASE:-/vendor/airplay2}
+STOCK=${HK_BT_STOCK_EXE:-/system/workdir/bin/a01controller}
+WRAPPER="$BASE/hk-bt-controller-wrapper.sh"
+SHIM="$BASE/hk-bt-open-redirect.so"
+CONF="$BASE/hk-bt-alsa.conf"
+TARGET=${HK_BT_TARGET:-/tmp/bin/a01controller}
+TARGET_DIR=${TARGET%/*}
+LOG=${HK_BT_BOOT_LOG:-/tmp/hk-bt-boot.log}
+STOCK_SHA256=${HK_BT_STOCK_SHA256:-150bdfbe5757fd81010d2b99ed700fff591664ba729e901617e31b5d32f748f1}
+WRAPPER_SHA256=${HK_BT_WRAPPER_SHA256:-a6a3fb003825f164e240d7132aebaee635a998460ecc14644eeb2a1041d8a0de}
+SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-91c750546aaf8a66a1b97fdebc9ccd0a712b99bd75467c0ca12daac5962f2f73}
+CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2d128861ebd8285815d2247230fe9d32b43936b36a7bf916a90955e30c21c44a}
+
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
+        >>"$LOG" 2>/dev/null || true
+}
+
+hash_of() {
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+fail() {
+    log "$*"
+    if [ -f "$TARGET" ] && cmp -s "$TARGET" "$WRAPPER"; then
+        rm -f "$TARGET"
+    fi
+    exit 0
+}
+
+[ ! -e "$BASE/disable-bt-dsp" ] || {
+    log "disabled by $BASE/disable-bt-dsp"
+    exit 0
+}
+[ -x "$STOCK" ] || fail "stock player is missing"
+[ -x "$WRAPPER" ] || fail "wrapper is missing or not executable"
+[ -r "$SHIM" ] || fail "redirect shim is missing"
+[ -r "$CONF" ] || fail "private ALSA configuration is missing"
+[ "$(hash_of "$STOCK")" = "$STOCK_SHA256" ] || fail "stock player checksum mismatch"
+[ "$(hash_of "$WRAPPER")" = "$WRAPPER_SHA256" ] || fail "wrapper checksum mismatch"
+[ "$(hash_of "$SHIM")" = "$SHIM_SHA256" ] || fail "redirect shim checksum mismatch"
+[ "$(hash_of "$CONF")" = "$CONF_SHA256" ] || fail "private ALSA configuration checksum mismatch"
+
+mkdir -p "$TARGET_DIR" || fail "cannot create $TARGET_DIR"
+cp "$WRAPPER" "$TARGET.new" || fail "cannot stage wrapper"
+chmod 700 "$TARGET.new" || {
+    rm -f "$TARGET.new"
+    fail "cannot chmod wrapper"
+}
+mv "$TARGET.new" "$TARGET" || fail "cannot install wrapper"
+log "installed Bluetooth DSP wrapper at $TARGET"
+exit 0

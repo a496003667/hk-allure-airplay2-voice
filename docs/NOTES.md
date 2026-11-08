@@ -12,7 +12,7 @@
 
 ## 出声路径（最关键）
 
-- ALSA `Master` 是 asoundrc 里的 softvol，**对 AirPlay 不影响响度**。真正有效的是 Shairport 软件音量和 `Digital Playback Volume`（numid=1，上限 192）。
+- 蓝牙、AirPlay 和语音播报最终都进入原厂 `harmandsp`：它先做左右相加、约 300 Hz 分频和低音/EQ 处理，再写 PCM512x。ALSA `Master` 是原厂播放器的 softvol，对 AirPlay 和语音响度没有作用。
 - 只开 `Ext Spk`、解除 I2S 静音还不够，还要解除**原厂功放静音**：用 `LD_PRELOAD` 预加载一个小库再启动原厂 `apple_remote`，它的构造函数会调用原厂的 `Snd_Ctrl airplay to mute 0/1`。
 - **无爆音的打开顺序**（和用户逐步对听确认）：
   1. 数据流先跑起来（静音也行）；
@@ -31,10 +31,12 @@
 - 加特性位 22 和 `vv=2`：没有它们 Mac 调不了音量。
 - 修正 get_info plist 里多出的 `</dict>`（严格的 plist 解析会得到空 plist）。
 - 没有会话时的远程控制回退；事件 socket 接收 2 秒超时。
-- ALSA 丢弃数据前先用 `Digital Playback Volume` 淡出，避免暂停、拖进度时爆音。
+- Shairport 5.6 是 soft-float 构建，原厂 `harmandsp` 是 hard-float 插件，动态加载器不能把两者直接放进一个进程。因此 Shairport 先输出固定 S32_LE/48 kHz PCM 到 `/tmp/hk-ap2/run/airplay-pcm.fifo`，再由 hard-float `hk-ap2-dsp-bridge` 使用原厂 ALSA 打开 DSP。
+- `hk-ap2-dsp-bridge` 只在 FIFO 有数据时打开声卡，约 1 秒没有新数据就关闭；它退出后由 AP2 supervisor 拉起，启动和关闭阶段仍有独立 watchdog 与硬静音保护。
+- 44.1 kHz 源会在 Shairport 内重采样到 48 kHz，因为原始 pipe 没有格式变更通知；这样桥进程始终只处理一种确定的格式。
 - 另一台设备 pair-setup 时立即让出旧会话，解决 iPhone 和 Mac 互相接管时的爆音。最初 pair-verify 也会触发，但后台做 pair-verify 的设备会把正在播放的发送端踢掉，已去掉。抢占、TEARDOWN、播放中断线都会以 `hk:` 开头写进 shairport.log。
 - 告诉发送端的缓冲区（audioBufferSize）从 8 MB 改成 2 MB：发送端会把它填满，原来播放几分钟后 Shairport 会多占约 8 MB 内存。
-- `/tmp/hk-ap2/run/release-dac` 存在时，暂停（SETRATEANCHORTIME rate 0）和 flush 都会关闭声卡，并且不自动重开。语音助手靠这个在 AirPlay 会话中途借用喇叭。AirPlay 2 暂停时原本不会释放声卡。
+- `/tmp/hk-ap2/run/release-dac` 存在时，现有 Shairport 补丁会阻止 ALSA 自动重开。改用 pipe 后，桥进程在数据停止约 1 秒后自行关闭 DSP，语音助手主要依据这个关闭状态接管声卡。
 - 已知现象：AirPlay 重启后，Mac 不会主动重发音量，手动断开再重连一次就好。
 
 ## 按键与灯效
@@ -54,7 +56,7 @@
 - 识别：百度短语音标准版（dev_pid 1537）。试过百度极速版、远场模型 1936（账号无权限）、谱减法降噪、硅基流动 SenseVoice，在这台机器上都没有稳定的提升。
 - 大模型：魔搭 API-Inference，OpenAI 兼容接口，`Qwen/Qwen3.8-Flash-Next`，`enable_thinking=false`，流式输出、按句切分后逐句合成。天气和提醒用 tool call；提醒的绝对时间由程序按北京时间计算，不让模型自己换算。
 - 合成：百度 TTS，音色 4189 返回 24 kHz（基础音色是 16 kHz），要按 WAV 头里的采样率处理。
-- 播放：`hk-voice feedq | aplay` 一直输出静音流，回复按句插入，喇叭只在静音时开关（见"出声路径"）。
+- 播放：`hk-voice feedq | aplay -D hk_harman_dsp` 一直输出静音流，回复按句插入，流本身先经过原厂 Harman DSP，喇叭仍只在静音时开关（见"出声路径"）。
 - 原厂 CA 证书太旧，没有 ISRG Root X1/X2，访问 open-meteo 要用自带的 CA 包。
 - 音箱没有可路由的 IPv6，curl 强制只走 IPv4。
 - 语音助手和 AirPlay 交接喇叭：两边都在 `/tmp/hk-ap2/run/speaker.lock` 下判断归属。语音占着喇叭时（`voice-owns`），AirPlay hook 的 start 推迟、stop 忽略；回答结束后由语音助手按无爆音顺序把喇叭交还给 AirPlay。没有这个机制时，两边会在同一秒开关功放，导致爆音，AirPlay 还会没声音。

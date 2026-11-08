@@ -33,8 +33,17 @@ INFO_SHIM="$BASE/libhk-ap2-info-shim-soft.so"
 INFO_SHIM_SHA1=78ab5f7782414b9e33154d6d6ead71c2bd2cc05a
 SPS56_SHA1=b6c5263c3ef6f09fd5bc8f7bc9474f99fab042b7
 NQPTP56_SHA1=ea5785e47f215cc9d89192a653aa616e3fb0e4f1
-CONF56_SHA1=657a86a6e5a47f3ca6e34f9d528f5e3d3c932cda
-AUDIO_HOOK_OVERRIDE_SHA1=e973366e237a2674ec5be91d15774a7d51e73432
+CONF56_SHA1=6e9f4e5442750613a450103ed707b3d57d4d8cf1
+AUDIO_HOOK_OVERRIDE_SHA1=2907786440ed3c1cf52042f827ce175f63d2335f
+SAFE_TEST_OVERRIDE="$BASE/hk-ap2-safe-test.bt"
+SAFE_TEST_OVERRIDE_SHA1=ac9e89d4800425e18a68ab60d43709b8619dad65
+BT_BRIDGE="$BASE/hk-bt-bridge.sh"
+BT_BRIDGE_SHA1=b982e59346a1ec5ad9fdac50615b194ded7a6339
+DSP_ALSA_CONF="$BASE/hk-dsp-alsa.conf"
+DSP_ALSA_CONF_SHA1=47af209cbaf6432a1d81e14c8bc1e204bd618890
+DSP_BRIDGE="$BASE/hk-ap2-dsp-bridge"
+DSP_BRIDGE_SHA1=ab9e93eba6a08558c76c9ae5e8193cce92831836
+DSP_FIFO="$RUN/airplay-pcm.fifo"
 REQUEST="$OPT/bin/hk-unix-request-raw"
 MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-34816}
 PLAYER_SOCKET=/tmp/Requesta01controller
@@ -118,6 +127,32 @@ bind_mounted_at() {
     awk -v path="$1" '$2 == path { found = 1 } END { exit !found }' /proc/mounts
 }
 
+ensure_dsp_runtime() {
+    [ -r "$DSP_ALSA_CONF" ] || {
+        log "missing Harman DSP ALSA config: $DSP_ALSA_CONF"
+        return 1
+    }
+    dsp_conf_sha1=$(sha1sum "$DSP_ALSA_CONF" 2>/dev/null | awk '{print $1}')
+    [ "$dsp_conf_sha1" = "$DSP_ALSA_CONF_SHA1" ] || {
+        log "Harman DSP ALSA config checksum mismatch: ${dsp_conf_sha1:-missing}"
+        return 1
+    }
+    grep -q 'libasound_module_pcm_harmandsp.so' "$DSP_ALSA_CONF" &&
+        grep -q 'bypassmode[[:space:]]*0' "$DSP_ALSA_CONF" || {
+        log "Harman DSP ALSA config is not an enabled harmandsp route"
+        return 1
+    }
+    [ -x "$DSP_BRIDGE" ] || {
+        log "missing DSP bridge: $DSP_BRIDGE"
+        return 1
+    }
+    dsp_bridge_sha1=$(sha1sum "$DSP_BRIDGE" 2>/dev/null | awk '{print $1}')
+    [ "$dsp_bridge_sha1" = "$DSP_BRIDGE_SHA1" ] || {
+        log "DSP bridge checksum mismatch: ${dsp_bridge_sha1:-missing}"
+        return 1
+    }
+}
+
 ensure_verified_bind_mount() {
     target_path=$1
     source_path=$2
@@ -173,6 +208,7 @@ select_runtime_controller() {
 }
 
 ensure_runtime_override() {
+    ensure_dsp_runtime || return 1
     select_runtime_controller
     if [ ! -x "$AP2CTL_OVERRIDE" ]; then
         log "missing runtime controller override: $AP2CTL_OVERRIDE"
@@ -201,6 +237,12 @@ ensure_runtime_override() {
         "$AP2CTL_OVERRIDE_SHA1" "runtime controller" || return 1
     ensure_verified_bind_mount "$AUDIO_HOOK" "$AUDIO_HOOK_OVERRIDE" \
         "$AUDIO_HOOK_OVERRIDE_SHA1" "audio hook" || return 1
+    ensure_verified_bind_mount "$SAFE_TEST" "$SAFE_TEST_OVERRIDE" \
+        "$SAFE_TEST_OVERRIDE_SHA1" "Bluetooth-aware safety watchdog" || return 1
+    [ -x "$BT_BRIDGE" ] && [ "$(sha1sum "$BT_BRIDGE" | awk '{print $1}')" = "$BT_BRIDGE_SHA1" ] || {
+        log "Bluetooth bridge missing or checksum mismatch"
+        return 1
+    }
     use_ap256 || return 0
     ensure_verified_bind_mount "$OPT/bin/shairport-sync" "$AP256_DIR/shairport-sync" \
         "$SPS56_SHA1" "shairport 5.6" || return 1
@@ -270,7 +312,7 @@ mount_runtime() {
 unmount_runtime() {
     unmount_failed=0
     for target_path in "$OPT/etc/ap2/shairport-sync.conf" "$OPT/bin/nqptp" \
-        "$OPT/bin/shairport-sync" "$AUDIO_HOOK" "$AP2CTL"; do
+        "$OPT/bin/shairport-sync" "$AUDIO_HOOK" "$AP2CTL" "$SAFE_TEST"; do
         if bind_mounted_at "$target_path"; then
             if umount "$target_path"; then
                 log "$target_path override unmounted"
@@ -328,16 +370,24 @@ stock_value() {
 }
 
 check_stock_safety() {
-    volume=$(stock_value vol)
+    status=$(stock_status) || return 1
+    volume=$(printf '%s' "$status" | sed -n 's/.*"vol":"\([0-9][0-9]*\)".*/\1/p' | sed -n '1p')
+    mode=$(printf '%s' "$status" | sed -n 's/.*"mode":"\([0-9][0-9]*\)".*/\1/p' | sed -n '1p')
     case "$volume" in
         ''|*[!0-9]*)
             log "stock player volume is unavailable"
             return 1
             ;;
     esac
-    if [ "$volume" -gt 30 ]; then
-        log "stock player volume $volume exceeds safety cap 30"
-        return 1
+    [ "$volume" -le 100 ] || return 1
+    # Bluetooth follows the full stock range; retain the existing guard for
+    # other stock modes so the Bluetooth change doesn't alter them.
+    if [ "$mode" != 41 ] && [ "$volume" -gt 30 ]; then
+        log "stock player volume $volume exceeds cap 30; requesting clamp"
+        "$REQUEST" "$PLAYER_SOCKET" setPlayerCmd:vol:30 1200 >/dev/null 2>&1 || return 1
+        volume=$(stock_value vol)
+        case "$volume" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$volume" -le 30 ] || return 1
     fi
     return 0
 }
@@ -361,6 +411,90 @@ restart_allowed() {
     recent_restarts="$recent_restarts $now"
 }
 
+start_bt_bridge() {
+    nohup "$BT_BRIDGE" __run </dev/null >>"$RUN/bt-bridge-process.log" 2>&1 &
+    bt_bridge_pid=$!
+    sleep 1
+    kill -0 "$bt_bridge_pid" 2>/dev/null || { log "Bluetooth bridge failed to start"; return 1; }
+    log "Bluetooth bridge started pid=$bt_bridge_pid"
+}
+
+start_dsp_bridge() {
+    dsp_pid=$(cat "$RUN/dsp-bridge.pid" 2>/dev/null || true)
+    case "$dsp_pid" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$dsp_pid" 2>/dev/null && return 0 ;;
+    esac
+
+    if [ -e "$DSP_FIFO" ] && [ ! -p "$DSP_FIFO" ]; then
+        rm -f "$DSP_FIFO"
+    fi
+    [ -p "$DSP_FIFO" ] || mkfifo "$DSP_FIFO" || {
+        log "failed to create AirPlay PCM FIFO"
+        return 1
+    }
+    chmod 0666 "$DSP_FIFO" 2>/dev/null || true
+
+    nohup env ALSA_CONFIG_PATH="$DSP_ALSA_CONF" \
+        LD_LIBRARY_PATH="$AMIXER_LIB:/lib" \
+        "$DSP_BRIDGE" </dev/null >>"$RUN/dsp-bridge.log" 2>&1 &
+    dsp_pid=$!
+    echo "$dsp_pid" >"$RUN/dsp-bridge.pid"
+    sleep 1
+    kill -0 "$dsp_pid" 2>/dev/null || {
+        log "DSP bridge failed to start"
+        tail -20 "$RUN/dsp-bridge.log" 2>/dev/null
+        return 1
+    }
+    echo 11 >"/proc/$dsp_pid/oom_score_adj" 2>/dev/null || true
+    log "Harman DSP bridge started pid=$dsp_pid"
+}
+
+stop_dsp_bridge() {
+    dsp_pid=$(cat "$RUN/dsp-bridge.pid" 2>/dev/null || true)
+    case "$dsp_pid" in
+        ''|*[!0-9]*)
+            rm -f "$RUN/dsp-bridge.pid"
+            return 0
+            ;;
+    esac
+    dsp_command=$(tr '\000' ' ' <"/proc/$dsp_pid/cmdline" 2>/dev/null || true)
+    case "$dsp_command" in
+        *"$DSP_BRIDGE"*) ;;
+        *)
+            rm -f "$RUN/dsp-bridge.pid"
+            return 0
+            ;;
+    esac
+    kill -TERM "$dsp_pid" 2>/dev/null || true
+    tries=0
+    while kill -0 "$dsp_pid" 2>/dev/null && [ "$tries" -lt 8 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    kill -KILL "$dsp_pid" 2>/dev/null || true
+    rm -f "$RUN/dsp-bridge.pid"
+}
+
+stop_bt_bridge() {
+    bt_bridge_pid=$(cat "$RUN/bt-bridge.pid" 2>/dev/null || true)
+    case "$bt_bridge_pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    bt_command=$(tr '\000' ' ' <"/proc/$bt_bridge_pid/cmdline" 2>/dev/null || true)
+    case "$bt_command" in *"$BT_BRIDGE"*) ;; *) return 0 ;; esac
+    kill -TERM "$bt_bridge_pid" 2>/dev/null || true
+    tries=0
+    while kill -0 "$bt_bridge_pid" 2>/dev/null && [ "$tries" -lt 8 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    if kill -0 "$bt_bridge_pid" 2>/dev/null; then
+        "$SAFE_TEST" mute >/dev/null 2>&1 || true
+        kill -KILL "$bt_bridge_pid" 2>/dev/null || true
+    fi
+}
+
 supervisor_run() {
     if supervisor_alive; then
         log "supervisor already running pid=$(supervisor_pid)"
@@ -372,6 +506,8 @@ supervisor_run() {
 
     cleanup() {
         log "supervisor stopping"
+        stop_bt_bridge
+        stop_dsp_bridge
         stop_ap2
         unmount_runtime || true
         rm -f "$STOPFILE" "$PIDFILE"
@@ -418,6 +554,13 @@ supervisor_run() {
         fi
     fi
     log "AirPlay 2 armed without playback deadline"
+    if ! start_dsp_bridge; then
+        log "Harman DSP bridge unavailable; stopping AP2"
+        return 1
+    fi
+    if ! start_bt_bridge; then
+        log "Bluetooth bridge unavailable; AP2 remains protected"
+    fi
 
     stock_failures=0
     while :; do
@@ -457,6 +600,23 @@ supervisor_run() {
             log "safe watchdog exited"
             break
         fi
+
+        bt_bridge_pid=$(cat "$RUN/bt-bridge.pid" 2>/dev/null || true)
+        case "$bt_bridge_pid" in
+            ''|*[!0-9]*) start_bt_bridge || true ;;
+            *) kill -0 "$bt_bridge_pid" 2>/dev/null || start_bt_bridge || true ;;
+        esac
+
+        dsp_bridge_pid=$(cat "$RUN/dsp-bridge.pid" 2>/dev/null || true)
+        case "$dsp_bridge_pid" in
+            ''|*[!0-9]*)
+                start_dsp_bridge || break
+                ;;
+            *)
+                kill -0 "$dsp_bridge_pid" 2>/dev/null ||
+                    start_dsp_bridge || break
+                ;;
+        esac
 
         if check_stock_safety; then
             stock_failures=0

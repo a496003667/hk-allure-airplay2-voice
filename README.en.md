@@ -16,11 +16,12 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 | Module | What it does |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP. Works from iPhone and Mac (Shairport Sync supports being added to the Home app; not tested by the author); 44.1/48 kHz, 32-bit output; software volume capped at -6 dB |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP. Works from iPhone and Mac (Shairport Sync supports being added to the Home app; not tested by the author); software volume capped at -9 dB and routed through the stock ABI bridge into Harman's two-channel DSP |
+| **Bluetooth / bass** | Keeps the stock A2DP player, but routes it through Harman's two-way DSP: left drives the 90 mm woofer and right drives the mid/high drivers; phone volume drives the stock 33-step software volume before the DSP |
 | **No pops** | Starts the I2S data first, then unmutes the stock amplifier, then switches the speaker on and fades in; no pops on pause, seek, or when two senders take over from each other |
 | **Lights / volume ring** | Shows the stock "playing" animation during playback; the volume ring follows the sender's volume |
 | **Buttons** | While an AirPlay sender is connected, play/pause and volume keys control the sender, with volume kept in sync both ways |
-| **Voice assistant** | Uses the stock "Alexa" wake word; Baidu short-speech ASR → ModelScope Qwen LLM (streamed) → Baidu TTS (voice 4189) |
+| **Voice assistant** | Uses the stock "Alexa" wake word; Baidu short-speech ASR → ModelScope Qwen LLM (streamed) → Baidu TTS (voice 4189), with spoken replies routed through the same Harman DSP |
 | **Conversation** | A chime when you finish speaking; follow-up questions without the wake word for ~5 s; say "Alexa" to interrupt; speaks while the answer is still being generated |
 | **Local commands** | Pause / resume / next / previous / louder / quieter, handled without the LLM |
 | **Weather** | open-meteo (free, no key); default city by IP geolocation; any city, today to the day after tomorrow |
@@ -47,12 +48,13 @@ docs/       technical notes and pitfalls (Chinese)
 ## Building
 
 - **Shairport Sync**: take upstream 5.6 (the author used commit `9118bbc`), apply `airplay2/shairport-sync-5.6-hk.patch`, and cross-compile with a crosstool-ng `arm-unknown-linux-gnueabi` toolchain (soft-float, glibc 2.27). Dependencies: alsa-lib, libsoxr, ffmpeg (libavcodec/swresample), libsodium, libgcrypt, libplist, libmosquitto, avahi, libconfig, libpopt, OpenSSL. The runtime is packed as a cramfs image under `/vendor/airplay2/`, fully isolated from the stock hard-float glibc 2.19. NQPTP is upstream 1.2.x, unmodified.
+- **AirPlay DSP bridge**: Shairport emits fixed S32_LE/48 kHz raw PCM; `airplay2/hk-ap2-dsp-bridge.c` reads the FIFO with the stock hard-float ABI and opens `harmandsp` only while audio is arriving. The build command is in the source header.
 - **hk-voice / key hook**: `armv7-linux-gnueabihf-gcc -Os -o hk-voice hk-voice.c -ldl -static-libgcc`. It reaches the stock libcurl + OpenSSL 1.1 through `dlopen`, avoids libm, and needs no symbol newer than GLIBC_2.17, so it runs on the stock glibc 2.19.
 - **tools/**: static programs written against raw system calls; any ARM cross compiler will do.
 
 ## Installing (outline)
 
-1. Put the modules under `/vendor/airplay2`, `/vendor/hk-lights`, `/vendor/hk-keys`, `/vendor/hk-voice` and `/vendor/hk-debloat`, and the start scripts in `/etc/init.d/`.
+1. Put the modules under `/vendor/airplay2`, `/vendor/hk-lights`, `/vendor/hk-keys`, `/vendor/hk-voice` and `/vendor/hk-debloat`, and the start scripts in `/etc/init.d/`. `hk-dsp-alsa.conf` and `hk-ap2-dsp-bridge` must be under `/vendor/airplay2`. The Bluetooth DSP route, installation and rollback are documented in [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
 2. Set `airplay_device_id` in `airplay2/shairport-sync.conf` to your speaker's wlan0 MAC address.
 3. Voice assistant: copy `voice/voice.conf.example` to `/vendor/hk-voice/voice.conf` (mode 600) and fill in your Baidu speech keys (short-speech ASR + TTS) and ModelScope API-Inference key. Run `hk-voice check` to test them and `hk-voice mkclips` to create the offline prompts. `voice/update-voice-keys.sh` rotates keys later (set `HK_PUT` / `HK_SHELL` to your own way of reaching the speaker).
 4. The speaker's CA bundle is old: open-meteo needs the ISRG Root X1/X2 roots added, combined into `/vendor/hk-voice/ca.pem`.

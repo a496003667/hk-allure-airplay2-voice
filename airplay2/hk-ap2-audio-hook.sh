@@ -7,13 +7,14 @@
 ROOT=${HK_AP2_ROOT:-/tmp/hk-ap2/opt}
 RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
 SAFE="$RUN/safe"
-AMIXER=/system/workdir/bin/amixer
+AMIXER=${HK_AP2_AMIXER:-/system/workdir/bin/amixer}
 AMIXER_LIB=/system/workdir/lib
 MASTER=${HK_AP2_MASTER_SAFE:-4}
 DIGITAL=${HK_AP2_DIGITAL_SAFE:-128}
 PLAYBACK=${HK_AP2_PLAYBACK_SAFE:-0}
 USE_STOCK_PA=${HK_AP2_USE_STOCK_PA:-0}
-APPLE_REMOTE=/system/workdir/bin/apple_remote
+APPLE_REMOTE=${HK_AP2_APPLE_REMOTE:-/system/workdir/bin/apple_remote}
+APPLE_REMOTE_SOCKET=${HK_AP2_APPLE_REMOTE_SOCKET:-/tmp/RequestAppleRemote}
 PA_UNMUTE_LIB=${HK_AP2_PA_UNMUTE_LIB:-$ROOT/lib/libhk-airplay-unmute.so}
 PA_MUTE_LIB=${HK_AP2_PA_MUTE_LIB:-$ROOT/lib/libhk-airplay-mute.so}
 PA_LOG="$RUN/pa-hook.log"
@@ -26,6 +27,8 @@ VOICE_OWNS="$RUN/voice-owns"
 DEFERRED="$RUN/ap2-deferred"
 CLAIM="$RUN/ap2-claim"
 SPEAKER_LOCK="$RUN/speaker.lock"
+BT_OWNER="$RUN/bt-owner.pid"
+BT_RELEASE="$RUN/bt-release"
 
 # The AP2 loader must not leak its glibc path into stock shell commands.
 unset LD_LIBRARY_PATH
@@ -68,7 +71,7 @@ mixer_values() {
 
 switch_state() {
     env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sget "$1" 2>/dev/null |
-        sed -n 's/.*\[\(on\|off\)\].*/\1/p' |
+        sed -n 's/.*\[\([a-z]*\)\].*/\1/p' |
         sed -n '1p'
 }
 
@@ -118,11 +121,14 @@ stock_pa_mute() {
     fi
     [ -x "$APPLE_REMOTE" ] && [ -r "$preload" ] || return 1
 
-    rm -f /tmp/RequestAppleRemote
+    rm -f "$APPLE_REMOTE_SOCKET"
     : >"$PA_LOG"
     env LD_LIBRARY_PATH="$AMIXER_LIB:/lib" LD_PRELOAD="$preload" \
         "$APPLE_REMOTE" >>"$PA_LOG" 2>&1 &
     pid=$!
+    # A Bluetooth source can stop during setup and terminate this hook. Do
+    # not leave the temporary helper holding the runtime mount open.
+    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1' HUP INT TERM
     # The preload constructor does the work right away and logs it; poll
     # for that line instead of a fixed 1 s wait (cap 1.5 s).
     n=0
@@ -132,9 +138,10 @@ stock_pa_mute() {
         n=$((n + 1))
     done
     usleep 100000 2>/dev/null || true
-    rm -f /tmp/RequestAppleRemote
+    rm -f "$APPLE_REMOTE_SOCKET"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    trap - HUP INT TERM
 
     # apple_remote may exit after the constructor because one stock helper
     # symbol is unavailable. The constructor runs first and is the operation
@@ -201,7 +208,11 @@ start_failed() {
 case "${1:-}" in
     start)
         hook_log "start requested armed=$([ -f "$SAFE/armed" ] && echo yes || echo no) tripped=$([ -f "$SAFE/tripped" ] && echo yes || echo no)"
-        if [ -z "${HK_AP2_VOICE:-}" ]; then
+        if [ -n "${HK_AP2_BT:-}" ] && voice_owns; then
+            hook_log "Bluetooth start refused: voice owns speaker"
+            exit 1
+        fi
+        if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
             speaker_lock
             if voice_owns; then
                 : >"$DEFERRED"
@@ -210,7 +221,19 @@ case "${1:-}" in
                 exit 0
             fi
             cut -d. -f1 /proc/uptime >"$CLAIM" 2>/dev/null
-            speaker_unlock
+            if [ -f "$BT_OWNER" ]; then
+                : >"$BT_RELEASE"
+                speaker_unlock
+                tries=0
+                while [ -f "$BT_OWNER" ] && [ "$tries" -lt 80 ]; do
+                    usleep 100000 2>/dev/null || sleep 1
+                    tries=$((tries + 1))
+                done
+                [ ! -f "$BT_OWNER" ] || { hook_log "Bluetooth did not release output"; exit 1; }
+                rm -f "$BT_RELEASE"
+            else
+                speaker_unlock
+            fi
         fi
         [ -f "$SAFE/armed" ] || exit 1
         [ ! -f "$SAFE/tripped" ] || exit 1
@@ -230,7 +253,12 @@ case "${1:-}" in
         # Configure the low-volume path while the speaker is still off.
         mixer_set "Ext Spk" off || true
         mixer_set "Master" "$MASTER" || true
-        mixer_cset 1 "$DIGITAL,$DIGITAL" || true
+        # Bluetooth starts the stock PCM before this hook runs. Keep the DAC
+        # silent throughout setup, even if the stock player has already
+        # unmuted its amplifier. AirPlay retains its existing baseline.
+        baseline_digital=$DIGITAL
+        [ -z "${HK_AP2_BT:-}" ] || baseline_digital=0
+        mixer_cset 1 "$baseline_digital,$baseline_digital" || true
         mixer_cset 2 "$PLAYBACK,$PLAYBACK" || true
         mixer_set "Digital" on || true
         mixer_set "Auto Mute" off || true
@@ -239,7 +267,7 @@ case "${1:-}" in
         [ "$(mixer_master)" = "$MASTER" ] || {
             start_failed "Master verification failed"
         }
-        [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] || {
+        [ "$(mixer_values 1)" = "$baseline_digital,$baseline_digital" ] || {
             start_failed "Digital Playback Volume verification failed"
         }
         [ "$(mixer_values 2)" = "$PLAYBACK,$PLAYBACK" ] || {
@@ -254,13 +282,22 @@ case "${1:-}" in
         [ "$(switch_state 'Ext Spk')" = "off" ] || {
             start_failed "external speaker mute baseline verification failed"
         }
-        hook_log "mixer baseline verified master=$MASTER digital=$DIGITAL playback=$PLAYBACK"
+        hook_log "mixer baseline verified master=$MASTER digital=$baseline_digital playback=$PLAYBACK"
 
         [ "$(read_file "$SAFE/watchdog.pid")" ] ||
             start_failed "watchdog pid disappeared"
         watchdog_alive || start_failed "watchdog stopped during baseline"
         watchdog_alive || start_failed "watchdog stopped before output enable"
         [ ! -f "$SAFE/tripped" ] || start_failed "watchdog tripped before output enable"
+        # The stock Bluetooth player can change the PA independently when it
+        # resumes. Reassert PA mute while Ext Spk is off and I2S is muted;
+        # the normal opening sequence below unmutes it only after I2S runs.
+        if [ -n "${HK_AP2_BT:-}" ] && [ "$USE_STOCK_PA" = "1" ]; then
+            stock_pa_mute 1 || start_failed "stock PA pre-mute failed"
+            watchdog_alive || start_failed "watchdog stopped during PA pre-mute"
+            [ ! -f "$SAFE/tripped" ] || start_failed "watchdog tripped during PA pre-mute"
+            hook_log "stock PA pre-muted for Bluetooth"
+        fi
         # Open the path while the DAC is digitally silent: start the I2S data
         # while the stock PA is still muted, then unmute the PA, then switch
         # the amplifier on and fade in by restoring the digital volume (the
@@ -286,7 +323,11 @@ case "${1:-}" in
         exit 0
         ;;
     stop|mute)
-        if [ -z "${HK_AP2_VOICE:-}" ]; then
+        if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
+            if [ "${1:-}" = stop ] && [ -f "$BT_OWNER" ]; then
+                hook_log "AirPlay stop ignored: Bluetooth owns the speaker"
+                exit 0
+            fi
             rm -f "$DEFERRED" "$CLAIM"
             if voice_owns; then
                 hook_log "${1:-stop} ignored: the voice assistant has the speaker"

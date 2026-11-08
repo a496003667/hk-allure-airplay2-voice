@@ -25,6 +25,7 @@ HOOK=/vendor/airplay2/hk-ap2-audio-hook.sh
 SAFE=/tmp/hk-ap2/run/safe
 PCM_STATUS=/proc/asound/card0/pcm0p/sub0/status
 APLAY=/system/workdir/bin/aplay
+DSP_ALSA_CONF=/vendor/airplay2/hk-dsp-alsa.conf
 MAX_RECORD=${HK_VOICE_MAX_RECORD:-8}
 
 log() {
@@ -179,7 +180,8 @@ start_stream() {
     mkdir -p "$QD"
     rm -f "$QD"/*
     "$D/hk-voice" feedq "$QD" 2>/dev/null |
-        env LD_LIBRARY_PATH=/system/workdir/lib "$APLAY" -q -D hw:0,0 \
+        env ALSA_CONFIG_PATH="$DSP_ALSA_CONF" LD_LIBRARY_PATH=/system/workdir/lib \
+        "$APLAY" -q -D hk_harman_dsp \
             -f S16_LE -r 48000 -c 2 -t raw >/dev/null 2>&1 &
 }
 
@@ -416,7 +418,7 @@ cleanup_output() {
     [ -d "$QD" ] && : >"$QD/stop"
     sleep 1
     for p in $pids; do kill "$p" 2>/dev/null; done
-    for p in $(ps | grep "[a]play -q -D hw:0,0 -f S16_LE -r 48000" | awk '{print $1}'); do
+    for p in $(ps | grep "[a]play -q -D hk_harman_dsp -f S16_LE -r 48000" | awk '{print $1}'); do
         kill "$p" 2>/dev/null
     done
     if [ "$owned" = 1 ]; then
@@ -476,7 +478,10 @@ airplay_owns_dac() {
     [ -n "$o" ] || return 1
     for t in /proc/[0-9]*/task/"$o"; do
         [ -d "$t" ] || continue
-        tr '\0' ' ' <"${t%/task/*}/cmdline" 2>/dev/null | grep -q shairport-sync && return 0
+        # Shairport uses the stock-ABI DSP bridge for pipe output, so either
+        # process can own the DAC while an AirPlay stream is active.
+        tr '\0' ' ' <"${t%/task/*}/cmdline" 2>/dev/null |
+            grep -Eq 'shairport-sync|hk-ap2-dsp-bridge' && return 0
     done
     return 1
 }

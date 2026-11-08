@@ -2075,8 +2075,35 @@ static int reminders_due(void) {
 
 static int answer_sequential(const char *q, const char *qdir) {
   long t0 = mono_ms();
-  char *a = llm_ask(q);
-  /* Release the ModelScope TLS session before creating the Baidu TTS one. */
+  char *a = NULL;
+  if (is_reminder_strong(q) || (!is_weather_question(q) && is_reminder_question(q))) {
+    size_t an = 0;
+    FILE *out = open_memstream(&a, &an);
+    if (out) {
+      handle_reminder(q, out);
+      fclose(out);
+    }
+    if (a) {
+      while (an && (a[an - 1] == '\n' || a[an - 1] == '\r')) a[--an] = 0;
+    }
+  } else {
+    char *ctx = NULL;
+    if (is_weather_question(q)) {
+      char city[128];
+      int day;
+      weather_args(q, city, sizeof city, &day);
+      ctx = weather_report(city, day);
+      fprintf(stderr, "hk-voice: weather %s day %d: %s (%ld ms)\n", city, day,
+              ctx ? ctx : "unavailable", mono_ms() - t0);
+      if (!ctx) ctx = strdup("天气服务暂时查不到数据。");
+      /* The forecast is complete in memory; do not retain its TLS session
+       * while the model prepares the reply. */
+      http_close();
+    }
+    a = llm_ask_ctx(q, ctx, NULL);
+    free(ctx);
+  }
+  /* Release the model/reminder TLS session before creating Baidu TTS one. */
   http_close();
   if (!a) a = strdup("抱歉，我暂时连不上大模型，请稍后再试。");
   speakable(a, 900);

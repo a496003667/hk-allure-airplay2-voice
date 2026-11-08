@@ -304,6 +304,11 @@ case "${1:-}" in
         # DAC ramps it).  Unmuting the PA before the I2S data starts pops
         # audibly (verified step by step with the user, 2026-11-04).
         mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
+        # If a sender is already writing PCM when this hook is re-run, the
+        # DAC needs time to finish its digital-volume ramp before the I2S and
+        # amplifier stages change. Switching them immediately caused two
+        # audible pops during a recovery reopen on 2026-11-08.
+        usleep 300000 2>/dev/null || sleep 1
         mixer_set "aml audio i2s mute" off || start_failed "I2S unmute failed"
         [ "$(switch_state 'aml audio i2s mute')" = "off" ] ||
             start_failed "I2S unmute verification failed"

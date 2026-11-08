@@ -15,7 +15,7 @@
 
 | 模块 | 说明 |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP。iPhone、Mac 都能投（Shairport Sync 支持加入"家庭" App，作者未实测）；软件音量上限 -9 dB，经原厂 ABI 桥接入 Harman 两路 DSP |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP。iPhone、Mac 都能投（Shairport Sync 支持加入"家庭" App，作者未实测）；发送端控制软件音量（最高 -6 dB、默认 -30 dB），经原厂 ABI 桥接入 Harman 两路 DSP |
 | **蓝牙 / 低音** | 保留原厂 A2DP 蓝牙，把播放器接回 Harman DSP 的左右两路：左声道驱动 90 mm 低音单元，右声道驱动中高音；手机音量驱动 DSP 前的 33 级软件音量 |
 | **防爆音** | AirPlay、蓝牙和语音统一经过 `hk-ap2-audio-hook.sh` 的 `guard`：先验证租约、时钟和静音基线，再开 I2S 数据流、解除原厂功放静音、开喇叭并渐入 |
 | **灯效 / 音量环** | 播放时显示原厂播放灯效，音量环跟随发送端音量 |

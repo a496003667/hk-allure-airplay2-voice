@@ -27,7 +27,8 @@ Allure 的 PCM5121 两个输出通道不是一个普通立体声对：
 a01controller -> Master softvol -> harmandsp -> hw:0,0
 ```
 
-AirPlay 使用 Shairport 自己的软件音量并保留 `-9.0 dB` 上限。因为 Shairport
+AirPlay 使用 Shairport 自己的软件音量，最高为 `-6.0 dB`，新连接的默认值为
+`-30.0 dB`；播放中的音量仍由发送端决定。因为 Shairport
 5.6 是 soft-float、原厂 DSP 是 hard-float，它先把固定格式 PCM 交给
 `hk-ap2-dsp-bridge`，再由桥进入同一个 `harmandsp`；蓝牙仍使用自己的调用点配置。
 

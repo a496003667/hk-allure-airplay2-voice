@@ -16,7 +16,7 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 | Module | What it does |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP. Works from iPhone and Mac (Shairport Sync supports being added to the Home app; not tested by the author); software volume capped at -9 dB and routed through the stock ABI bridge into Harman's two-channel DSP |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP. Works from iPhone and Mac (Shairport Sync supports being added to the Home app; not tested by the author); sender-controlled software volume (-6 dB ceiling, default -30 dB) routed through the stock ABI bridge into Harman's two-channel DSP |
 | **Bluetooth / bass** | Keeps the stock A2DP player, but routes it through Harman's two-way DSP: left drives the 90 mm woofer and right drives the mid/high drivers; phone volume drives the stock 33-step software volume before the DSP |
 | **No pops** | Starts the I2S data first, then unmutes the stock amplifier, then switches the speaker on and fades in; no pops on pause, seek, or when two senders take over from each other |
 | **Lights / volume ring** | Shows the stock "playing" animation during playback; the volume ring follows the sender's volume |

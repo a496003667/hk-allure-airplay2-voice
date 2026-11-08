@@ -21,15 +21,16 @@ class DspRoutingTest(unittest.TestCase):
         self.assertRegex(config, r"bypassmode\s+0")
         self.assertNotRegex(config, r"type\s+softvol")
 
-    def test_airplay_pipe_is_fixed_format_and_keeps_minus_nine_db(self):
+    def test_airplay_pipe_is_fixed_format_and_keeps_minus_six_db(self):
         config = (AIRPLAY / "shairport-sync.conf").read_text()
         self.assertRegex(config, r'output_backend\s*=\s*"pipe"')
         self.assertRegex(config, r'name\s*=\s*"/tmp/hk-ap2/run/airplay-pcm\.fifo"')
         self.assertRegex(config, r"output_rate\s*=\s*48000")
         self.assertRegex(config, r'output_format\s*=\s*"S32_LE"')
         self.assertRegex(config, r"output_channels\s*=\s*2")
-        self.assertRegex(config, r"volume_max_db\s*=\s*-9\.0")
-        self.assertRegex(config, r"volume_range_db\s*=\s*38")
+        self.assertRegex(config, r"volume_max_db\s*=\s*-6\.0")
+        self.assertRegex(config, r"volume_range_db\s*=\s*30")
+        self.assertRegex(config, r"default_airplay_volume\s*=\s*-30\.0")
         self.assertRegex(config, r'volume_control_profile\s*=\s*"flat"')
         self.assertNotIn('output_device = "hw:0,0"', config)
 

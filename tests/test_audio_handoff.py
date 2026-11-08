@@ -50,7 +50,7 @@ class HandoffTest(unittest.TestCase):
         self.assertTrue((self.run / 'ap2-claim').exists())
         self.assertEqual(result.returncode, 1, 'unarmed output must fail closed')
 
-    def test_bluetooth_open_mutes_pa_before_enabling_i2s(self):
+    def test_bluetooth_enables_pa_once_after_silent_clock_baseline(self):
         safe = self.run / 'safe'
         (safe / 'armed').touch()
         (safe / 'watchdog.pid').write_text(str(os.getpid()))
@@ -117,10 +117,18 @@ echo "Snd_Ctrl airplay to mute $level"
         self.assertEqual(result.returncode, 0, result.stderr + '\n' + (self.run / 'hook.log').read_text() + '\n' + events.read_text())
         log = events.read_text().splitlines()
         self.assertLess(log.index('mixer 1 0,0'), log.index('pa 1'))
-        self.assertLess(log.index('pa 1'), log.index('mixer aml audio i2s mute off'))
-        self.assertLess(log.index('mixer aml audio i2s mute off'), log.index('pa 0'))
+        self.assertLess(log.index('pa 1'),
+                        log.index('mixer aml audio i2s mute off'))
+        self.assertLess(log.index('mixer aml audio i2s mute off'),
+                        log.index('pa 0'))
         self.assertLess(log.index('pa 0'), log.index('mixer Ext Spk on'))
-        self.assertLess(log.index('mixer Ext Spk on'), log.index('mixer 1 100,100'))
+        self.assertLess(log.index('mixer Ext Spk on'),
+                        log.index('mixer 1 100,100'))
+        self.assertEqual(log.count('pa 0'), 1)
+        self.assertEqual(log.count('pa 1'), 1)
+        self.assertEqual(log.count('mixer Ext Spk on'), 1)
+        self.assertEqual(log.count('mixer aml audio i2s mute off'), 1)
+        self.assertEqual(log.count('mixer 1 0,0'), 2)
 
         (safe / 'play.started').unlink()
         (safe / 'watchdog.heartbeat').write_text('0')

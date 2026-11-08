@@ -13,6 +13,7 @@ MASTER=${HK_AP2_MASTER_SAFE:-4}
 DIGITAL=${HK_AP2_DIGITAL_SAFE:-128}
 PLAYBACK=${HK_AP2_PLAYBACK_SAFE:-0}
 USE_STOCK_PA=${HK_AP2_USE_STOCK_PA:-0}
+PA_WARMUP_MS=${HK_AP2_PA_WARMUP_MS:-200}
 APPLE_REMOTE=${HK_AP2_APPLE_REMOTE:-/system/workdir/bin/apple_remote}
 APPLE_REMOTE_SOCKET=${HK_AP2_APPLE_REMOTE_SOCKET:-/tmp/RequestAppleRemote}
 PA_UNMUTE_LIB=${HK_AP2_PA_UNMUTE_LIB:-$ROOT/lib/libhk-airplay-unmute.so}
@@ -315,26 +316,24 @@ case "${1:-}" in
         wait_for_lease_ack "$previous_heartbeat" ||
             start_failed "watchdog did not acknowledge playback lease"
 
+        # Prepare every gain and switch while the physical path is still off.
+        # The stock amplifier is enabled only once here, while the DAC remains
+        # digitally silent; the clock is then allowed to run before that gain
+        # returns. Repeatedly muting/unmuting the amplifier across clock and
+        # I2S transitions is the click heard on AirPlay reconnects.
         mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
         usleep 300000 2>/dev/null || sleep 1
         if [ "$USE_STOCK_PA" = "1" ]; then
             stock_pa_mute 1 || start_failed "stock PA pre-mute failed"
         fi
-        wait_for_pcm_clock || start_failed "audio clock unavailable"
-
-        # Configure the low-volume path while the speaker is still off.
         mixer_set "Ext Spk" off || true
         mixer_set "Master" "$MASTER" || true
-        # Bluetooth starts the stock PCM before this hook runs. Keep the DAC
-        # silent throughout setup, even if the stock player has already
-        # unmuted its amplifier. AirPlay retains its existing baseline.
-        baseline_digital=$DIGITAL
-        [ -z "${HK_AP2_BT:-}" ] || baseline_digital=0
+        baseline_digital=0
         mixer_cset 1 "$baseline_digital,$baseline_digital" || true
         mixer_cset 2 "$PLAYBACK,$PLAYBACK" || true
         mixer_set "Digital" on || true
         mixer_set "Auto Mute" off || true
-        mixer_set "aml audio i2s mute" on || true
+        mixer_set "aml audio i2s mute" off || true
 
         [ "$(mixer_master)" = "$MASTER" ] || {
             start_failed "Master verification failed"
@@ -348,34 +347,16 @@ case "${1:-}" in
         [ "$(switch_state 'Digital')" = "on" ] || {
             start_failed "Digital switch verification failed"
         }
-        [ "$(switch_state 'aml audio i2s mute')" = "on" ] || {
-            start_failed "I2S mute baseline verification failed"
+        [ "$(switch_state 'aml audio i2s mute')" = "off" ] || {
+            start_failed "I2S enable verification failed"
         }
         [ "$(switch_state 'Ext Spk')" = "off" ] || {
             start_failed "external speaker mute baseline verification failed"
         }
         hook_log "mixer baseline verified master=$MASTER digital=$baseline_digital playback=$PLAYBACK"
 
-        # The stock Bluetooth player can change the PA independently when it
-        # resumes. Reassert PA mute while Ext Spk is off and I2S is muted;
-        # the normal opening sequence below unmutes it only after I2S runs.
-        output_guard_ok || start_failed "output guard lost during PA pre-mute"
-        wait_for_pcm_clock || start_failed "audio clock lost before output enable"
-        # Open the path while the DAC is digitally silent: start the I2S data
-        # while the stock PA is still muted, then unmute the PA, then switch
-        # the amplifier on and fade in by restoring the digital volume (the
-        # DAC ramps it).  Unmuting the PA before the I2S data starts pops
-        # audibly (verified step by step with the user, 2026-11-04).
-        mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
-        # If a sender is already writing PCM when this hook is re-run, the
-        # DAC needs time to finish its digital-volume ramp before the I2S and
-        # amplifier stages change. Switching them immediately caused two
-        # audible pops during a recovery reopen on 2026-11-08.
-        usleep 300000 2>/dev/null || sleep 1
-        mixer_set "aml audio i2s mute" off || start_failed "I2S unmute failed"
-        [ "$(switch_state 'aml audio i2s mute')" = "off" ] ||
-            start_failed "I2S unmute verification failed"
-        usleep 200000 2>/dev/null || true
+        output_guard_ok || start_failed "output guard lost during baseline"
+        wait_for_pcm_clock || start_failed "audio clock unavailable"
         if [ "$USE_STOCK_PA" = "1" ]; then
             stock_pa_mute 0 || start_failed "stock PA unmute failed"
             hook_log "stock PA unmuted"
@@ -383,7 +364,10 @@ case "${1:-}" in
         mixer_set "Ext Spk" on || start_failed "external speaker enable failed"
         [ "$(switch_state 'Ext Spk')" = "on" ] ||
             start_failed "external speaker enable verification failed"
-        usleep 200000 2>/dev/null || sleep 1
+        warmup=$((PA_WARMUP_MS * 1000))
+        usleep "$warmup" 2>/dev/null || sleep 1
+        output_guard_ok || start_failed "output guard lost during amplifier warm-up"
+        wait_for_pcm_clock 5 || start_failed "audio clock lost during amplifier warm-up"
         mixer_cset 1 "$DIGITAL,$DIGITAL" || start_failed "digital fade-in failed"
         [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] ||
             start_failed "digital fade-in verification failed"

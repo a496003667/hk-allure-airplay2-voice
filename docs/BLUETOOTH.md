@@ -68,8 +68,9 @@ armv7-linux-gnueabihf-gcc -Os -fPIC -shared \
 - 蓝牙独占逻辑写在桥接器和 watchdog 中。播放时建立租约，暂停/停止时释放；
   AirPlay 要接管时会先等蓝牙释放。
 - Bluetooth watchdog 在桥接器退出、心跳过期或来源停止时立即恢复硬静音。
-- 打开顺序为 DAC 静音、原厂功放静音、开 I2S、解除功放静音、开 `Ext Spk`、
-  最后数字渐入。关闭按相反顺序，避免暂停/恢复时的“啪”声。
+- 打开顺序为 DAC 静音、解除 I2S 静音并等待数据时钟、解除一次原厂功放静音、
+  开 `Ext Spk`、等功放稳定后数字渐入。整个开场不再反复切换原厂功放静音；
+  关闭先数字淡出，再依次关闭功放和 I2S，避免暂停/恢复时的“啪”声。
 - 所有来源共用 `hk-ap2-audio-hook.sh` 的 `guard`/`start`/`stop`：调用扬声器前
   先验证租约、watchdog、hold/trip 和 PCM 时钟，再确认功放与数字静音基线。
   蓝牙语音混音恢复数字增益前也会先淡出到 0 并调用 `guard active`；检查失败

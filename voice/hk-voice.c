@@ -32,6 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
+extern int malloc_trim(size_t);
+
 #define CONF_PATH "/vendor/hk-voice/voice.conf"
 #define TOKEN_PATH "/vendor/hk-voice/baidu.token"
 #define HIST_PATH "/tmp/hk-voice/history"
@@ -144,6 +146,35 @@ static const char *conf_get(const char *key, const char *def) {
   return def;
 }
 
+/* This kernel pre-dates MemAvailable. Match its low-memory-killer view:
+ * anonymous shared pages are not reclaimable even though they count as
+ * Cached. */
+static long mem_available_kib(void) {
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (!f) return 0;
+  long free_kib = 0, cached_kib = 0, shmem_kib = 0;
+  char line[256];
+  while (fgets(line, sizeof line, f)) {
+    long value;
+    if (sscanf(line, "MemFree: %ld", &value) == 1) free_kib = value;
+    else if (sscanf(line, "Cached: %ld", &value) == 1) cached_kib = value;
+    else if (sscanf(line, "Shmem: %ld", &value) == 1) shmem_kib = value;
+  }
+  fclose(f);
+  long available = free_kib + cached_kib - shmem_kib;
+  return available > 0 ? available : 0;
+}
+
+static int sequential_reply(void) {
+  const char *forced = getenv("HK_VOICE_SEQUENTIAL");
+  if (forced && strcmp(forced, "0")) return 1;
+  const char *stream = getenv("HK_VOICE_STREAM");
+  if (stream && !strcmp(stream, "0")) return 1;
+  const char *minimum = getenv("HK_VOICE_STREAM_MIN_KIB");
+  long min_kib = minimum ? atol(minimum) : 65536;
+  return mem_available_kib() < min_kib;
+}
+
 /* ---------- libcurl via dlopen ---------- */
 
 typedef void CURL;
@@ -195,6 +226,17 @@ static int net_err; /* a request failed at the network level */
 static int asr_svc_err, tts_svc_err, token_svc_err; /* Baidu answered, but with a service error */
 typedef size_t (*write_fn)(char *, size_t, size_t, void *);
 static write_fn http_write_fn = on_write; /* overridable for streaming */
+static CURL *http_handle;
+static pid_t http_handle_pid;
+
+static void http_close(void) {
+  if (http_handle && http_handle_pid == getpid()) c_cleanup(http_handle);
+  http_handle = NULL;
+  http_handle_pid = 0;
+  /* libcurl and OpenSSL retain connection and TLS-buffer allocations. Return
+   * them before a low-memory process starts the next network service. */
+  malloc_trim(0);
+}
 
 /* POST body to url (GET when body is NULL); returns HTTP status, fills resp
  * and content type. */
@@ -204,13 +246,11 @@ static long http_post(const char *url, const char **headers, const void *body, s
   /* One handle per process so TLS connections are reused between requests
    * (ASR -> TTS sentences).  A forked child must not touch its parent's
    * handle, so key it on the pid. */
-  static CURL *gc;
-  static pid_t gpid;
-  if (!gc || gpid != getpid()) {
-    gc = c_init();
-    gpid = getpid();
+  if (!http_handle || http_handle_pid != getpid()) {
+    http_handle = c_init();
+    http_handle_pid = getpid();
   }
-  CURL *c = gc;
+  CURL *c = http_handle;
   if (!c) die("curl init failed");
   struct curl_slist *hl = NULL;
   for (; headers && *headers; headers++) hl = c_slist_append(hl, *headers);
@@ -2033,9 +2073,51 @@ static int reminders_due(void) {
   return n;
 }
 
-/* Answer q: the model streams sentences from a child process while this
- * process synthesises each one into <qdir>/q.N.raw for the queue feeder. */
+static int answer_sequential(const char *q, const char *qdir) {
+  long t0 = mono_ms();
+  char *a = llm_ask(q);
+  /* Release the ModelScope TLS session before creating the Baidu TTS one. */
+  http_close();
+  if (!a) a = strdup("抱歉，我暂时连不上大模型，请稍后再试。");
+  speakable(a, 900);
+  printf("A: %s\n", a);
+  fflush(stdout);
+
+  float g = output_gain_db();
+  char tmp[300], fin[300];
+  int nq = 0;
+  snprintf(tmp, sizeof tmp, "%s/q.tmp", qdir);
+  if (tts_to_file(a, tmp, g) == 0) {
+    snprintf(fin, sizeof fin, "%s/q.1.raw", qdir);
+    if (rename(tmp, fin) == 0) nq = 1;
+  }
+  if (nq == 0) {
+    snprintf(tmp, sizeof tmp, "%s/q.tmp", qdir);
+    if (clip_to_file(tts_svc_err && !net_err ? "ttserr" : "neterr", tmp, g) == 0) {
+      snprintf(fin, sizeof fin, "%s/q.1.raw", qdir);
+      if (rename(tmp, fin) == 0) nq = 1;
+    }
+  }
+  snprintf(fin, sizeof fin, "%s/q.end", qdir);
+  int fd = open(fin, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd >= 0) close(fd);
+  fprintf(stderr, "hk-voice: sequential reply done, %d sentences, %ld ms\n",
+          nq, mono_ms() - t0);
+  free(a);
+  return nq ? 0 : 1;
+}
+
+/* Answer q: on a roomy host, the model streams sentences from a child process
+ * while this process synthesises each one into <qdir>/q.N.raw. The Allure is
+ * memory constrained; below the kernel's 64 MiB reclaimable-memory trigger,
+ * use the single-process path so the LLM and TTS peaks cannot overlap. */
 static int answer_streamed(const char *q, const char *qdir) {
+  if (sequential_reply()) {
+    long available = mem_available_kib();
+    http_close();
+    fprintf(stderr, "hk-voice: sequential reply mode (available %ld KiB)\n", available);
+    return answer_sequential(q, qdir);
+  }
   int pfd[2];
   if (pipe(pfd) != 0) die("pipe");
   long t0 = mono_ms();
@@ -2210,6 +2292,8 @@ int main(int argc, char **argv) {
     }
     char *q = asr_best(pcm, n);
     free(pcm);
+    /* Drop the ASR connection before LLM/TTS starts its own TLS session. */
+    http_close();
     if (!q || !*q) {
       const char *qd = getenv("HK_VOICE_QDIR");
       if (qd && net_err) {

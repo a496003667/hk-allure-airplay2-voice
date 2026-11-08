@@ -68,4 +68,6 @@
 - 正常空闲约 18–30 MB（按 MemFree 算，页缓存多时会显得偏低）。
 - 语音循环 `oom_score_adj=15`，AirPlay 是 11，原厂进程是 0：内存紧张时先杀语音助手。
 - 低内存杀手（lowmemorykiller）只在空闲内存和文件缓存**同时**低于 6 MB 时才会杀 `oom_score_adj` 为 15 的语音循环。语音监护进程每 5 秒检查一次，两者之和低于 24 MB 时，把内存快照写进 `/tmp/hk-voice/mem.log`。
+- 大模型流式回答时，父进程合成 TTS、子进程同时读大模型，TLS 与音频缓冲的峰值会叠加。Allure 曾在回答已经生成、准备 TTS 时被 LMK 以 `rc=137` 杀掉，表现为“Alexa 听懂了但没有出声”。
+- `hk-voice` 用 `MemFree + Cached - Shmem` 估算可回收内存；低于 64 MiB 时关闭流式重叠，先完成大模型回答并释放 ModelScope 的 HTTP/TLS 句柄，再单独请求百度 TTS。可用 `HK_VOICE_SEQUENTIAL=1`、`HK_VOICE_STREAM=0` 强制顺序模式，或用 `HK_VOICE_STREAM_MIN_KIB` 调整门槛。
 - 预录每 10 秒轮换一次，内存盘里最多约 1.7 MB。

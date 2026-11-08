@@ -14,12 +14,15 @@
  *   -o hk-ap2-dsp-bridge hk-ap2-dsp-bridge.c <rootfs>/lib/libasound.so.2
  */
 typedef struct _snd_pcm snd_pcm_t;
+#ifndef HK_AP2_RUNTIME_DIR
+#define HK_AP2_RUNTIME_DIR "/tmp/hk-ap2"
+#endif
 extern int snd_pcm_open(snd_pcm_t **, const char *, int, int);
 extern int snd_pcm_set_params(snd_pcm_t *, int, int, unsigned, unsigned, int,
                               unsigned);
 extern long snd_pcm_writei(snd_pcm_t *, const void *, unsigned long);
 extern int snd_pcm_recover(snd_pcm_t *, int, int);
-extern int snd_pcm_drain(snd_pcm_t *);
+extern int snd_pcm_drop(snd_pcm_t *);
 extern int snd_pcm_close(snd_pcm_t *);
 
 struct pollfd {
@@ -40,7 +43,8 @@ enum {
     PCM_STREAM_PLAYBACK = 0,
     SND_PCM_FORMAT_S32_LE = 10,
     SND_PCM_ACCESS_RW_INTERLEAVED = 3,
-    CLOSE_AFTER_MS = 1000,
+    POLL_AFTER_MS = 10,
+    SILENCE_FRAMES = 960,
     BUFFER_BYTES = 32768
 };
 
@@ -91,9 +95,13 @@ static int file_exists(const char *path) {
 }
 
 static int airplay_allowed(void) {
-    return !file_exists("/tmp/hk-ap2-hold-mute") &&
-           !file_exists("/tmp/hk-ap2/run/safe/tripped") &&
-           file_exists("/tmp/hk-ap2/run/safe/play.started");
+    return !file_exists(HK_AP2_RUNTIME_DIR "-hold-mute") &&
+           !file_exists(HK_AP2_RUNTIME_DIR "/run/safe/tripped") &&
+           file_exists(HK_AP2_RUNTIME_DIR "/run/safe/armed") &&
+           file_exists(HK_AP2_RUNTIME_DIR "/run/ap2-claim") &&
+           !file_exists(HK_AP2_RUNTIME_DIR "/run/bt-owner.pid") &&
+           !file_exists(HK_AP2_RUNTIME_DIR "/run/voice-owns") &&
+           file_exists(HK_AP2_RUNTIME_DIR "/run/safe/play.started");
 }
 
 static int write_frames(snd_pcm_t *pcm, const unsigned char *data,
@@ -115,14 +123,15 @@ static int write_frames(snd_pcm_t *pcm, const unsigned char *data,
 
 static void close_pcm(snd_pcm_t *pcm) {
     if (pcm) {
-        snd_pcm_drain(pcm);
+        snd_pcm_drop(pcm);
         snd_pcm_close(pcm);
     }
 }
 
 void _start(void) {
-    static const char fifo[] = "/tmp/hk-ap2/run/airplay-pcm.fifo";
+    static const char fifo[] = HK_AP2_RUNTIME_DIR "/run/airplay-pcm.fifo";
     static unsigned char buffer[BUFFER_BYTES + 8] __attribute__((aligned(8)));
+    static unsigned char silence[SILENCE_FRAMES * 8] __attribute__((aligned(8)));
     struct pollfd poll_fd;
     snd_pcm_t *pcm = 0;
     long fifo_fd = -1;
@@ -130,6 +139,12 @@ void _start(void) {
 
     for (;;) {
         long result;
+
+        if (pcm && !airplay_allowed()) {
+            close_pcm(pcm);
+            pcm = 0;
+            pending = 0;
+        }
 
         if (fifo_fd < 0) {
             fifo_fd = syscall3(SYS_OPEN, (long)fifo, OPEN_READ_ONLY |
@@ -143,11 +158,15 @@ void _start(void) {
         poll_fd.fd = (int)fifo_fd;
         poll_fd.events = POLL_IN;
         poll_fd.revents = 0;
-        result = syscall3(SYS_POLL, (long)&poll_fd, 1, CLOSE_AFTER_MS);
+        result = syscall3(SYS_POLL, (long)&poll_fd, 1, pcm ? 0 : POLL_AFTER_MS);
         if (result == 0) {
-            close_pcm(pcm);
-            pcm = 0;
-            pending = 0;
+            if (airplay_allowed()) {
+                if (!pcm && open_pcm(&pcm) < 0) wait_retry();
+                if (pcm && write_frames(pcm, silence, SILENCE_FRAMES) < 0) {
+                    close_pcm(pcm);
+                    pcm = 0;
+                }
+            }
             continue;
         }
         if (result < 0)
@@ -162,6 +181,13 @@ void _start(void) {
         if (result == 0) {
             syscall3(SYS_CLOSE, fifo_fd, 0, 0);
             fifo_fd = -1;
+            if (airplay_allowed()) {
+                if (!pcm && open_pcm(&pcm) < 0) wait_retry();
+                if (pcm && write_frames(pcm, silence, SILENCE_FRAMES) < 0) {
+                    close_pcm(pcm);
+                    pcm = 0;
+                }
+            }
             continue;
         }
         if (result < 0)

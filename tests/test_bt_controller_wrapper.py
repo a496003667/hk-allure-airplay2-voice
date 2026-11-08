@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 WRAPPER = REPO / "airplay2/hk-bt-controller-wrapper.sh"
 BOOT = REPO / "airplay2/hk-bt-boot"
+SHIM = REPO / "airplay2/hk-bt-open-redirect.so"
 BOOT_ORDER = REPO / "init/S05linkplay.sh"
 
 
@@ -127,6 +129,24 @@ class BluetoothLauncherTest(unittest.TestCase):
         rootapp = script.index("rootApp &")
         self.assertLess(vendor_mount, hook)
         self.assertLess(hook, rootapp)
+
+    def test_default_integrity_hashes_pin_current_artifacts(self):
+        wrapper = WRAPPER.read_text()
+        boot = BOOT.read_text()
+        wrapper_shim = re.search(
+            r"^SHIM_SHA256=.*:-([0-9a-f]{64})\}$", wrapper, re.M
+        )
+        boot_wrapper = re.search(
+            r"^WRAPPER_SHA256=.*:-([0-9a-f]{64})\}$", boot, re.M
+        )
+        boot_shim = re.search(
+            r"^SHIM_SHA256=.*:-([0-9a-f]{64})\}$", boot, re.M
+        )
+        for match in (wrapper_shim, boot_wrapper, boot_shim):
+            self.assertIsNotNone(match)
+        self.assertEqual(wrapper_shim.group(1), sha256(SHIM))
+        self.assertEqual(boot_shim.group(1), sha256(SHIM))
+        self.assertEqual(boot_wrapper.group(1), sha256(WRAPPER))
 
 
 if __name__ == "__main__":

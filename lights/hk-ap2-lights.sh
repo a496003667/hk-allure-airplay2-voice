@@ -1,7 +1,7 @@
 #!/bin/sh
-# AP2 -> stock light/display bridge.  Never touches the mixer or audio.
+# Playback lease -> stock light/display bridge.  Never touches the mixer or audio.
 #
-#  * While a playback lease is held (Shairport is playing), mark the stock play state as
+#  * While an AirPlay or Bluetooth playback lease is held, mark the stock play state as
 #    playing (hk-shm-play on) so mv_ioguard shows its HK_Playing animation.
 #    The stock firmware itself suppresses that animation in privacy (mic
 #    off) mode.  After 3 s without a running stream the state is undone.
@@ -22,6 +22,8 @@ SHM=${HK_LIGHTS_BIN:-$D}/hk-shm-play
 REQUEST=/tmp/hk-ap2/opt/bin/hk-unix-request-raw
 RUN=${HK_LIGHTS_RUN:-/tmp/hk-ap2/run}
 PCM_STATUS=/proc/asound/card0/pcm0p/sub0/status
+PCM_STATUS=${HK_LIGHTS_PCM_STATUS:-$PCM_STATUS}
+PROC_ROOT=${HK_LIGHTS_PROC_ROOT:-/proc}
 PIDFILE=$D/lights.pid
 LOG=$D/lights.log
 
@@ -55,6 +57,23 @@ airplay_playback_active() {
     return 0
 }
 
+bluetooth_playback_active() {
+    # The production bridge grants this lease only after the stock Bluetooth
+    # player owns a running PCM. Keep checking the owner here so a stale
+    # marker left by a failed bridge cannot turn the ring on indefinitely.
+    [ -s "$RUN/bt-owner.pid" ] || return 1
+    [ -f "$RUN/safe/armed" ] && [ ! -f "$RUN/safe/tripped" ] || return 1
+    voice_owns && return 1
+    [ "$(sed -n '1p' "$PCM_STATUS" 2>/dev/null)" = "state: RUNNING" ] || return 1
+    owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM_STATUS" 2>/dev/null)
+    case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(cat "$PROC_ROOT/$owner/comm" 2>/dev/null)" = a01controller ]
+}
+
+playback_lease_active() {
+    airplay_playback_active || bluetooth_playback_active
+}
+
 sender_connected() {
     # ESTABLISHED (01) with local port 7000 (0x1B58), IPv4 or IPv6.
     grep -qE '^ *[0-9]+: [0-9A-F]+:1B58 [0-9A-F]+:[0-9A-F]+ 01 ' \
@@ -67,7 +86,8 @@ broker_listening() {
 }
 
 update_forward_flag() {
-    if [ ! -f "$D/disable" ] && sender_connected && broker_listening; then
+    if [ ! -f "$D/disable" ] && sender_connected && broker_listening &&
+       [ ! -f "$RUN/bt-owner.pid" ]; then
         if [ -d "$RUN" ] && [ ! -f "$RUN/buttons.forward" ]; then
             : >"$RUN/buttons.forward" && log "buttons -> AirPlay sender"
         fi
@@ -85,6 +105,7 @@ claim() {
     status=$(play_status)
     case "$status" in
         0|3) ;;
+        4) log "claim: stock play state already active"; return 0 ;;
         *) log "skip claim: play_status=$status"; return 1 ;;
     esac
     log "claim: $("$SHM" on)"
@@ -128,7 +149,7 @@ run() {
             continue
         fi
 
-        if airplay_playback_active; then
+        if playback_lease_active; then
             idle=0
             if [ "$owned" = 0 ]; then
                 claim && owned=1
@@ -179,14 +200,16 @@ case "${1:-}" in
         fi
         if airplay_playback_active; then
             echo "AirPlay playback: active"
+        elif bluetooth_playback_active; then
+            echo "Bluetooth playback: active"
         else
-            echo "AirPlay playback: idle"
+            echo "Playback: idle"
         fi
         "$SHM" get
         tail -n 5 "$LOG" 2>/dev/null
         ;;
     state)
-        if airplay_playback_active; then
+        if playback_lease_active; then
             echo active
         else
             echo idle

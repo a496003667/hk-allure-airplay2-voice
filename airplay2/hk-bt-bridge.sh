@@ -13,6 +13,7 @@ TEST=$ROOT/bin/hk-ap2-safe-test
 OWNER=$RUN/bt-owner.pid
 HEARTBEAT=$RUN/bt-heartbeat
 RELEASE=$RUN/bt-release
+VOICE_INJECT=$RUN/voice-inject/active
 LOCK=$RUN/speaker.lock
 LOG=$RUN/bt-bridge.log
 PCM=${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
@@ -35,6 +36,11 @@ watchdog_live() {
 }
 
 bt_playing() {
+    bt_source_playing || return 1
+    bt_pcm_live
+}
+
+bt_source_playing() {
     watchdog_live || return 1
     [ -x "$REQ" ] && [ -S "$PLAYER_SOCKET" ] || return 1
     data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
@@ -44,10 +50,42 @@ bt_playing() {
     vol=$(printf '%s' "$data" | sed -n 's/.*"vol":"\([0-9][0-9]*\)".*/\1/p')
     case "$vol" in ''|*[!0-9]*) return 1;; esac
     [ "$vol" -le 100 ] || return 1
+}
+
+bt_pcm_live() {
     grep -q '^state: RUNNING' "$PCM" || return 1
     owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM")
     case "$owner" in ''|*[!0-9]*) return 1;; esac
     [ "$(cat "$PROC_ROOT/$owner/comm" 2>/dev/null)" = a01controller ]
+}
+
+stall_since=
+last_stall_repair=0
+
+repair_stalled_bluetooth() {
+    # a01controller can keep reporting "play" after the A2DP stream stalls:
+    # metadata and totlen are present, but it never opens the PCM and no audio
+    # reaches /tmp/bt-avk-fifo. Rebuild that transport with its own pause and
+    # resume commands. Keep the speaker path closed throughout.
+    [ "${HK_BT_STALL_REPAIR:-1}" = 1 ] || return 1
+    current=$(now)
+    bt_source_playing || { stall_since=; return 1; }
+    bt_pcm_live && { stall_since=; return 1; }
+    [ -n "$stall_since" ] || stall_since=$current
+    [ $((current - stall_since)) -ge "${HK_BT_STALL_SECONDS:-4}" ] || return 1
+    # Never turn a recurring broken transport into a pause/resume loop.
+    [ $((current - last_stall_repair)) -ge "${HK_BT_STALL_COOLDOWN:-30}" ] || return 1
+    log "Bluetooth reports play without PCM; rebuilding A2DP transport"
+    if "$REQ" "$PLAYER_SOCKET" setPlayerCmd:onepause 1200 >/dev/null 2>&1; then
+        sleep 1
+        "$REQ" "$PLAYER_SOCKET" setPlayerCmd:resume 1200 >/dev/null 2>&1 ||
+            log "Bluetooth A2DP resume command failed"
+    else
+        log "Bluetooth A2DP pause command failed"
+    fi
+    last_stall_repair=$current
+    stall_since=
+    return 0
 }
 
 ap2_recent_claim() {
@@ -118,7 +156,7 @@ run_hook() {
 
 release_output() {
     [ "$active" = 1 ] || return 0
-    if [ -f "$RUN/voice-owns" ]; then
+    if [ -f "$RUN/voice-owns" ] && [ ! -f "$VOICE_INJECT" ]; then
         # A voice reply has already claimed the path; it owns any new lease.
         rm -f "$OWNER" "$HEARTBEAT" "$RELEASE"
         active=0
@@ -153,10 +191,16 @@ echo 11 >"/proc/$$/oom_score_adj" 2>/dev/null || true
 echo "$$" >"$RUN/bt-bridge.pid"
 log "bridge started pid=$$"
 while [ -f "$SAFE/armed" ]; do
+    if [ "$active" = 0 ] && [ ! -f "$SAFE/tripped" ] &&
+       [ ! -f "$RELEASE" ] && [ ! -f "$RUN/voice-owns" ] &&
+       [ ! -s "$SAFE/play.started" ] && ! ap2_recent_claim &&
+       watchdog_live; then
+        repair_stalled_bluetooth || true
+    fi
     if [ "$active" = 1 ]; then
         heartbeat || { "$TEST" mute >/dev/null 2>&1 || true; break; }
         if [ -f "$SAFE/tripped" ] || [ -f "$RELEASE" ] ||
-           [ -f "$RUN/voice-owns" ] || [ ! -s "$SAFE/play.started" ] ||
+           [ ! -s "$SAFE/play.started" ] ||
            ! bt_playing; then
             release_output
         fi

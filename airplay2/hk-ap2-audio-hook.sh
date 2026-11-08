@@ -29,6 +29,9 @@ CLAIM="$RUN/ap2-claim"
 SPEAKER_LOCK="$RUN/speaker.lock"
 BT_OWNER="$RUN/bt-owner.pid"
 BT_RELEASE="$RUN/bt-release"
+PCM_STATUS=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
+PROC_ROOT=${HK_AP2_PROC_ROOT:-/proc}
+HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
 
 # The AP2 loader must not leak its glibc path into stock shell commands.
 unset LD_LIBRARY_PATH
@@ -195,6 +198,42 @@ wait_for_lease_ack() {
     return 1
 }
 
+pcm_clock_live() {
+    grep -q '^state: RUNNING' "$PCM_STATUS" 2>/dev/null || return 1
+    pcm_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM_STATUS" 2>/dev/null)
+    case "$pcm_owner" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    pcm_comm=$(cat "$PROC_ROOT/$pcm_owner/comm" 2>/dev/null)
+    if [ -n "${HK_AP2_BT:-}" ]; then
+        [ "$pcm_comm" = a01controller ]
+    elif [ -n "${HK_AP2_VOICE:-}" ]; then
+        [ "$pcm_comm" = aplay ]
+    else
+        [ "$pcm_owner" = "$(read_file "$RUN/dsp-bridge.pid")" ]
+    fi
+}
+
+output_guard_ok() {
+    [ ! -f "$HOLD_MUTE" ] &&
+    [ -f "$SAFE/armed" ] &&
+    [ ! -f "$SAFE/tripped" ] &&
+    [ -s "$SAFE/play.started" ] &&
+    watchdog_alive
+}
+
+wait_for_pcm_clock() {
+    limit=${1:-80}
+    tries=0
+    while [ "$tries" -lt "$limit" ]; do
+        output_guard_ok || return 1
+        pcm_clock_live && return 0
+        usleep 100000 2>/dev/null || sleep 1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 start_failed() {
     reason=$1
     hook_log "start failed: $reason"
@@ -206,6 +245,31 @@ start_failed() {
 }
 
 case "${1:-}" in
+    guard)
+        # Every speaker user calls this before touching a mixer control or
+        # switching the stock amplifier.  It is the single pop-free contract:
+        # supervised, with a live clock owned by the caller.  "closed" is the
+        # baseline before the shared start sequence; "active" is a path that
+        # is already open but must be digitally silent before gain returns.
+        # This command never changes a mixer control or enables output.
+        case "${2:-closed}" in
+            closed)
+                wait_for_pcm_clock 5 || exit 1
+                [ "$(switch_state 'Ext Spk')" = "off" ] || exit 1
+                [ "$(switch_state 'aml audio i2s mute')" = "on" ] || exit 1
+                ;;
+            active)
+                wait_for_pcm_clock 5 || exit 1
+                [ "$(switch_state 'Ext Spk')" = "on" ] || exit 1
+                [ "$(switch_state 'aml audio i2s mute')" = "off" ] || exit 1
+                [ "$(switch_state 'Digital')" = "on" ] || exit 1
+                [ "$(mixer_values 1)" = "0,0" ] || exit 1
+                ;;
+            *) exit 2 ;;
+        esac
+        hook_log "output guard passed mode=${2:-closed}"
+        exit 0
+        ;;
     start)
         hook_log "start requested armed=$([ -f "$SAFE/armed" ] && echo yes || echo no) tripped=$([ -f "$SAFE/tripped" ] && echo yes || echo no)"
         if [ -n "${HK_AP2_BT:-}" ] && voice_owns; then
@@ -235,6 +299,7 @@ case "${1:-}" in
                 speaker_unlock
             fi
         fi
+        [ ! -f "$HOLD_MUTE" ] || exit 1
         [ -f "$SAFE/armed" ] || exit 1
         [ ! -f "$SAFE/tripped" ] || exit 1
         watchdog_alive || exit 1
@@ -249,6 +314,13 @@ case "${1:-}" in
         publish_play_lease || start_failed "could not publish playback lease"
         wait_for_lease_ack "$previous_heartbeat" ||
             start_failed "watchdog did not acknowledge playback lease"
+
+        mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
+        usleep 300000 2>/dev/null || sleep 1
+        if [ "$USE_STOCK_PA" = "1" ]; then
+            stock_pa_mute 1 || start_failed "stock PA pre-mute failed"
+        fi
+        wait_for_pcm_clock || start_failed "audio clock unavailable"
 
         # Configure the low-volume path while the speaker is still off.
         mixer_set "Ext Spk" off || true
@@ -284,20 +356,11 @@ case "${1:-}" in
         }
         hook_log "mixer baseline verified master=$MASTER digital=$baseline_digital playback=$PLAYBACK"
 
-        [ "$(read_file "$SAFE/watchdog.pid")" ] ||
-            start_failed "watchdog pid disappeared"
-        watchdog_alive || start_failed "watchdog stopped during baseline"
-        watchdog_alive || start_failed "watchdog stopped before output enable"
-        [ ! -f "$SAFE/tripped" ] || start_failed "watchdog tripped before output enable"
         # The stock Bluetooth player can change the PA independently when it
         # resumes. Reassert PA mute while Ext Spk is off and I2S is muted;
         # the normal opening sequence below unmutes it only after I2S runs.
-        if [ -n "${HK_AP2_BT:-}" ] && [ "$USE_STOCK_PA" = "1" ]; then
-            stock_pa_mute 1 || start_failed "stock PA pre-mute failed"
-            watchdog_alive || start_failed "watchdog stopped during PA pre-mute"
-            [ ! -f "$SAFE/tripped" ] || start_failed "watchdog tripped during PA pre-mute"
-            hook_log "stock PA pre-muted for Bluetooth"
-        fi
+        output_guard_ok || start_failed "output guard lost during PA pre-mute"
+        wait_for_pcm_clock || start_failed "audio clock lost before output enable"
         # Open the path while the DAC is digitally silent: start the I2S data
         # while the stock PA is still muted, then unmute the PA, then switch
         # the amplifier on and fade in by restoring the digital volume (the

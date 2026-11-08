@@ -246,15 +246,20 @@ watchdog_loop() {
             deadline=
             last_marker=
         else
-            shairport_pid=$(read_file "$RUN/shairport.pid")
-            if [ -z "$shairport_pid" ] || ! kill -0 "$shairport_pid" 2>/dev/null; then
-                rm -f "$SAFE/play.started"
-                hard_mute
-                deadline=
-                last_marker=
-                log_action "AP2 stream process ended; hard mute"
-                sleep 1
-                continue
+            # A Bluetooth lease does not belong to Shairport.  LMK may recycle
+            # the optional AirPlay process while Bluetooth continues playing;
+            # that must not revoke the independent bridge's valid lease.
+            if [ ! -f "$BT_OWNER" ]; then
+                shairport_pid=$(read_file "$RUN/shairport.pid")
+                if [ -z "$shairport_pid" ] || ! kill -0 "$shairport_pid" 2>/dev/null; then
+                    rm -f "$SAFE/play.started"
+                    hard_mute
+                    deadline=
+                    last_marker=
+                    log_action "AP2 stream process ended; hard mute"
+                    sleep 1
+                    continue
+                fi
             fi
             # Bluetooth follows the stock 0..32 Master control. The AP2
             # path retains its existing setting; both retain the separate

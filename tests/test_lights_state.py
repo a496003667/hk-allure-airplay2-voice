@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the lights bridge's AirPlay-only playback ownership state."""
+"""Exercise the lights bridge's AirPlay and Bluetooth ownership state."""
 import os
 import pathlib
 import subprocess
@@ -17,10 +17,15 @@ class LightsStateTest(unittest.TestCase):
         self.bin = root / "bin"
         (self.run / "safe").mkdir(parents=True)
         self.bin.mkdir()
+        self.proc = root / "proc"
+        self.proc.mkdir()
+        self.pcm = root / "pcm.status"
         (self.run / "shairport.pid").write_text(f"{os.getpid()}\n")
         self.env = os.environ | {
             "HK_LIGHTS_DIR": str(root / "lights"),
             "HK_LIGHTS_RUN": str(self.run),
+            "HK_LIGHTS_PCM_STATUS": str(self.pcm),
+            "HK_LIGHTS_PROC_ROOT": str(self.proc),
         }
 
     def tearDown(self):
@@ -41,6 +46,18 @@ class LightsStateTest(unittest.TestCase):
         (self.run / "safe/play.started").write_text("1\n")
         (self.run / "ap2-claim").write_text("1\n")
 
+    def bluetooth_markers(self, comm="a01controller\n"):
+        owner = 4242
+        (self.run / "safe/armed").touch()
+        (self.run / "bt-owner.pid").write_text("31337\n")
+        self.pcm.write_text(
+            "state: RUNNING\n"
+            f"owner_pid   : {owner}\n"
+            "trigger_time: 1.000000000\n"
+        )
+        (self.proc / str(owner)).mkdir()
+        (self.proc / str(owner) / "comm").write_text(comm)
+
     def test_active_requires_both_airplay_markers(self):
         self.active_markers()
         self.assertEqual(self.state(), "active")
@@ -59,6 +76,16 @@ class LightsStateTest(unittest.TestCase):
         cut.write_text("#!/bin/sh\nprintf '0\\n'\n")
         cut.chmod(0o755)
         self.env["PATH"] = str(self.bin) + ":" + self.env["PATH"]
+        self.assertEqual(self.state(), "idle")
+
+    def test_running_bluetooth_lease_lights_the_ring(self):
+        self.bluetooth_markers()
+        self.assertEqual(self.state(), "active")
+        self.pcm.write_text("state: closed\n")
+        self.assertEqual(self.state(), "idle")
+
+    def test_non_bluetooth_pcm_owner_does_not_light_the_ring(self):
+        self.bluetooth_markers(comm="shairport-sync\n")
         self.assertEqual(self.state(), "idle")
 
 

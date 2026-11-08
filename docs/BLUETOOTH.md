@@ -70,6 +70,10 @@ armv7-linux-gnueabihf-gcc -Os -fPIC -shared \
 - Bluetooth watchdog 在桥接器退出、心跳过期或来源停止时立即恢复硬静音。
 - 打开顺序为 DAC 静音、原厂功放静音、开 I2S、解除功放静音、开 `Ext Spk`、
   最后数字渐入。关闭按相反顺序，避免暂停/恢复时的“啪”声。
+- 所有来源共用 `hk-ap2-audio-hook.sh` 的 `guard`/`start`/`stop`：调用扬声器前
+  先验证租约、watchdog、hold/trip 和 PCM 时钟，再确认功放与数字静音基线。
+  蓝牙语音混音恢复数字增益前也会先淡出到 0 并调用 `guard active`；检查失败
+  就保持静音，不再直接切换功放或渐入。
 
 ## 安装
 

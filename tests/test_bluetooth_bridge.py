@@ -45,6 +45,13 @@ class BluetoothBridgeTest(unittest.TestCase):
 if [ "$2" = setPlayerCmd:vol:30 ]; then
   echo clamp >>"$MOCK_LOG"
   sed 's/"vol":"52"/"vol":"30"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
+elif [ "$2" = setPlayerCmd:onepause ]; then
+  echo onepause >>"$MOCK_LOG"
+  sed 's/"status":"play"/"status":"stop"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
+elif [ "$2" = setPlayerCmd:resume ]; then
+  echo resume >>"$MOCK_LOG"
+  sed 's/"status":"stop"/"status":"play"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
+  printf 'state: RUNNING\\nowner_pid   : 42\\n' >"$MOCK_PCM"
 else
   cat "$MOCK_STATUS"
 fi
@@ -70,8 +77,11 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
             'HK_BT_PCM_STATUS': str(self.pcm), 'HK_BT_PROC_ROOT': str(self.proc),
             'HK_BT_PLAYER_SOCKET': str(self.base / 'player.sock'),
             'MOCK_STATUS': str(self.status), 'MOCK_LOG': str(self.log),
+            'MOCK_PCM': str(self.pcm),
             'MOCK_MASTER': str(self.base / 'master'),
             'MOCK_LEVELS': str(self.base / 'levels'),
+            'HK_BT_STALL_SECONDS': '0',
+            'HK_BT_STALL_COOLDOWN': '0',
         }
         self.children = []
         self.dummy_watchdog = self.launch(['sleep', '60'])
@@ -126,6 +136,43 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
         time.sleep(2)
         self.assertEqual(self.events().count('start'), 2, 'AirPlay claim blocks reacquisition')
         self.assertIsNone(bridge.poll())
+
+    def test_play_without_pcm_rebuilds_a2dp_transport(self):
+        self.pcm.write_text('state: closed\n')
+        self.state('play')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: self.events().count('start') == 1, timeout=15)
+        events = self.events()
+        self.assertLess(events.index('onepause'), events.index('resume'))
+        self.assertLess(events.index('resume'), events.index('start'))
+        self.assertTrue((self.run / 'bt-owner.pid').exists())
+
+    def test_voice_mixer_keeps_the_bluetooth_lease(self):
+        self.state('play')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: self.events().count('start') == 1)
+        (self.run / 'voice-owns').write_text('0\n')
+        (self.run / 'voice-inject').mkdir()
+        (self.run / 'voice-inject/active').touch()
+        time.sleep(2)
+        self.assertNotIn('stop', self.events())
+        self.assertTrue((self.run / 'bt-owner.pid').exists())
+        (self.run / 'voice-inject/active').unlink()
+        time.sleep(2)
+        self.assertNotIn('stop', self.events())
+        self.assertTrue(
+            (self.run / 'bt-owner.pid').exists(),
+            'a still-running Bluetooth PCM must keep its output lease after voice mixing',
+        )
+        (self.run / 'voice-owns').unlink()
+        time.sleep(2)
+        self.assertNotIn('stop', self.events())
+        self.assertTrue((self.run / 'bt-owner.pid').exists())
+        self.state('stop')
+        eventually(
+            lambda: 'stop' in self.events()
+            and not (self.run / 'bt-owner.pid').exists()
+        )
 
     def test_watchdog_latches_mute_when_bridge_dies(self):
         self.state('play')
@@ -216,6 +263,32 @@ esac
         eventually(lambda: not (self.run / 'bt-owner.pid').exists())
         time.sleep(1)
         self.assertFalse((self.safe / 'tripped').exists(), 'normal release must not latch a false trip')
+
+    def test_bluetooth_lease_does_not_require_shairport(self):
+        mixer = self.base / 'fake-amixer'
+        self.executable(mixer, '''#!/bin/sh
+case "$*" in
+  *"sget Master"*) echo 'Front Left: 17';;
+  *"cget numid=1"*) echo '  : values=207,207';;
+  *"cget numid=2"*) echo '  : values=0,0';;
+esac
+''')
+        (self.run / 'bt-owner.pid').write_text(str(self.dummy_watchdog.pid))
+        (self.run / 'bt-heartbeat').write_text('0')
+        (self.safe / 'play.started').write_text('1')
+        env = self.env | {
+            'HK_AP2_AMIXER': str(mixer), 'HK_AP2_MAX_PLAY_SECONDS': '0',
+            'HK_AP2_BT_DIGITAL_SAFE': '207', 'HK_AP2_BT_PLAYBACK_SAFE': '0',
+        }
+        self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
+        eventually(lambda: (self.safe / 'watchdog.heartbeat').exists())
+        time.sleep(3)
+        self.assertFalse(
+            (self.safe / 'tripped').exists(),
+            'Bluetooth must survive Shairport being recycled by the memory guard',
+        )
+        self.assertTrue((self.safe / 'play.started').exists())
+        self.assertTrue((self.run / 'bt-owner.pid').exists())
 
     def test_watchdog_allows_bluetooth_master_above_four(self):
         mixer = self.base / 'fake-amixer'

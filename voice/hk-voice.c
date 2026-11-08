@@ -1424,6 +1424,8 @@ static int ap2_connected(void) {
  * sender is connected, the stock volume (0..100) otherwise.  GAIN_REF_DB is
  * the level at volume 25 (what the user picked); each doubling adds 6 dB. */
 static float output_gain_db(void) {
+  const char *bt_mix = getenv("HK_VOICE_BT_INJECT_ACTIVE");
+  if (bt_mix && access(bt_mix, F_OK) == 0) return -12.0f;
   const char *fixed = conf_get("GAIN_DB", NULL);
   if (fixed) return (float)strtod(fixed, NULL);
   float ref = (float)strtod(conf_get("GAIN_REF_DB", "-20"), NULL);

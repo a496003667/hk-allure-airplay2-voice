@@ -4,6 +4,10 @@
 
 Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and replaces the retired Alexa with a Chinese voice assistant that **runs on the speaker itself**. The stock light ring, physical buttons and volume ring are wired back up to the new features.
 
+AirPlay, the stock Bluetooth player and voice replies use the Harman DSP. The project retains the stock wake word and physical controls, and provides a persistent mTLS maintenance channel, audio handoff safeguards and rollback procedures.
+
+As of 2026-11-08, AirPlay and Bluetooth have both produced sound on the test speaker, and one Bluetooth pause and resume was heard without a pop. The latest shared pop prevention sequence and AirPlay volume settings still need listening tests after reconnecting. The woofer and the complete voice handoff during Bluetooth playback also need further testing. Passing automated tests does not establish those listening results.
+
 ## ⚠️ Read this first
 
 - You need a **root shell** on the speaker. See [initial root access](docs/ROOTING.md) and the [persistent mTLS maintenance channel](docs/MAINTENANCE.md) (Chinese). The latter starts at boot and is used for routine maintenance. Certificates and keys are not included.
@@ -16,9 +20,9 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 | Module | What it does |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP. Works from iPhone and Mac (Shairport Sync supports being added to the Home app; not tested by the author); sender-controlled software volume (-6 dB ceiling, default -30 dB) routed through the stock ABI bridge into Harman's two-channel DSP |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP, routed through the stock ABI bridge into the Harman DSP. Software output spans -36 to -6 dB; the default AirPlay input value is -30 (about -36 dB output, and subject to sender control) |
 | **Bluetooth / bass** | Keeps the stock A2DP player, but routes it through Harman's two-way DSP: left drives the 90 mm woofer and right drives the mid/high drivers; phone volume drives the stock 33-step software volume before the DSP |
-| **No pops** | Starts the I2S data first, then unmutes the stock amplifier, then switches the speaker on and fades in; no pops on pause, seek, or when two senders take over from each other |
+| **Pop prevention** | Starts I2S data, unmutes the stock amplifier, switches the speaker on and fades in; the latest sequence still needs listening tests across source changes |
 | **Lights / volume ring** | Shows the stock "playing" animation during playback; the volume ring follows the sender's volume |
 | **Buttons** | While an AirPlay sender is connected, play/pause and volume keys control the sender, with volume kept in sync both ways |
 | **Voice assistant** | Uses the stock "Alexa" wake word; Baidu short-speech ASR → ModelScope Qwen LLM (streamed) → Baidu TTS (voice 4189), with spoken replies routed through the same Harman DSP |

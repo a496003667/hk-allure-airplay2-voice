@@ -57,7 +57,9 @@ COMMON_SHA1=02f8c40f3888d3b2125706e59dacbb04c9f6dad2
 VOICE_SCRIPT="$BASE/../hk-voice/hk-voice.sh"
 VOICE_SCRIPT_SHA1=467486eb76fbf0bad6ce48ced7b41f59d42c25c5
 VOICE_RUN=/tmp/hk-voice
-MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-34816}
+MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-8192}
+MIN_START_AVAILABLE_KIB=${HK_AP2_MIN_START_AVAILABLE_KIB:-49152}
+MEMINFO=${HK_AP2_MEMINFO_FILE:-/proc/meminfo}
 PLAYER_SOCKET=/tmp/Requesta01controller
 PIDFILE=/tmp/hk-ap2-supervisor.pid
 STOPFILE=/tmp/hk-ap2-supervisor.stop
@@ -109,6 +111,35 @@ log() {
 
 free_kib() {
     awk '/^MemFree:/ {print $2; exit}' /proc/meminfo 2>/dev/null
+}
+
+startup_memory_kib() {
+    # Linux 3.10 has no MemAvailable. Count clean reclaimable file cache,
+    # exclude tmpfs and dirty/writeback pages, and credit only half the slab.
+    awk '
+        /^(MemFree|Buffers|Cached|Shmem|SReclaimable|Dirty|Writeback):/ {
+            if ($2 !~ /^[0-9]+$/) bad=1
+            value[$1]=$2
+        }
+        END {
+            if (bad || !("MemFree:" in value) || !("Buffers:" in value) ||
+                !("Cached:" in value) || !("Shmem:" in value)) exit 1
+            clean=value["Cached:"]-value["Shmem:"]-value["Dirty:"]-value["Writeback:"]
+            if (clean < 0) clean=0
+            available=value["MemFree:"]+value["Buffers:"]+clean+int(value["SReclaimable:"]/2)
+            printf "%d %d\n", value["MemFree:"], available
+        }
+    ' "$MEMINFO" 2>/dev/null
+}
+
+startup_memory_ok() {
+    memory=$(startup_memory_kib) || { log 'refusing AP2 start: invalid memory accounting'; return 1; }
+    free=${memory%% *}; available=${memory#* }
+    if [ "$free" -lt "$MIN_START_FREE_KIB" ] || [ "$available" -lt "$MIN_START_AVAILABLE_KIB" ]; then
+        log "refusing AP2 start: MemFree=${free}KiB available~${available}KiB; need free=${MIN_START_FREE_KIB}KiB available=${MIN_START_AVAILABLE_KIB}KiB"
+        return 1
+    fi
+    log "startup memory checked: MemFree=${free}KiB available~${available}KiB"
 }
 
 supervisor_pid() {
@@ -315,14 +346,7 @@ mount_runtime() {
         return 1
     }
 
-    free=$(free_kib)
-    case "$free" in
-        ''|*[!0-9]*) free=0 ;;
-    esac
-    if [ "$free" -lt "$MIN_START_FREE_KIB" ]; then
-        log "refusing AP2 start: MemFree=${free}KiB, need=${MIN_START_FREE_KIB}KiB"
-        return 1
-    fi
+    startup_memory_ok || return 1
 
     # This path belongs only to the optional runtime.  Remove files left by
     # the previous unpack-to-tmpfs implementation before covering it with the

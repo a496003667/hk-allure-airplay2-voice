@@ -1,6 +1,6 @@
 # 构建、发布与受控更新 / Build, package and update
 
-本分支为离线候选，实机部署与听测待完成。本说明区分已有设备更新与首次安装；不会自动连接设备。
+本分支已完成作者设备的安装与静音核验，试听及长测待完成；见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。本说明区分已有设备更新与首次安装；主机构建/打包工具不会自动连接设备。
 
 ## 构建输入
 
@@ -64,7 +64,7 @@ python3 tools/make-runtime.py \
 
 ## 设备更新事务
 
-以下均是回到内网、核查设备空闲后才执行的设备侧步骤，本轮离线开发不执行：
+以下均是处于设备内网、核查设备空闲后才执行的设备侧步骤：
 
 1. 读取当前播放、内存、版本、hold/trip 和维护状态；用户暂停音源。私有备份保存到电脑，核对 SHA-256 和权限。
 2. 上传经过验证的候选目录到有足够空间的临时位置。用 `tools/stage-update.sh <候选目录>` 生成目标的 `.new` 文件，它不替换运行文件。
@@ -73,6 +73,12 @@ python3 tools/make-runtime.py \
 5. 安装后核对实际运行的 5.6 绑定、二进制和设备配置 pin、端口、DSP/蓝牙桥、保护进程；不是仅看端口 7000。未验收的 4.3.6 不能冒充成功。
 6. 若包涉及语音、灯效、按键或蓝牙库，由事务内校验并保存的 `hk-audio-dependents.sh` 重载相应组件。原厂播放器只在静音、独立 watchdog 已恢复时受控重载；不重启 `rootApp` 或维护通道。原厂播放器未成功重载即更新失败。
 7. 成功保留维护 hold 等待用户在场试听；不用定时静音打断后续长测。不能直接删除 hold 而不检查 latched trip 和正常关闭顺序。
+
+原厂 BusyBox 没有 `stat` applet；更新器通过 POSIX `ls` 权限字段读取并保留普通及特殊权限位。失败启动可能删除运行目录，回退静音会先重建锁的父目录。旧控制器没有 `verify` 命令时，只有回退路径可使用兼容验收：整批恢复文件、实际 5.6 绑定、进程身份、watchdog 心跳及状态均必须匹配；新候选仍必须提供 `verify`。
+
+这台小内存设备需要释放上传/解包副本的 tmpfs 占用。暂存并核对全部 `.new` 后，把已校验的候选更新器和 manifest 复制到独立临时路径，再清理上传压缩包及解包目录；电脑上保留完整私有包。可用 `HK_AP2_UPDATE_RELEASE_STAGING=1 sh <已校验更新器> --manifest <manifest>`，在整批安装文件通过哈希/权限校验后、启动前释放 `.new` 副本。回退使用独立事务备份；重试须从原包重新暂存。不要清理未完成事务或唯一回滚副本。
+
+启动检查同时要求至少 8192 KiB 原始空闲和 49152 KiB 估算可用内存。Linux 3.10 的估算只计入扣除 Shmem、Dirty、Writeback 后的文件缓存，加 Buffers 和一半 SReclaimable；字段缺失或无效时拒绝启动。运行期原有 4096 KiB 空闲 / 32768 KiB 可用门槛保持，不能把这项改动理解为取消内存保护。
 
 失败会恢复整批文件；即使回退成功，原更新命令仍返回非零。回退失败保留 hold 与 `/vendor/airplay2/.updates/pending`，日志给出：
 
@@ -104,10 +110,14 @@ pending 未完成时普通启动保持静音并拒绝开始。保存事务内的
 
 ## English summary
 
-This branch is an offline candidate. `build-local.sh` cross-builds project code and the pinned Shairport patch; `sync-pins.py` updates public artifact pins. `release.py` packages an explicit allowlist, checks ELF ABI and shell syntax, generates hashes/modes, preserves a private device configuration and generates its private pin. No tool connects to a speaker or reads credentials.
+This branch passed muted deployment checks on the author's device; listening and sustained acceptance are pending. `build-local.sh` cross-builds project code and the pinned Shairport patch; `sync-pins.py` updates public artifact pins. `release.py` packages an explicit allowlist, checks ELF ABI and shell syntax, generates hashes/modes, preserves a private device configuration and generates its private pin. These host build/package tools do not connect to a speaker or read credentials.
 
 Existing-device updates reuse the verified base runtime and update only the candidate overrides. A fresh installation additionally needs the locked third-party dependency tree, runtime image, NQPTP, broker and prior root/boot setup. `make-runtime.py` creates a little-endian cramfs from explicit inputs; it is not a third-party source builder or proof of a tested fresh installation. The small vendor partition can prevent a full image transaction; keep the rollback-space check.
 
 On the device, stage `.new` siblings, then run the verified candidate updater with `--manifest`. It backs up the full set, holds output muted, closes audio before stopping clocks, unmounts, installs, verifies the exact 5.6/configuration/protection stack, and reloads affected dependents. It never restarts rootApp or the maintenance channel. Failure returns nonzero; failed recovery retains mute and a persistent journal. Successful installation also stays held until user-present verification.
+
+Stock BusyBox lacks `stat`, so permissions are decoded from POSIX `ls`, including special bits. Recovery recreates the runtime lock directory after failed startup. A controller lacking `verify` is accepted only during rollback and only after matching the saved files, active 5.6 bindings, live process identities, watchdog heartbeat and status. New candidates must pass their own `verify` command.
+
+After verified staging, retain a separate verified updater/manifest and remove uploaded/extracted tmpfs copies while preserving the original private package on the host. `HK_AP2_UPDATE_RELEASE_STAGING=1` additionally removes `.new` duplicates after the complete installed set is verified and before startup; rollback still uses transaction backups. Startup requires both 8 MiB raw free and 48 MiB conservatively estimated available memory, excluding tmpfs and dirty/writeback cache and crediting half the reclaimable slab. Invalid counters fail closed. The existing 4 MiB free / 32 MiB available runtime protection remains unchanged.
 
 Disabling AirPlay retains shared Bluetooth/voice protection. Other modules have distinct persistent-disable and reload behavior as listed above. Automated and emulated tests do not establish audible pop prevention, bass output, physical-button loudness or sustained playback acceptance. The simulator's Shairport `-X` crash is shared by the old baseline; persistent startup remains an on-device test.

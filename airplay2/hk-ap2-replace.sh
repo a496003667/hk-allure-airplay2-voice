@@ -20,7 +20,30 @@ TX=
 DEPENDENTS=
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG"; }
 digest() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
-mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+mode() {
+    # The stock BusyBox has no stat applet. POSIX ls is available there;
+    # decode its permission field, including special bits needed on rollback.
+    LC_ALL=C ls -ld "$1" 2>/dev/null | awk '
+        function bits(s) {
+            r=(substr(s,1,1)=="r" ? 4 : 0)
+            w=(substr(s,2,1)=="w" ? 2 : 0)
+            x=(substr(s,3,1) ~ /[xst]/ ? 1 : 0)
+            return r+w+x
+        }
+        NR==1 {
+            u=substr($1,2,3); g=substr($1,5,3); o=substr($1,8,3)
+            if (u !~ /^[r-][w-][xsS-]$/ || g !~ /^[r-][w-][xsS-]$/ ||
+                o !~ /^[r-][w-][xtT-]$/) exit 1
+            special=0
+            if (substr(u,3,1) ~ /[sS]/) special+=4
+            if (substr(g,3,1) ~ /[sS]/) special+=2
+            if (substr(o,3,1) ~ /[tT]/) special+=1
+            if (special) printf "%d", special
+            printf "%d%d%d\n", bits(u), bits(g), bits(o)
+        }
+        END { if (NR != 1) exit 1 }
+    '
+}
 allowed() {
     case "$1" in *..*|*//*|*' '*|*'\t'*|*'|'*) return 1;; esac
     case "$1" in "$BASE"/*|"${BASE%/*}"/hk-voice/*|"${BASE%/*}"/hk-lights/*|"${BASE%/*}"/hk-keys/*) ;;
@@ -74,7 +97,9 @@ check_space() {
 }
 
 keep_muted() {
-    mkdir -p "$(dirname "$HOLD")" || return 1
+    # A failed start/stop can remove RUN. The hook needs its lock directory
+    # even when no runtime is mounted and recovery is about to restore files.
+    mkdir -p "$RUN" "$(dirname "$HOLD")" || return 1
     : >"$HOLD" || return 1
     if [ -x "$BASE/hk-ap2-audio-hook.sh" ]; then
         # Voice flag prevents a stale voice marker from ignoring global mute.
@@ -104,17 +129,79 @@ installed_matches() {
         [ "$(digest "$target")" = "$sum" ] && [ "$(mode "$target")" = "$perm" ] || return 1
     done <"$TX/candidate.manifest"
 }
+release_staging() {
+    [ "${HK_AP2_UPDATE_RELEASE_STAGING:-0}" = 1 ] || return 0
+    # Low-RAM devices can release duplicated page-cache pages before start.
+    # Do this only after every installed file has passed its manifest check;
+    # rollback uses the transaction backups, never these staged candidates.
+    while read -r sum perm target extra; do
+        [ -f "$target.new" ] && [ ! -L "$target.new" ] &&
+            [ "$(digest "$target.new")" = "$sum" ] || return 1
+    done <"$TX/candidate.manifest"
+    while read -r sum perm target extra; do rm "$target.new" || return 1; done <"$TX/candidate.manifest"
+    log 'verified installed set; released staged duplicates before startup'
+}
+restored_matches() {
+    while read -r index sum perm target; do
+        if [ "$sum" = - ]; then
+            [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+        else
+            [ "$(digest "$target")" = "$sum" ] && [ "$(mode "$target")" = "$perm" ] || return 1
+        fi
+    done <"$TX/restore.manifest"
+}
+verify_legacy_restore() {
+    # The pre-audit controller has no `verify` verb. Accept its restored
+    # startup only against the saved files AND the actual active bindings;
+    # a listening fallback alone is never proof of a successful rollback.
+    restored_matches || return 1
+    [ ! -f /tmp/hk-ap2-56.fallback ] && [ -f "$RUN/safe/armed" ] || return 1
+    for pair in \
+        "$BASE/ap2-56/shairport-sync:$OPT/bin/shairport-sync" \
+        "$BASE/ap2-56/shairport-sync.conf:$OPT/etc/ap2/shairport-sync.conf" \
+        "$BASE/hk-ap2-audio-hook.sh:$OPT/hk-ap2-audio-hook.sh" \
+        "$BASE/hk-ap2-safe-test.bt:$OPT/bin/hk-ap2-safe-test" \
+        "$BASE/hk-ap2ctl.ap256:$OPT/bin/hk-ap2ctl"; do
+        target=${pair%:*}; active=${pair#*:}
+        expected=$(awk -v path="$target" '$4==path {print $2}' "$TX/restore.manifest")
+        [ -n "$expected" ] && [ "$expected" != - ] || return 1
+        awk -v path="$active" '$2==path {found=1} END {exit !found}' "$MOUNTS" || return 1
+        [ "$(digest "$active")" = "$expected" ] || return 1
+    done
+    for pair in "$RUN/shairport.pid:$OPT/bin/shairport-sync" \
+        "$RUN/safe/watchdog.pid:hk-ap2-safe-test"; do
+        pidfile=${pair%:*}; command=${pair#*:}
+        pid=$(cat "$pidfile" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*|0|1) return 1;; esac
+        kill -0 "$pid" 2>/dev/null &&
+            tr '\000' ' ' <"/proc/$pid/cmdline" | grep -Fq "$command" || return 1
+    done
+    beat=$(cat "$RUN/safe/watchdog.heartbeat" 2>/dev/null)
+    current=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+    case "$beat:$current" in *[!0-9:]*|:*|*:) return 1;; esac
+    [ "$beat" -le "$current" ] && [ $((current-beat)) -le 4 ] || return 1
+    status=$("$CTL" status 2>/dev/null) || return 1
+    for line in '^supervisor: running pid=' '^watchdog: running pid=' \
+        '^AP2 mode: real$' '^armed: yes$' '^airplay port 7000: listening$'; do
+        printf '%s\n' "$status" | grep -q "$line" || return 1
+    done
+}
 ap2_up() {
     i=0
     while [ "$i" -lt "${HK_AP2_UPDATE_WAIT_SECONDS:-90}" ]; do
         # verify checks the active 5.6 binding, config pins and supervisors.
-        "$CTL" verify >>"$LOG" 2>&1 && return 0
+        if "$CTL" verify >>"$LOG" 2>&1; then return 0
+        else verify_rc=$?; fi
+        if [ "${1:-candidate}" = restored ] && [ "$verify_rc" = 2 ] && verify_legacy_restore; then
+            log 'legacy rollback verified against saved files, active bindings and watchdog'
+            return 0
+        fi
         sleep 2
         i=$((i + 2))
     done
     return 1
 }
-start_ap2() { env HK_AP2_UPDATE_START=1 "$CTL" start >>"$LOG" 2>&1 && ap2_up; }
+start_ap2() { env HK_AP2_UPDATE_START=1 "$CTL" start >>"$LOG" 2>&1 && ap2_up "$@"; }
 backup_all() {
     index=0
     : >"$TX/restore.manifest" || return 1
@@ -156,7 +243,7 @@ rollback() {
     release_runtime || return 1
     [ -z "$DEPENDENTS" ] || env HK_AP2_UPDATE_TX="$TX" "$DEPENDENTS" stop "$TX/candidate.manifest" >>"$LOG" 2>&1 || return 1
     restore_all || return 1
-    start_ap2 || return 1
+    start_ap2 restored || return 1
     [ -z "$DEPENDENTS" ] || env HK_AP2_UPDATE_TX="$TX" "$DEPENDENTS" start "$TX/candidate.manifest" >>"$LOG" 2>&1 || return 1
     [ -z "$DEPENDENTS" ] || env HK_AP2_UPDATE_TX="$TX" "$DEPENDENTS" verify "$TX/candidate.manifest" >>"$LOG" 2>&1 || return 1
     printf '%s\n' rolled-back >"$TX/state"
@@ -233,7 +320,7 @@ main() {
     done <"$TX/candidate.manifest"
     printf '%s\n' installed >"$TX/state"
     sync
-    installed_matches && start_ap2 && installed_matches || return 1
+    installed_matches && release_staging && start_ap2 && installed_matches || return 1
     [ -z "$DEPENDENTS" ] || env HK_AP2_UPDATE_TX="$TX" "$DEPENDENTS" start "$TX/candidate.manifest" >>"$LOG" 2>&1 || return 1
     [ -z "$DEPENDENTS" ] || env HK_AP2_UPDATE_TX="$TX" "$DEPENDENTS" verify "$TX/candidate.manifest" >>"$LOG" 2>&1 || return 1
     printf '%s\n' committed >"$TX/state"

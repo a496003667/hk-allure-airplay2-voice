@@ -1,6 +1,6 @@
 # 2026-11-14 审计修复方案 / Audit repair plan
 
-状态：**已进入离线开发，尚未部署到设备**。基线提交：`741ce5848646717f44026634cb978dfd4c915294`；修复分支：`fix/audit-20261114`。
+状态：**离线开发已完成，已部署并通过静音核验；本轮听测、硬件低频和长测待完成**。基线提交：`741ce5848646717f44026634cb978dfd4c915294`；修复分支：`fix/audit-20261114`。本文件保留修复设计，实际结果见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。
 
 ## 目标与基线
 
@@ -160,7 +160,7 @@ F01–F12 每项均需有对应改动、回归证据和剩余限制；未完成�
 
 ## English summary
 
-This plan is now being implemented offline; nothing has been deployed to the speaker. The baseline is commit `741ce58`, with 54 passing existing tests and nine reproduced abnormal behaviors. A subsequent read-only device connection succeeded; that snapshot does not constitute runtime acceptance of any fix.
+The offline implementation is complete and has passed muted deployment checks; this round's listening, bass hardware and sustained acceptance remain pending. The baseline is commit `741ce58`, with 54 original tests and nine reproduced abnormal behaviors. The current complete suite passes 111 tests; see the device record for actual installation and recovery evidence. The design below remains the repair plan, not a claim of audible acceptance.
 
 The six implementation batches are:
 

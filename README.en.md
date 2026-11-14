@@ -6,7 +6,7 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 AirPlay, the stock Bluetooth player and voice replies use the Harman DSP. The project retains the stock wake word and physical controls, and provides a persistent mTLS maintenance channel, audio handoff safeguards and rollback procedures.
 
-The 2026-11-14 audit repairs are being validated offline on `fix/audit-20261114`; **nothing from this branch has been deployed to the speaker**. Earlier AirPlay/Bluetooth playback does not establish acceptance of these changes. Audible pops, source switching, voice handoff, bass hardware and sustained operation still need device tests. See the bilingual [repair status](docs/AUDIT-REPAIRS-2026-11-14.md) and [repair plan](docs/REPAIR-PLAN-2026-11-14.md).
+The 2026-11-14 repairs on `fix/audit-20261114` passed **111 Linux/BusyBox tests and muted deployment checks on the author's speaker**. The active stack is Shairport 5.6 with the 24 dB flat configuration, Harman DSP, Bluetooth bridge and independent protection; voice, lights and keys were reloaded. Maintenance mute remains held for this round's listening tests. Audible pops, source switching, complete voice handoff, bass hardware and sustained operation remain unverified. See the bilingual [device record](docs/DEVICE-VALIDATION-2026-11-14.md), [repair status](docs/AUDIT-REPAIRS-2026-11-14.md) and [repair plan](docs/REPAIR-PLAN-2026-11-14.md).
 
 ## ⚠️ Read this first
 

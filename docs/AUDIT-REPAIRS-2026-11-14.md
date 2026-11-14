@@ -21,7 +21,7 @@
 
 ## 本轮验证
 
-Linux/BusyBox 完整 **99 项通过**；当前 ARM raw IPC 另 **7 项通过**。12 个 ARM 产物的 ABI/GLIBC 检查通过，30 文件最小候选包验证通过，基础 cramfs 重复打包两次哈希一致。所有 shell 语法通过。具体哈希和验证边界见 [OFFLINE-VALIDATION.json](OFFLINE-VALIDATION.json)。基线的 54 项通过不再作为新增修复的唯一证据。
+Linux/BusyBox 完整 **99 项通过**；当前 ARM raw IPC 的 **6 项 socket 用例通过**（同组另重跑 1 项本机 fork 失败用例）。12 个 ARM 产物的 ABI/GLIBC 检查通过，30 文件最小候选包验证通过，基础 cramfs 重复打包两次哈希一致。所有 shell 语法通过。具体哈希和验证边界见 [OFFLINE-VALIDATION.json](OFFLINE-VALIDATION.json)。基线的 54 项通过不再作为新增修复的唯一证据。
 
 - 没有访问音箱或调用实际麦克风/扬声器；所有 audio 控件是夹具，媒体输出仅为本机文件或 `/dev/null`。
 - ARM 模拟器运行新 Shairport `--version` 正常。配置显示已解析 24 dB 范围，但 `-X` 随后退出为 139；旧基线 `b6c5263c…` 在相同环境同样崩溃。因此不宣称常驻启动已通过模拟验证。
@@ -39,6 +39,6 @@ Linux/BusyBox 完整 **99 项通过**；当前 ARM raw IPC 另 **7 项通过**�
 
 ## English summary
 
-All twelve audited findings have corresponding offline candidate changes and regression evidence listed above. The Linux/BusyBox suite passed all 99 tests, with another seven ARM IPC tests; 12 ARM artifacts passed compatibility checks, the 30-file candidate was verified, and two runtime packings produced the same hash. Nothing has been deployed to the speaker. Coverage includes process safety, real IPC deadlines, source-aware ownership, shutdown ordering, transactional update/rollback, command dispatch, interruption, disable semantics, bounded inode-preserving log rotation and packaging/pin generation.
+All twelve audited findings have corresponding offline candidate changes and regression evidence listed above. The Linux/BusyBox suite passed all 99 tests, with another six ARM IPC tests; 12 ARM artifacts passed compatibility checks, the 30-file candidate was verified, and two runtime packings produced the same hash. Nothing has been deployed to the speaker. Coverage includes process safety, real IPC deadlines, source-aware ownership, shutdown ordering, transactional update/rollback, command dispatch, interruption, disable semantics, bounded inode-preserving log rotation and packaging/pin generation.
 
 The AirPlay candidate maps software attenuation from −30 to −6 dB. Bluetooth voice defaults to in-place PCM mixing with music ducked to silence; an explicit pause really pauses and cancels automatic resume. Physical loudness calibration, complete source/voice handoff, audible pops, bass hardware, dependent stock-process reloads, fresh installation and sustained runtime remain device acceptance work. The Shairport `-X` simulator crash also affects the old baseline and is recorded as a validation limit.

@@ -19,16 +19,16 @@ Allure 的 PCM5121 两个输出通道不是一个普通立体声对：
 - `lib/alsa/asoundrc` 是普通 `softvol -> dmixer -> hw`，没有分频；
 - `lib/alsa/asoundrc_harman` 才是 `softvol -> harmandsp -> dmixer -> hw`。
 
-本机的原厂播放器从字面设备名 `default` 打开蓝牙 PCM，而启动脚本没有选择
+此前核查的本机原厂播放器从字面设备名 `default` 打开蓝牙 PCM，而启动脚本没有选择
 `asoundrc_harman`。因此蓝牙可以出声，却绕过了 Harman 的左右声道分频和低频调音。
-这不是 PCM5121 没启动，也不是 90 mm 单元本身的独立开关。蓝牙的正确路径是：
+这能说明软件分频路径存在差异，不能单凭它排除低音功放、接线或单元故障。当前未找到可独立启用低音单元的已验证控制接口。蓝牙路径应为：
 
 ```text
 a01controller -> Master softvol -> harmandsp -> hw:0,0
 ```
 
-AirPlay 使用 Shairport 自己的软件音量，输出范围为 `-36.0` 至 `-6.0 dB`。
-默认 AirPlay 输入值 `-30.0` 对应约 `-36.0 dB` 输出衰减，发送端可以覆盖默认值；
+本次离线修复分支的 AirPlay 使用 Shairport 软件音量与新增的 24 dB flat 范围，
+输出衰减为 `-30.0` 至 `-6.0 dB`；默认协议输入 `-30.0` 对应 `-30.0 dB` 输出衰减，发送端可以覆盖默认值；
 这些数值不是声压级。因为 Shairport
 5.6 是 soft-float、原厂 DSP 是 hard-float，它先把固定格式 PCM 交给
 `hk-ap2-dsp-bridge`，再由桥进入同一个 `harmandsp`；蓝牙仍使用自己的调用点配置。
@@ -43,8 +43,8 @@ armv7-linux-gnueabihf-gcc -Os -fPIC -shared \
   airplay2/hk-bt-open-redirect.c
 ```
 
-如果编译器版本或参数不同，生成的 SHA-256 会改变。必须同时更新
-`hk-bt-controller-wrapper.sh` 和 `hk-bt-boot` 中的默认校验值。
+使用 `tools/build-local.sh` 构建并由 `tools/sync-pins.py` 同步公版 pin，或由
+`tools/release.py` 为候选目录生成一致的 pin；不要只手动改一处校验值。
 
 ## 只改蓝牙调用点
 
@@ -110,6 +110,17 @@ grep hk-bt /proc/$pid/maps
 - `/etc/init.d/S05linkplay.sh` 替换前的备份；
 - `/vendor/airplay2/hk-bt-alsa.conf` 的旧版本；
 - 原厂 `a01controller` 与重定向库的 SHA-256 记录。
+
+## 2026-11-14 离线修复
+
+- 播放租约记录来源、owner PID、进程启动时间、轮次和阶段。独立语音先预留租约再检查时钟；旧轮 stop 不能撤销新轮租约。
+- AP2 的资源回收保留有效蓝牙/语音租约，恢复前先维护共享监督。常规停服先淡出/物理静音，再停 DSP/PCM；维护 hold 阻止新开声，同时保留现有时钟直到租约释放。
+- 默认同 PCM 语音混音会把背景音乐平滑压至静音，手机进度可能继续；“暂停”命令是真实的原厂暂停，取消本轮自动续播。下一首/上一首派发至蓝牙，而非 AirPlay MQTT。
+- `HK_VOICE_BT_MODE=pause` 是待实机验证的独立播报路径。若原厂暂停后仍占声卡，记录原因并保持静音；不强杀原厂服务争抢声卡。
+- 机身按键在蓝牙时保留原厂路径；AirPlay 接管后走发送端，AirPlay 语音交接期间仍可调发送端音量。已生成的播报片段不会因为滑块改变而重新合成，实时响度效果仍需听测。
+- 安装必须使用发布清单与受控依赖重载；更换 `.so` 文件不会自动改变已经映射它的原厂播放器。见 [BUILD-AND-UPDATE.md](BUILD-AND-UPDATE.md)。
+
+本分支尚未部署；下列历史记录不能替代新的实机验收。
 
 ## 验证状态
 

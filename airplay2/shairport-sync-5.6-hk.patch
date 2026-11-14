@@ -450,7 +450,7 @@ index 312763c..cb677d3 100644
  #endif
  
 diff --git a/shairport.c b/shairport.c
-index eca9c3e..d1044fe 100644
+index eca9c3e..60b33bb 100644
 --- a/shairport.c
 +++ b/shairport.c
 @@ -612,7 +612,10 @@ int parse_options(int argc, char **argv) {
@@ -465,7 +465,19 @@ index eca9c3e..d1044fe 100644
  
    // make up a firmware version
  #ifdef CONFIG_USE_GIT_VERSION_STRING
-@@ -1952,8 +1955,9 @@ int parse_options(int argc, char **argv) {
+@@ -1082,8 +1085,9 @@ int parse_options(int argc, char **argv) {
+       /* Get the volume range, in dB, that should be used If not set, it means you just use the
+        * range set by the mixer. */
+       if (config_lookup_int(config.cfg, "general.volume_range_db", &value)) {
+-        if ((value < 30) || (value > 150))
+-          die("Invalid volume range  %d dB. It should be between 30 and 150 dB. Zero means use "
++        if (((value < 30) || (value > 150)) &&
++            !((value == 24) && (config.volume_control_profile == VCP_flat)))
++          die("Invalid volume range %d dB. Use 24 dB with flat profile, or 30 to 150 dB. Zero means use "
+               "the mixer's native range. The setting reamins at %d.",
+               value, config.volume_range_db);
+         else
+@@ -1952,8 +1956,9 @@ int parse_options(int argc, char **argv) {
    // Bit 46 seems to mean	SupportsHKPairingAndAccessControl	HomeKit-based pairing and
    // access control support Bit 47 seems necessary too, but is undocumented.
  

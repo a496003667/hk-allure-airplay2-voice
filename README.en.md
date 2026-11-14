@@ -6,12 +6,12 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 AirPlay, the stock Bluetooth player and voice replies use the Harman DSP. The project retains the stock wake word and physical controls, and provides a persistent mTLS maintenance channel, audio handoff safeguards and rollback procedures.
 
-As of 2026-11-08, AirPlay and Bluetooth have both produced sound on the test speaker, and one Bluetooth pause and resume was heard without a pop. The latest shared pop prevention sequence and AirPlay volume settings still need listening tests after reconnecting. The woofer and the complete voice handoff during Bluetooth playback also need further testing. Passing automated tests does not establish those listening results.
+The 2026-11-14 repairs on `fix/audit-20261114` passed **111 Linux/BusyBox tests and muted deployment checks on the author's speaker**. The active stack is Shairport 5.6 with the 24 dB flat configuration, Harman DSP, Bluetooth bridge and independent protection; voice, lights and keys were reloaded. Maintenance mute remains held for this round's listening tests. Audible pops, source switching, complete voice handoff, bass hardware and sustained operation remain unverified. See the bilingual [device record](docs/DEVICE-VALIDATION-2026-11-14.md), [repair status](docs/AUDIT-REPAIRS-2026-11-14.md) and [repair plan](docs/REPAIR-PLAN-2026-11-14.md).
 
 ## ⚠️ Read this first
 
 - You need a **root shell** on the speaker. See [initial root access](docs/ROOTING.md) and the [persistent mTLS maintenance channel](docs/MAINTENANCE.md) (Chinese). The latter starts at boot and is used for routine maintenance. Certificates and keys are not included.
-- The speaker has **no offline recovery path**. This project only touches the `/vendor` user-data partition and `/etc/init.d` start scripts; it never writes the bootloader, kernel or firmware partitions, and every feature can be switched off with `touch …/disable`. Please keep to the same boundary.
+- The speaker has **no offline recovery path**. This project only touches the `/vendor` user-data partition and `/etc/init.d` start scripts; it never writes the bootloader, kernel or firmware partitions, with module-specific disable semantics described in the [build/update guide](docs/BUILD-AND-UPDATE.md). Disabling AirPlay retains shared protection needed by Bluetooth and voice. Please keep to the same boundary.
 - Tested on one Allure only (Amlogic quad-core Cortex‑A5, ~110 MB RAM, Linux 3.10.33, firmware from 2019-09).
 - Not affiliated with Harman Kardon, Amazon, Apple, Baidu or ModelScope; all names are trademarks of their respective owners.
 - The voice assistant speaks and understands **Mandarin Chinese** (Baidu ASR/TTS); the prompts are in Chinese.
@@ -20,18 +20,19 @@ As of 2026-11-08, AirPlay and Bluetooth have both produced sound on the test spe
 
 | Module | What it does |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP, routed through the stock ABI bridge into the Harman DSP. Software output spans -36 to -6 dB; the default AirPlay input value is -30 (about -36 dB output, and subject to sender control) |
-| **Bluetooth / bass** | Keeps the stock A2DP player, but routes it through Harman's two-way DSP: left drives the 90 mm woofer and right drives the mid/high drivers; phone volume drives the stock 33-step software volume before the DSP |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP, routed through the stock ABI bridge into the Harman DSP. This branch adds the tested 24 dB flat range: software attenuation -30 to -6 dB; default protocol input -30 maps to -30 dB, subject to sender control |
+| **Bluetooth / bass** | Keeps the stock A2DP player, routes it through Harman DSP and the stock 33-step software volume; actual low-frequency driver operation still needs listening tests |
 | **Pop prevention** | Starts I2S data, unmutes the stock amplifier, switches the speaker on and fades in; the latest sequence still needs listening tests across source changes |
 | **Lights / volume ring** | Shows the stock "playing" animation during playback; the volume ring follows the sender's volume |
 | **Buttons** | While an AirPlay sender is connected, play/pause and volume keys control the sender, with volume kept in sync both ways |
 | **Voice assistant** | Uses the stock "Alexa" wake word; Baidu short-speech ASR → ModelScope Qwen LLM (streamed) → Baidu TTS (voice 4189), with spoken replies routed through the same Harman DSP |
 | **Conversation** | A chime when you finish speaking; follow-up questions without the wake word for ~5 s; say "Alexa" to interrupt; speaks while the answer is still being generated |
+| **Bluetooth + voice** | By default the same PCM ducks music to silence and mixes the reply; phone track position may continue. An explicit pause command really pauses and cancels automatic resume |
 | **Local commands** | Pause / resume / next / previous / louder / quieter, handled without the LLM |
 | **Weather** | open-meteo (free, no key); default city by IP geolocation; any city, today to the day after tomorrow |
 | **Reminders / alarms / timers** | e.g. "十分钟后提醒我关火" (remind me in ten minutes), "明早七点叫我" (wake me at 7), "倒计时五分钟" (5-minute timer), list and cancel; many phrasings are recognised |
 | **AirPlay + voice** | Waking it during playback fades out and pauses the music, frees the DAC, answers, then resumes |
-| **Reliability** | Stored spoken prompts for network and service errors; the assistant is the first to go under memory pressure; a supervisor restarts it; the pre-roll recording is size-capped |
+| **Reliability** | Stored spoken prompts for network and service errors; optional processes keep positive OOM scores; AP2 reclamation preserves a valid Bluetooth lease; pre-roll and logs are bounded; kernel reclaim order is not guaranteed |
 | **Debloat** | Stops the OTA updater, Alexa alarms and Alexa multi-room at boot (reversible) |
 
 ## Layout
@@ -51,19 +52,18 @@ docs/       technical notes and pitfalls (Chinese)
 
 ## Building
 
-- **Shairport Sync**: take upstream 5.6 (the author used commit `9118bbc`), apply `airplay2/shairport-sync-5.6-hk.patch`, and cross-compile with a crosstool-ng `arm-unknown-linux-gnueabi` toolchain (soft-float, glibc 2.27). Dependencies: alsa-lib, libsoxr, ffmpeg (libavcodec/swresample), libsodium, libgcrypt, libplist, libmosquitto, avahi, libconfig, libpopt, OpenSSL. The runtime is packed as a cramfs image under `/vendor/airplay2/`, fully isolated from the stock hard-float glibc 2.19. NQPTP is upstream 1.2.x, unmodified.
-- **AirPlay DSP bridge**: Shairport emits fixed S32_LE/48 kHz raw PCM; `airplay2/hk-ap2-dsp-bridge.c` reads the FIFO with the stock hard-float ABI and opens `harmandsp` only while audio is arriving. The build command is in the source header.
-- **hk-voice / key hook**: `armv7-linux-gnueabihf-gcc -Os -o hk-voice hk-voice.c -ldl -static-libgcc`. It reaches the stock libcurl + OpenSSL 1.1 through `dlopen`, avoids libm, and needs no symbol newer than GLIBC_2.17, so it runs on the stock glibc 2.19.
-- **tools/**: static programs written against raw system calls; any ARM cross compiler will do.
+Use `tools/build-local.sh`, `tools/sync-pins.py`, and `tools/release.py` as described in the [bilingual build/update guide](docs/BUILD-AND-UPDATE.md). Sources now include the DSP bridge, Bluetooth redirect, IPC tool, keys, NSS/capability shims and stock-amplifier helpers. `docs/runtime-inputs.lock.json` pins the third-party runtime inputs; obtain proprietary stock ALSA libraries from your own firmware.
+
+AirPlay uses the isolated soft-float/glibc 2.27 runtime; DSP/Bluetooth/voice use the stock hard-float ABI. Validate ELF ABI and GLIBC symbol versions after building. An unverified 4.3.6 fallback is no longer accepted as equivalent to the 5.6 path.
 
 ## Installing (outline)
 
 1. Put the modules under `/vendor/airplay2`, `/vendor/hk-lights`, `/vendor/hk-keys`, `/vendor/hk-voice` and `/vendor/hk-debloat`, and the start scripts in `/etc/init.d/`. `hk-dsp-alsa.conf` and `hk-ap2-dsp-bridge` must be under `/vendor/airplay2`. The Bluetooth DSP route, installation and rollback are documented in [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
-2. Set `airplay_device_id` in `airplay2/shairport-sync.conf` to your speaker's wlan0 MAC address.
+2. Use `tools/release.py package --device-config <private-config>` to preserve the existing speaker ID and generate its `ap2-device.env` pin; `--device-mac <MAC>` can generate a new device template. Keep both outside the public repository.
 3. Voice assistant: copy `voice/voice.conf.example` to `/vendor/hk-voice/voice.conf` (mode 600) and fill in your Baidu speech keys (short-speech ASR + TTS) and ModelScope API-Inference key. Run `hk-voice check` to test them and `hk-voice mkclips` to create the offline prompts. `voice/update-voice-keys.sh` rotates keys later (set `HK_PUT` / `HK_SHELL` to your own way of reaching the speaker).
 4. The speaker's CA bundle is old: open-meteo needs the ISRG Root X1/X2 roots added, combined into `/vendor/hk-voice/ca.pem`.
-5. **Never overwrite AirPlay files while they are bind-mounted.** Upload them as `<file>.new` and run `airplay2/hk-ap2-replace.sh <file>…` (stop, unmount, install, start, roll back on failure). `hk-ap2-prodctl` checks each file's SHA1, so update the hashes in it when you change a file.
-6. To switch a feature off: `touch /vendor/<module>/disable`.
+5. Update from a complete manifest: validate the release, upload it, stage `.new` siblings with `tools/stage-update.sh`, then run `hk-ap2-replace.sh --manifest <release>/update.manifest`. It validates candidates, space and complete backups, holds audio muted, stops/unmounts/replaces the set, verifies the exact target and reloads affected dependent modules. Update failure returns nonzero even after successful rollback. Recovery failure stays muted; success also retains the maintenance hold for user-present listening.
+6. `/vendor/airplay2/disable` disables AirPlay reception while retaining shared Bluetooth/voice protection. Keys, lights and voice use their own persistent disable files. First installation and recovery differ from updating an existing speaker; follow the build/update guide.
 
 ## Credits
 

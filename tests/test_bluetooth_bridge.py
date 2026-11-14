@@ -61,9 +61,12 @@ echo "$1" >>"$MOCK_LOG"
 if [ "$1" = start ]; then
   echo "$HK_AP2_MASTER_SAFE" >"$MOCK_MASTER"
   echo "$HK_AP2_DIGITAL_SAFE,$HK_AP2_PLAYBACK_SAFE" >"$MOCK_LEVELS"
-  echo 0 >"$HK_AP2_RUN/safe/play.started"
+  SAFE=$HK_AP2_RUN/safe; RUN=$HK_AP2_RUN
+  . "$HK_AUDIO_COMMON"
+  HK_AP2_BT=1
+  audio_reserve || exit 1
 else
-  rm -f "$HK_AP2_RUN/safe/play.started"
+  rm -f "$HK_AP2_RUN/safe/play.started" "$HK_AP2_RUN/safe/lease"
 fi
 ''')
         self.executable(self.root / 'bin/hk-ap2-safe-test', '''#!/bin/sh
@@ -83,6 +86,11 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
             'HK_BT_STALL_SECONDS': '0',
             'HK_BT_STALL_COOLDOWN': '0',
         }
+        (self.base / 'clock').write_text('0.00 0.00\n')
+        self.env['HK_AUDIO_UPTIME_FILE'] = str(self.base / 'clock')
+        self.env['HK_AUDIO_COMMON'] = str(REPO / 'airplay2/hk-audio-common.sh')
+        self.env['HK_AP2_PROC_ROOT'] = str(self.proc)
+        self.env['HK_AP2_PCM_STATUS'] = str(self.pcm)
         self.children = []
         self.dummy_watchdog = self.launch(['sleep', '60'])
         (self.safe / 'watchdog.pid').write_text(str(self.dummy_watchdog.pid) + '\n')
@@ -114,6 +122,11 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
 
     def events(self):
         return self.log.read_text().splitlines()
+
+    def reserve_bluetooth(self):
+        shell = '. "$HK_AUDIO_COMMON"; SAFE=$HK_AP2_RUN/safe; RUN=$HK_AP2_RUN; HK_AP2_BT=1; audio_reserve'
+        result = subprocess.run(['sh', '-c', shell], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_claim_release_and_airplay_handoff(self):
         bridge = self.launch(['sh', str(BRIDGE), '__run'])
@@ -193,14 +206,14 @@ esac
         mixer_log.touch()
         env = self.env | {'HK_AP2_AMIXER': str(mixer), 'MOCK_MIXER_LOG': str(mixer_log),
                           'HK_AP2_MAX_PLAY_SECONDS': '0', 'HK_AP2_MASTER_SAFE': '4',
-                          'HK_AP2_DIGITAL_SAFE': '192', 'HK_AP2_PLAYBACK_SAFE': '1'}
+                          'HK_AP2_DIGITAL_SAFE': '192', 'HK_AP2_PLAYBACK_SAFE': '1', 'HK_AP2_BT_PLAYBACK_SAFE': '1'}
         self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
         eventually(lambda: (self.safe / 'watchdog.heartbeat').exists())
         bridge.kill()
         bridge.wait()
         eventually(lambda: (self.safe / 'tripped').exists(), timeout=8)
         self.assertEqual((self.safe / 'tripped').read_text().strip(), 'Bluetooth bridge lost')
-        self.assertFalse((self.safe / 'play.started').exists())
+        eventually(lambda: not (self.safe / 'play.started').exists())
         eventually(lambda: 'Ext Spk off' in mixer_log.read_text())
         self.assertIn('Ext Spk off', mixer_log.read_text())
 
@@ -225,8 +238,9 @@ esac
         (self.run / 'bt-heartbeat').write_text('1')
         (self.run / 'shairport.pid').write_text(str(self.dummy_watchdog.pid))
         (self.safe / 'play.started').write_text('1')
+        self.reserve_bluetooth()
         env = self.env | {'HK_AP2_AMIXER': str(mixer), 'HK_AP2_MAX_PLAY_SECONDS': '0',
-                          'HK_AP2_PLAYBACK_SAFE': '1',
+                          'HK_AP2_PLAYBACK_SAFE': '1', 'HK_AP2_BT_PLAYBACK_SAFE': '1',
                           'PATH': str(self.base) + ':' + os.environ['PATH'],
                           'MOCK_CLOCK_COUNT': str(self.base / 'clock-count')}
         self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
@@ -256,8 +270,9 @@ esac
         (self.run / 'bt-heartbeat').write_text('0')
         (self.run / 'shairport.pid').write_text(str(self.dummy_watchdog.pid))
         (self.safe / 'play.started').write_text('1')
+        self.reserve_bluetooth()
         env = self.env | {'HK_AP2_AMIXER': str(mixer), 'HK_AP2_MAX_PLAY_SECONDS': '0',
-                          'HK_AP2_PLAYBACK_SAFE': '1',
+                          'HK_AP2_PLAYBACK_SAFE': '1', 'HK_AP2_BT_PLAYBACK_SAFE': '1',
                           'PATH': str(self.base) + ':' + os.environ['PATH']}
         self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
         eventually(lambda: not (self.run / 'bt-owner.pid').exists())
@@ -276,6 +291,7 @@ esac
         (self.run / 'bt-owner.pid').write_text(str(self.dummy_watchdog.pid))
         (self.run / 'bt-heartbeat').write_text('0')
         (self.safe / 'play.started').write_text('1')
+        self.reserve_bluetooth()
         env = self.env | {
             'HK_AP2_AMIXER': str(mixer), 'HK_AP2_MAX_PLAY_SECONDS': '0',
             'HK_AP2_BT_DIGITAL_SAFE': '207', 'HK_AP2_BT_PLAYBACK_SAFE': '0',
@@ -306,9 +322,10 @@ esac
         (self.run / 'bt-heartbeat').write_text('0')
         (self.run / 'shairport.pid').write_text(str(self.dummy_watchdog.pid))
         (self.safe / 'play.started').write_text('1')
+        self.reserve_bluetooth()
         env = self.env | {'HK_AP2_AMIXER': str(mixer), 'MOCK_MIXER_LOG': str(mixer_log),
                           'HK_AP2_MAX_PLAY_SECONDS': '0', 'HK_AP2_MASTER_SAFE': '4',
-                          'HK_AP2_PLAYBACK_SAFE': '1'}
+                          'HK_AP2_PLAYBACK_SAFE': '1', 'HK_AP2_BT_PLAYBACK_SAFE': '1'}
         self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
         eventually(lambda: 'sget Master' in mixer_log.read_text())
         self.assertNotIn('sset Master 4', mixer_log.read_text())
@@ -385,6 +402,7 @@ esac
         (self.run / 'bt-heartbeat').write_text('0')
         (self.run / 'shairport.pid').write_text(str(self.dummy_watchdog.pid))
         (self.safe / 'play.started').write_text('1')
+        self.reserve_bluetooth()
         env = self.env | {
             'HK_AP2_AMIXER': str(mixer), 'MOCK_MIXER_LOG': str(mixer_log),
             'HK_AP2_MAX_PLAY_SECONDS': '0', 'HK_AP2_MASTER_SAFE': '4',

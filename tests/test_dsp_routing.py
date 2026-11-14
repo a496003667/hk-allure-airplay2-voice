@@ -29,7 +29,7 @@ class DspRoutingTest(unittest.TestCase):
         self.assertRegex(config, r'output_format\s*=\s*"S32_LE"')
         self.assertRegex(config, r"output_channels\s*=\s*2")
         self.assertRegex(config, r"volume_max_db\s*=\s*-6\.0")
-        self.assertRegex(config, r"volume_range_db\s*=\s*30")
+        self.assertRegex(config, r"volume_range_db\s*=\s*24")
         self.assertRegex(config, r"default_airplay_volume\s*=\s*-30\.0")
         self.assertRegex(config, r'volume_control_profile\s*=\s*"flat"')
         self.assertNotIn('output_device = "hw:0,0"', config)
@@ -50,6 +50,13 @@ class DspRoutingTest(unittest.TestCase):
             "VOICE_SCRIPT_SHA1": sha1(ROOT / "voice/hk-voice.sh"),
             "DSP_ALSA_CONF_SHA1": sha1(AIRPLAY / "hk-dsp-alsa.conf"),
             "DSP_BRIDGE_SHA1": sha1(AIRPLAY / "hk-ap2-dsp-bridge"),
+            "COMMON_SHA1": sha1(AIRPLAY / "hk-audio-common.sh"),
+            "REQUEST_OVERRIDE_SHA1": sha1(AIRPLAY / "hk-unix-request-raw"),
+            "GUARD_OVERRIDE_SHA1": sha1(AIRPLAY / "runtime/hk-ap2-guard.sh"),
+            "VOLUME_OVERRIDE_SHA1": sha1(AIRPLAY / "runtime/hk-ap2-volume-log"),
+            "SAFE_TEST_OVERRIDE_SHA1": sha1(AIRPLAY / "runtime/hk-ap2-safe-test"),
+            "AP2CTL_OVERRIDE_256_SHA1": sha1(AIRPLAY / "runtime/hk-ap2ctl"),
+            "INFO_SHIM_SHA1": sha1(AIRPLAY / "libhk-ap2-info-shim-soft.so"),
         }
         for name, digest in expected.items():
             match = re.search(rf"^{name}=([0-9a-f]{{40}})$", controller, re.M)
@@ -82,7 +89,7 @@ class DspRoutingTest(unittest.TestCase):
     def test_prodctl_keeps_bluetooth_alive_when_airplay_process_is_recycled(self):
         controller = (AIRPLAY / "hk-ap2-prodctl").read_text()
         self.assertIn("AP2 unavailable while Bluetooth is playing", controller)
-        self.assertIn('[ -f "$RUN/bt-owner.pid" ]', controller)
+        self.assertIn('audio_bt_valid', controller)
 
     def test_prodctl_restarts_the_voice_supervisor(self):
         controller = (AIRPLAY / "hk-ap2-prodctl").read_text()

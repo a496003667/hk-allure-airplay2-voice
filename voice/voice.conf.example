@@ -7,5 +7,7 @@ TTS_PER=4189
 # Optional:
 # MODEL=Qwen/Qwen3.8-Flash-Next
 # WEATHER_CITY=auto        # or a city name, e.g. 北京
-# GAIN_REF_DB=-20          # reply level at stock volume 25
+# GAIN_REF_DB=-20          # standalone reply level at stock volume 25
+# GAIN_MEDIA_OFFSET_DB=0   # reply relative to AirPlay software attenuation, -12..12
+# GAIN_BT_MIX_DB=-12        # optional BT mix BEFORE stock Master, -40..-6
 # SILICONFLOW_KEY=...      # optional SenseVoice ASR (disabled by default)

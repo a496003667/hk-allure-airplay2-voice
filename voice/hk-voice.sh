@@ -35,13 +35,14 @@ MAX_RECORD=${HK_VOICE_MAX_RECORD:-8}
 # 5 uses the 8 MiB bucket, still behind every stock process at adj 0.
 VOICE_OOM_SCORE_ADJ=${HK_VOICE_OOM_SCORE_ADJ:-5}
 VOICE_SUPERVISOR_OOM_SCORE_ADJ=${HK_VOICE_SUPERVISOR_OOM_SCORE_ADJ:-5}
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../airplay2/hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 
 log() {
     printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >>"$LOG"
-    size=$(wc -c <"$LOG" 2>/dev/null || echo 0)
-    if [ "$size" -gt 65536 ]; then
-        tail -c 32768 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
-    fi
+    audio_trim_log "$LOG" 65536
 }
 
 now_ms() {
@@ -54,8 +55,9 @@ ap2_playing() { [ -f "$SAFE/play.started" ]; }
 pcm_closed() { [ "$(cat "$PCM_STATUS" 2>/dev/null)" = "closed" ]; }
 
 LED_FLAG=$RUN/led.thinking
-QD=$RUN/q              # reply queue read by "hk-voice feedq"
-ACTION=$RUN/action
+QUEUE_ROOT=$RUN/q
+QD=${HK_VOICE_QDIR:-$QUEUE_ROOT} # each producer has a private generation directory
+ACTION=$QD/action
 
 # Stock light ring states via mv_ioguard (the same GNOTIFY asr_tts sends).
 led() {
@@ -85,28 +87,20 @@ led_keeper() {
 }
 
 HOOK_ENV="HK_AP2_VOICE=1 HK_AP2_USE_STOCK_PA=1 HK_AP2_MASTER_SAFE=4 HK_AP2_DIGITAL_SAFE=192 HK_AP2_PLAYBACK_SAFE=1"
-PREPARED=$RUN/prepared
+PREPARED=$QD/prepared
 
 # Speaker hand-off with AirPlay (see hk-ap2-audio-hook.sh): we take the
 # speaker only under the shared lock, and only if AirPlay has not just
 # claimed it; while we hold voice-owns, AirPlay's hook defers its start.
 VOICE_OWNS=/tmp/hk-ap2/run/voice-owns
+VOICE_TOKEN=/tmp/hk-ap2/run/voice-token
+VOICE_CURRENT=/tmp/hk-ap2/run/current-voice-token
 AP2_DEFERRED=/tmp/hk-ap2/run/ap2-deferred
 AP2_CLAIM=/tmp/hk-ap2/run/ap2-claim
 SPEAKER_LOCK=/tmp/hk-ap2/run/speaker.lock
-speaker_lock() {
-    n=0
-    while ! mkdir "$SPEAKER_LOCK" 2>/dev/null; do
-        n=$((n + 1))
-        if [ "$n" -ge 30 ]; then
-            rmdir "$SPEAKER_LOCK" 2>/dev/null
-            mkdir "$SPEAKER_LOCK" 2>/dev/null
-            return 0
-        fi
-        usleep 100000
-    done
-}
-speaker_unlock() { rmdir "$SPEAKER_LOCK" 2>/dev/null; }
+speaker_lock() { audio_lock "$SPEAKER_LOCK"; }
+speaker_unlock() { audio_unlock "$SPEAKER_LOCK" 2>/dev/null || true; }
+
 ap2_claimed() {   # AirPlay's hook started the path in the last 8 s
     t=$(sed -n 1p "$AP2_CLAIM" 2>/dev/null)
     case "$t" in ''|*[!0-9]*) return 1 ;; esac
@@ -114,8 +108,12 @@ ap2_claimed() {   # AirPlay's hook started the path in the last 8 s
 }
 # Drop voice-owns; if AirPlay asked for the speaker meanwhile, hand it over.
 voice_release() {
-    speaker_lock
-    rm -f "$VOICE_OWNS"
+    speaker_lock || return 1
+    if [ -n "${HK_AUDIO_TOKEN:-}" ] && [ "$(cat "$VOICE_TOKEN" 2>/dev/null)" != "$HK_AUDIO_TOKEN" ]; then
+        speaker_unlock
+        return 0
+    fi
+    rm -f "$VOICE_OWNS" "$VOICE_TOKEN"
     deferred=
     [ -f "$AP2_DEFERRED" ] && deferred=1
     rm -f "$AP2_DEFERRED"
@@ -165,6 +163,7 @@ stock_pa() {   # $1 = unmute|mute, via the same preload trick as the AP2 hook
 # is enabled.  Every voice path goes through it; there is no direct amplifier
 # shortcut.
 speaker_open() {
+    env $HOOK_ENV "$HOOK" reserve || return 1
     env $HOOK_ENV "$HOOK" guard || return 1
     env $HOOK_ENV "$HOOK" start || return 1
     echo "$(date '+%Y-%m-%dT%H:%M:%S%z') voice speaker opened" >>/tmp/hk-ap2/run/hook.log
@@ -172,14 +171,13 @@ speaker_open() {
 }
 
 speaker_guard() {
-    env HK_AP2_BT=1 $HOOK_ENV "$HOOK" guard active
+    env HK_AP2_BT=1 $HOOK_ENV HK_AUDIO_TOKEN= "$HOOK" guard active
 }
 
 # A silence stream that keeps the DAC clocked while the amplifier switches;
 # the feeder plays $QD/chime.raw and then $QD/q.N.raw as they appear.
 start_stream() {
     mkdir -p "$QD"
-    rm -f "$QD"/*
     "$D/hk-voice" feedq "$QD" 2>/dev/null |
         env ALSA_CONFIG_PATH="$DSP_ALSA_CONF" LD_LIBRARY_PATH=/system/workdir/lib \
         "$APLAY" -q -D hk_harman_dsp \
@@ -223,11 +221,24 @@ bt_inject_stop_feeder() {
     fi
 }
 
+bt_inject_abort() {
+    [ -d "$BT_INJECT" ] || return 0
+    rm -f "$BT_INJECT/aborted"
+    : >"$BT_INJECT/abort"
+    _ba_n=0
+    while [ ! -f "$BT_INJECT/aborted" ] && [ "$_ba_n" -lt 20 ]; do
+        audio_delay 100000
+        _ba_n=$((_ba_n + 1))
+    done
+    [ -f "$BT_INJECT/aborted" ]
+}
+
 bt_inject_wait_done() {
     i=0
     while [ -f "$BT_INJECT/active" ] &&
           [ ! -f "$BT_INJECT/done" ] &&
           [ ! -f "$BT_INJECT/stop" ] &&
+          [ ! -f "$QD/q.abort" ] &&
           [ "$i" -lt 1200 ]; do
         usleep 100000
         i=$((i + 1))
@@ -251,6 +262,12 @@ bt_inject_play_file() {
 bt_inject_feeder() {
     next=1
     while [ -f "$BT_INJECT/active" ] && [ ! -f "$BT_INJECT/stop" ]; do
+        if [ -f "$QD/q.abort" ]; then
+            : >"$BT_INJECT/abort"
+            rm -f "$QD"/q.*.raw "$QD/q.end" "$BT_INJECT/start" "$BT_INJECT/pcm.raw"
+            : >"$QD/aborted"
+            return 0
+        fi
         if [ -f "$QD/chime.raw" ]; then
             bt_inject_play_file "$QD/chime.raw" || break
             continue
@@ -259,12 +276,6 @@ bt_inject_feeder() {
             [ "$next" = 1 ] && : >"$QD/started"
             bt_inject_play_file "$QD/q.$next.raw" || break
             next=$((next + 1))
-            continue
-        fi
-        if [ -f "$QD/abort" ]; then
-            rm -f "$QD"/q.*.raw "$QD/q.end" "$QD/abort"
-            : >"$QD/played"
-            next=1
             continue
         fi
         if [ -f "$QD/q.end" ]; then
@@ -286,8 +297,8 @@ bt_inject_begin() {
     : >/tmp/hk-ap2/run/bt-voice-mix.log
     master=$(mx_master)
     digital=$(mx_values 1)
-    case "$master" in ''|*[!0-9]*) master=4 ;; esac
-    case "$digital" in ''|*,|*[!0-9,]*) digital=207,207 ;; esac
+    case "$master" in ''|*[!0-9]*) return 1 ;; esac
+    case "$digital" in ''|*,|*[!0-9,]*) return 1 ;; esac
     printf '%s %s\n' "$master" "$digital" >"$BT_INJECT/meta"
     : >"$BT_INJECT/active"
     BT_DUCKED=1
@@ -319,17 +330,18 @@ bt_inject_begin() {
 }
 
 bt_inject_prepare_voice() {
+    voice_round_current || return 1
     [ -f "$BT_INJECT/active" ] || return 1
     speaker_guard || return 1
     BT_DUCKED=1
     read -r saved_master saved_digital <"$BT_INJECT/meta" 2>/dev/null || true
-    case "$saved_digital" in ''|*,|*[!0-9,]*) saved_digital=207,207 ;; esac
+    case "$saved_digital" in ''|*,|*[!0-9,]*) return 1 ;; esac
     # a01controller has written silence for several seconds by this point.
     # Reassert digital silence, wait for the DAC ramp, and recheck the shared
     # guard before restoring gain for the chime/TTS.
     mx_cset 1 0,0 || return 1
     usleep 300000
-    speaker_guard || return 1
+    voice_round_current && speaker_guard || return 1
     mx_cset 1 "$saved_digital"
     usleep 200000
 }
@@ -338,7 +350,7 @@ bt_inject_end() {
     [ -d "$BT_INJECT" ] || { BT_DUCKED=0; return 0; }
     read -r saved_master saved_digital <"$BT_INJECT/meta" 2>/dev/null || true
     case "$saved_master" in ''|*[!0-9]*) saved_master=4 ;; esac
-    case "$saved_digital" in ''|*,|*[!0-9,]*) saved_digital=207,207 ;; esac
+    case "$saved_digital" in ''|*,|*[!0-9,]*) saved_digital=0,0 ;; esac
 
     bt_inject_stop_feeder
     mx_cset 1 0,0
@@ -358,13 +370,19 @@ bt_inject_end() {
 # open the speaker path, queue the acknowledgement chime, and record
 # "<ok|fail>" in $PREPARED.  AirPlay was already paused at the wake.
 prepare_output() {
+    if ! voice_round_current; then
+        printf 'fail\n' >"$PREPARED" 2>/dev/null || true
+        return 1
+    fi
     rm -f "$PREPARED"
     led_hold THINKING
     led_keeper </dev/null >/dev/null 2>&1 &
     st=fail
     if bt_inject_prepare_voice; then
-        speaker_lock
+        speaker_lock || return 1
+        voice_round_current || { speaker_unlock; return 1; }
         cut -d. -f1 /proc/uptime >"$VOICE_OWNS"
+        printf '%s\n' "${HK_AUDIO_TOKEN:-}" >"$VOICE_TOKEN"
         mine=1
         speaker_unlock
         st=ok
@@ -377,9 +395,10 @@ prepare_output() {
             usleep 100000
             i=$((i + 1))
         done
-        speaker_lock
-        if pcm_closed && ! ap2_claimed && [ ! -s "$BT_OWNER" ]; then
+        speaker_lock || return 1
+        if voice_round_current && pcm_closed && ! ap2_claimed && [ ! -s "$BT_OWNER" ]; then
             cut -d. -f1 /proc/uptime >"$VOICE_OWNS"
+            printf '%s\n' "${HK_AUDIO_TOKEN:-}" >"$VOICE_TOKEN"
             mine=1
         else
             mine=
@@ -411,12 +430,14 @@ prepare_output() {
 
 # Close the speaker path opened by prepare_output.
 close_output() {
+    retire_voice_round
     i=0
     while [ ! -f "$PREPARED" ] && [ "$i" -lt 100 ]; do usleep 100000; i=$((i + 1)); done
     rm -f "$LED_FLAG"
     if [ "$BT_DUCKED" = 1 ] || [ -f "$BT_INJECT/active" ]; then
         :
-    elif [ "$(cat "$PREPARED" 2>/dev/null)" = ok ]; then
+    elif [ "$(cat "$PREPARED" 2>/dev/null)" = ok ] ||
+         { audio_read_lease && [ "$lease_source" = voice ] && [ "$lease_token" = "${HK_AUDIO_TOKEN:-}" ]; }; then
         env $HOOK_ENV "$HOOK" stop      # fades out while silence still flows
         stop_stream
         voice_release
@@ -429,7 +450,47 @@ wake_count() { grep -c MCULEDLISTENING "$EV" 2>/dev/null || echo 0; }
 # One question/answer round from byte position $1 of the live recording,
 # waiting up to $2 ms for speech.  Returns 0 answered, 3 not recognised,
 # 4 nothing said, 5 local command (in $ACTION), 6 interrupted by a new wake.
+voice_round_current() {
+    [ -z "${HK_AUDIO_TOKEN:-}" ] || [ "$(cat "$VOICE_CURRENT" 2>/dev/null)" = "$HK_AUDIO_TOKEN" ]
+}
+retire_voice_round() {
+    if [ -n "${HK_AUDIO_TOKEN:-}" ] && [ "$(cat "$VOICE_CURRENT" 2>/dev/null)" = "$HK_AUDIO_TOKEN" ]; then
+        rm -f "$VOICE_CURRENT"
+    fi
+}
+cleanup_round_queue() {
+    case "$QD" in "$QUEUE_ROOT"/*) ;; *) return 0;; esac
+    _cq_name=${QD#"$QUEUE_ROOT/"}
+    case "$_cq_name" in ''|*[!0-9-]*) return 1;; esac
+    rm -rf "$QD"
+}
+
+new_round_queue() {
+    cleanup_round_queue
+    ROUND_SEQ=$((${ROUND_SEQ:-0} + 1))
+    HK_AUDIO_TOKEN="$(audio_now)-$$-$ROUND_SEQ"
+    QD=$QUEUE_ROOT/$HK_AUDIO_TOKEN
+    mkdir -p "$QD" || return 1
+    PREPARED=$QD/prepared
+    ACTION=$QD/action
+    printf '%s\n' "$QD" >"$RUN/current-queue.tmp" && mv "$RUN/current-queue.tmp" "$RUN/current-queue"
+    HK_VOICE_QDIR=$QD
+    HK_AP2_VOICE_OWNER=$(cat "$PIDFILE" 2>/dev/null || echo "$$")
+    export HK_AUDIO_TOKEN HK_VOICE_QDIR HK_AP2_VOICE_OWNER
+    printf '%s\n' "$HK_AUDIO_TOKEN" >"$VOICE_CURRENT.tmp" && mv "$VOICE_CURRENT.tmp" "$VOICE_CURRENT"
+}
+
 run_round() {
+    if [ "$BT_DUCKED" = 1 ]; then
+        bt_inject_stop_feeder
+        bt_inject_abort || return 1
+    fi
+    new_round_queue || return 1
+    if [ "$BT_DUCKED" = 1 ]; then
+        rm -f "$BT_INJECT/stop"
+        bt_inject_feeder </dev/null >/dev/null 2>&1 &
+        BT_INJECT_PID=$!
+    fi
     rm -f "$PREPARED" "$PREPARED.tmp" "$ACTION"
     if [ "$BT_DUCKED" = 1 ]; then
         rm -f "$QD/played" "$QD/started"
@@ -445,6 +506,13 @@ run_round() {
     PLAYED_MS=
     while :; do
         ticks=$((ticks + 1))
+        if [ -f "$D/disable" ]; then
+            : >"$QD/q.abort"
+            kill "$vpid" 2>/dev/null || true
+            wait "$vpid" 2>/dev/null || true
+            rc=1
+            break
+        fi
         [ "$ticks" -lt 300 ] || {
             log "round timed out after 60s"
             kill "$vpid" 2>/dev/null
@@ -493,40 +561,64 @@ run_round() {
     return "$rc"
 }
 
+player_value() {
+    "$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null |
+        sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"
+}
+bt_command() {
+    [ "$(player_value mode)" = 41 ] || return 1
+    "$REQ" "$PLAYER_SOCKET" "setPlayerCmd:$1" 1200 >/dev/null 2>&1 || return 1
+    [ "$(player_value mode)" = 41 ] || return 1
+    case "$1" in resume|onepause) ;; *) return 0;; esac
+    _bc_n=0
+    while [ "$_bc_n" -lt 5 ]; do
+        _bc_state=$(player_value status)
+        case "$1:$_bc_state" in resume:play|onepause:stop|onepause:pause) return 0;; esac
+        audio_delay 200000
+        _bc_n=$((_bc_n + 1))
+    done
+    return 1
+}
+
 do_action() {
     act=$(cat "$ACTION" 2>/dev/null)
-    log "command: $act"
-    case "$act" in
-        pause)
-            PAUSED=0
-            BT_PAUSED=0
-            rm -f "$BT_RESUME" "$BT_RELEASE" ;;
-        play)
-            PAUSED=1
-            [ -f "$BT_RESUME" ] && BT_PAUSED=1 ;;
-        next)
-            PAUSED=1
-            [ -f "$BT_RESUME" ] && BT_PAUSED=1
-            "$MQTT" hk-ap2/remote nextitem >/dev/null 2>&1 ;;
-        prev)
-            PAUSED=1
-            [ -f "$BT_RESUME" ] && BT_PAUSED=1
-            "$MQTT" hk-ap2/remote previtem >/dev/null 2>&1 ;;
-        volup|voldown)
-            [ -f "$BT_RESUME" ] && BT_PAUSED=1
-            if [ ! -f "$BT_RESUME" ] && netstat -tn 2>/dev/null | grep -q ':7000 .*ESTABLISHED'; then
-                cmd=volumeup; [ "$act" = voldown ] && cmd=volumedown
-                for k in 1 2 3; do "$MQTT" hk-ap2/remote "$cmd" >/dev/null 2>&1; done
-            else
-                v=$("$REQ" /tmp/Requesta01controller getPlayerStatus 2>/dev/null |
-                    sed -n 's/.*"vol":"\([0-9]*\)".*/\1/p')
-                [ -n "$v" ] || v=25
+    log "command: $act source=${HK_VOICE_SOURCE:-idle}"
+    if [ "${HK_VOICE_SOURCE:-}" = bluetooth ] || [ -f "$BT_RESUME" ] || [ "$BT_DUCKED" = 1 ]; then
+        case "$act" in
+            pause)
+                BT_PAUSED=0; PAUSED=0
+                rm -f "$BT_RESUME"
+                if [ "$(player_value status)" = play ]; then
+                    bt_command onepause || log "Bluetooth pause unconfirmed"
+                fi ;;
+            play)
+                BT_PAUSED=1
+                : >"$BT_RESUME" ;;
+            next|prev)
+                bt_command "$act" || log "Bluetooth $act command failed" ;;
+            volup|voldown)
+                v=$(player_value vol)
+                case "$v" in ''|*[!0-9]*) log "volume unavailable; no change"; return 1;; esac
                 if [ "$act" = volup ]; then v=$((v + 10)); else v=$((v - 10)); fi
                 [ "$v" -gt 100 ] && v=100
                 [ "$v" -lt 0 ] && v=0
-                "$REQ" /tmp/Requesta01controller "setPlayerCmd:vol:$v" >/dev/null 2>&1
-            fi ;;
-    esac
+                bt_command "vol:$v" || log "Bluetooth volume command failed" ;;
+        esac
+        return 0
+    fi
+    if [ "${HK_VOICE_SOURCE:-}" = airplay ]; then
+        case "$act" in
+            pause) PAUSED=0; "$MQTT" hk-ap2/remote pause >/dev/null 2>&1;;
+            play) PAUSED=1;;
+            next) "$MQTT" hk-ap2/remote nextitem >/dev/null 2>&1;;
+            prev) "$MQTT" hk-ap2/remote previtem >/dev/null 2>&1;;
+            volup|voldown)
+                cmd=volumeup; [ "$act" = voldown ] && cmd=volumedown
+                "$MQTT" hk-ap2/remote "$cmd" >/dev/null 2>&1;;
+        esac
+    else
+        log "no controllable media source; command ignored"
+    fi
 }
 
 # Pre-roll: asr_tts starts a fresh recording only seconds after a wake, which
@@ -623,24 +715,31 @@ rec_rotate_if_needed() {
 # Remove anything a killed round left behind: our silence stream holding the
 # DAC (AirPlay then cannot open it), the open speaker path and the lights.
 cleanup_output() {
+    rm -f "$VOICE_CURRENT"
     pids=$(ps | grep -e "[h]k-voice feedq" -e "[h]k-voice.sh prepare" -e "[h]k-voice listen" |
         awk '{print $1}')
     owned=0
     ps | grep -q "[h]k-voice feedq" && owned=1
+    if [ "$owned" = 1 ]; then
+        env $HOOK_ENV "$HOOK" stop
+    fi
     [ -d "$QD" ] && : >"$QD/stop"
     sleep 1
     for p in $pids; do kill "$p" 2>/dev/null; done
     for p in $(ps | grep "[a]play -q -D hk_harman_dsp -f S16_LE -r 48000" | awk '{print $1}'); do
         kill "$p" 2>/dev/null
     done
-    if [ "$owned" = 1 ]; then
-        env $HOOK_ENV "$HOOK" stop
-        led IDLE
-    fi
+    if [ "$owned" = 1 ]; then led IDLE; fi
     if [ "$BT_DUCKED" = 1 ] || [ -f "$BT_INJECT/active" ]; then
         bt_inject_end
     fi
     rm -f "$QD"/* "$LED_FLAG" "$PREPARED" "$ACTION" /tmp/hk-ap2/run/release-dac 2>/dev/null
+    for old_queue in "$QUEUE_ROOT"/*; do
+        [ -d "$old_queue" ] || continue
+        old_name=${old_queue#"$QUEUE_ROOT/"}
+        case "$old_name" in ''|*[!0-9-]*) continue;; esac
+        rm -rf "$old_queue"
+    done
     rm -f "$BT_RELEASE"
     [ -f "$BT_RESUME" ] && resume_bluetooth
     rmdir "$RUN/reopen.lock" 2>/dev/null
@@ -649,18 +748,29 @@ cleanup_output() {
 
 # Speak a short text (reminders), handling AirPlay like a wake does.
 announce() {
+    new_round_queue || return 1
     PAUSED=0
     RELEASED=0
     BT_PAUSED=0
     BT_DUCKED=0
     rm -f "$RELEASE"
+    HK_VOICE_SOURCE=idle
     if airplay_owns_dac; then
+        HK_VOICE_SOURCE=airplay
         release_airplay
     elif bluetooth_playing; then
-        if ! bt_inject_begin; then
+        HK_VOICE_SOURCE=bluetooth
+        if [ "${HK_VOICE_BT_MODE:-mix}" = mix ]; then
+            bt_inject_begin || release_bluetooth
+        else
             release_bluetooth
         fi
+    elif [ "$(cat /tmp/hk-ap2/run/media-source 2>/dev/null)" = bluetooth ] && [ "$(player_value mode)" = 41 ]; then
+        HK_VOICE_SOURCE=bluetooth
+    elif "$D/hk-voice" connected >/dev/null 2>&1; then
+        HK_VOICE_SOURCE=airplay
     fi
+    export HK_VOICE_SOURCE
     prepare_output
     if [ "$(cat "$PREPARED" 2>/dev/null)" = ok ]; then
         led_hold PLAYTTS
@@ -673,6 +783,9 @@ announce() {
         i=0
         while [ ! -f "$QD/played" ] && [ "$i" -lt 300 ]; do usleep 100000; i=$((i + 1)); done
     fi
+    announce_ok=1
+    [ "$(cat "$PREPARED" 2>/dev/null)" = ok ] && [ -f "$QD/played" ] &&
+        [ ! -f "$QD/q.abort" ] && announce_ok=0
     close_output
     led THINKING
     usleep 300000
@@ -685,18 +798,22 @@ announce() {
     fi
     [ "$BT_PAUSED" = 1 ] && resume_bluetooth
     [ "$PAUSED" = 1 ] && "$MQTT" hk-ap2/remote play >/dev/null 2>&1
+    cleanup_round_queue
+    return "$announce_ok"
 }
 
 check_reminders() {
     [ -s "$D/reminders" ] || return 0
     due=$(env LD_LIBRARY_PATH=/system/workdir/lib "$D/hk-voice" due 2>/dev/null) || return 0
-    printf '%s\n' "$due" | while read -r text; do
-        [ -n "$text" ] || continue
+    printf '%s\n' "$due" | while IFS="$(printf '\t')" read -r reminder_id text; do
+        [ -n "$reminder_id" ] && [ -n "$text" ] || continue
         if [ "$text" = "-" ]; then msg="提醒时间到了。"; else msg="提醒你：$text。"; fi
-        log "reminder: $text"
-        announce "$msg" </dev/null
-        usleep 500000
-        announce "$msg" </dev/null       # say it twice
+        log "reminder: $reminder_id"
+        if announce "$msg" </dev/null; then
+            "$D/hk-voice" ack "$reminder_id" >/dev/null 2>&1 || log "reminder acknowledgement failed"
+        else
+            log "reminder retained after output failure"
+        fi
     done
 }
 
@@ -736,8 +853,8 @@ bluetooth_playing() {
 # (the hook fades first), then pause with the release flag set so the
 # patched Shairport closes the device for us.
 release_airplay() {
-    pcm_running && PAUSED=1
-    env $HOOK_ENV "$HOOK" stop
+    if audio_read_lease && [ "$lease_source" = airplay ] && [ "$lease_phase" = active ]; then PAUSED=1; fi
+    env $HOOK_ENV HK_AP2_VOICE= HK_AUDIO_TOKEN= "$HOOK" stop
     rm -f "$AP2_CLAIM"
     : >"$RELEASE"
     "$MQTT" hk-ap2/remote pause >/dev/null 2>&1
@@ -748,25 +865,33 @@ release_airplay() {
 # Bluetooth also holds the DAC for the whole A2DP stream. Release the bridge
 # first so it can fade and close in order, then pause the stock transport.
 release_bluetooth() {
-    BT_PAUSED=1
-    : >"$BT_RESUME"
+    BT_PAUSED=0
     : >"$BT_RELEASE"
-    "$REQ" "$PLAYER_SOCKET" setPlayerCmd:onepause 1200 >/dev/null 2>&1 ||
-        log "Bluetooth pause command failed"
+    # Keep the stock PCM clock alive until the bridge has faded and muted.
     i=0
-    while [ "$i" -lt 60 ]; do
-        [ ! -s "$BT_OWNER" ] && pcm_closed && break
+    while [ -s "$BT_OWNER" ] && [ "$i" -lt 50 ]; do
         usleep 100000
         i=$((i + 1))
     done
-    log "Bluetooth muted and paused for the voice reply"
+    [ ! -s "$BT_OWNER" ] || { log "Bluetooth lease release timed out"; return 1; }
+    if [ "$(player_value status)" = play ] && bt_command onepause; then
+        BT_PAUSED=1
+        : >"$BT_RESUME"
+    else
+        log "Bluetooth pause unconfirmed; automatic resume not armed"
+        return 1
+    fi
+    i=0
+    while ! pcm_closed && [ "$i" -lt 40 ]; do usleep 100000; i=$((i + 1)); done
+    pcm_closed || { log "paused Bluetooth retains PCM; independent voice remains muted"; return 1; }
+    log "Bluetooth muted, paused and PCM released"
 }
 
 resume_bluetooth() {
     try=0
     while [ "$try" -lt 3 ]; do
         rm -f "$BT_RELEASE"
-        if "$REQ" "$PLAYER_SOCKET" setPlayerCmd:resume 1200 >/dev/null 2>&1; then
+        if bt_command resume; then
             rm -f "$BT_RESUME"
             BT_PAUSED=0
             log "resumed Bluetooth"
@@ -792,7 +917,7 @@ reopen_watch() {
             for try in 1 2 3; do
                 [ -f "$SAFE/play.started" ] &&
                     [ "$(mx_get "Ext Spk")" = on ] && break
-                env $HOOK_ENV "$HOOK" start && { log "AirPlay speaker path reopened"; break; }
+                env $HOOK_ENV HK_AP2_VOICE= HK_AUDIO_TOKEN= "$HOOK" start && { log "AirPlay speaker path reopened"; break; }
                 log "AirPlay speaker reopen failed (try $try)"
                 sleep 2
             done
@@ -811,13 +936,23 @@ handle_wake() {
     BT_PAUSED=0
     BT_DUCKED=0
     rm -f "$RELEASE"
+    HK_VOICE_SOURCE=idle
     if airplay_owns_dac; then
+        HK_VOICE_SOURCE=airplay
         release_airplay
     elif bluetooth_playing; then
-        if ! bt_inject_begin; then
+        HK_VOICE_SOURCE=bluetooth
+        if [ "${HK_VOICE_BT_MODE:-mix}" = mix ]; then
+            bt_inject_begin || release_bluetooth
+        else
             release_bluetooth
         fi
+    elif [ "$(cat /tmp/hk-ap2/run/media-source 2>/dev/null)" = bluetooth ] && [ "$(player_value mode)" = 41 ]; then
+        HK_VOICE_SOURCE=bluetooth
+    elif "$D/hk-voice" connected >/dev/null 2>&1; then
+        HK_VOICE_SOURCE=airplay
     fi
+    export HK_VOICE_SOURCE
     pos=$(rec_size)
     log "wake at $((pos / BYTES_PER_S))s of pre-roll"
     wait_ms=6000
@@ -885,6 +1020,7 @@ handle_wake() {
         "$MQTT" hk-ap2/remote play >/dev/null 2>&1
         log "resumed AirPlay"
     fi
+    cleanup_round_queue
     log "done"
 }
 
@@ -1010,7 +1146,14 @@ supervisor_health() {
         count=1
     fi
     printf '%s %s\n' "$prepare_key" "$count" >"$RUN/prepare-watch"
-    prepared=$(cat "$PREPARED" 2>/dev/null || true)
+    current_queue=$(cat "$RUN/current-queue" 2>/dev/null || true)
+    case "$current_queue" in
+        "$QUEUE_ROOT"/*)
+            prepared=$(cat "$current_queue/prepared" 2>/dev/null || true)
+            if [ ! -d "$current_queue" ] && [ ! -f "$VOICE_CURRENT" ]; then prepared=finished; fi
+            ;;
+        *) prepared=;;
+    esac
     limit=6
     [ "$prepared" = ok ] && limit=3
     if [ "$count" -ge "$limit" ]; then
@@ -1020,7 +1163,7 @@ supervisor_health() {
         # Once PREPARED=ok the main round already has its speaker path and
         # reply queue. Kill only the stale helper; restarting the loop here
         # would discard a valid TTS response and create another silent gap.
-        if [ "$prepared" != ok ]; then
+        if [ "$prepared" != ok ] && [ "$prepared" != finished ]; then
             kill -KILL "$pid" 2>/dev/null || true
             rm -f "$PIDFILE" /dev/shm/hk-voice-pre-*
             for p in $(ps | grep "[t]ail -n0 -f $EV" | awk '{print $1}'); do
@@ -1103,6 +1246,7 @@ case "${1:-start}" in
     say)
         # Speak a test sentence through the same path: hk-voice.sh say <text>
         mkdir -p "$RUN"
+        new_round_queue || exit 1
         prepare_output
         if [ "$(cat "$PREPARED" 2>/dev/null)" = ok ]; then
             env LD_LIBRARY_PATH=/system/workdir/lib "$D/hk-voice" say "$2" "$QD/q.tmp" &&

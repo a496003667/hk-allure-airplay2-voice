@@ -18,7 +18,8 @@ class HandoffTest(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.run = self.root / 'run'
         (self.run / 'safe').mkdir(parents=True)
-        self.env = os.environ | {'HK_AP2_ROOT': str(self.root), 'HK_AP2_RUN': str(self.run)}
+        (self.root / 'clock').write_text('0.00 0.00\n')
+        self.env = os.environ | {'HK_AP2_ROOT': str(self.root), 'HK_AP2_RUN': str(self.run), 'HK_AUDIO_UPTIME_FILE': str(self.root / 'clock')}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -105,10 +106,13 @@ echo "Snd_Ctrl airplay to mute $level"
             'PATH': str(self.root) + ':' + os.environ['PATH'],
             'MOCK_MIXER_STATE': str(state), 'MOCK_EVENTS': str(events),
         }
+        (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
         def acknowledge():
             deadline = time.monotonic() + 10
             while not (safe / 'play.started').exists() and time.monotonic() < deadline:
                 time.sleep(.02)
+            if not safe.exists(): return
+            (self.root / 'clock').write_text('1.00 0.00\n')
             (safe / 'watchdog.heartbeat').write_text('1')
         thread = threading.Thread(target=acknowledge)
         thread.start()
@@ -131,6 +135,8 @@ echo "Snd_Ctrl airplay to mute $level"
         self.assertEqual(log.count('mixer 1 0,0'), 2)
 
         (safe / 'play.started').unlink()
+        (safe / 'lease').unlink()
+        (self.root / 'clock').write_text('0.00 0.00\n')
         (safe / 'watchdog.heartbeat').write_text('0')
         pcm.write_text('closed\n')
         events.write_text('')
@@ -178,6 +184,10 @@ else: print('Front Left: Playback [' + state[key] + ']')
             'HK_AP2_PCM_STATUS': str(pcm), 'HK_AP2_PROC_ROOT': str(self.root / 'proc'),
             'MOCK_MIXER_STATE': str(state), 'MOCK_EVENTS': str(events),
         }
+        env['HK_AP2_VOICE_OWNER'] = str(os.getpid())
+        (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
+        reserve = subprocess.run(['sh', str(HOOK), 'reserve'], env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(reserve.returncode, 0, reserve.stderr)
         result = subprocess.run(['sh', str(HOOK), 'guard'], env=env,
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)

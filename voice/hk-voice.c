@@ -31,6 +31,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "../tools/hk-ipc.h"
 
 extern int malloc_trim(size_t);
 
@@ -602,6 +603,11 @@ static char *asr_best(const int16_t *pcm, size_t n) {
   int pfd[2];
   if (pipe(pfd) != 0) return baidu_asr(pcm, n);
   pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return baidu_asr(pcm, n);
+  }
   if (pid == 0) {
     close(pfd[0]);
     char *b = baidu_asr(pcm, n);
@@ -617,11 +623,11 @@ static char *asr_best(const int16_t *pcm, size_t n) {
   ssize_t r;
   /* read Baidu's answer (it is short); if SenseVoice won, don't wait long */
   if (sv && *sv) {
-    kill(pid, SIGKILL);
+    if (pid > 0) kill(pid, SIGKILL);
   }
   while ((r = read(pfd[0], tmp, sizeof tmp)) > 0) buf_add(&bd, tmp, (size_t)r);
   close(pfd[0]);
-  waitpid(pid, NULL, 0);
+  if (pid > 0) while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
   fprintf(stderr, "hk-voice: sensevoice \"%s\" (%ld ms), baidu \"%s\"\n", sv ? sv : "-", tsv,
           bd.p ? bd.p : "-");
   if (sv && *sv) {
@@ -1379,27 +1385,14 @@ static float log2f_approx(float v) {
 }
 
 static char *unix_request(const char *path, const char *cmd) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) return NULL;
-  struct sockaddr_un a;
-  memset(&a, 0, sizeof a);
-  a.sun_family = AF_UNIX;
-  snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
-  if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
-    close(fd);
+  char *response = malloc(16384);
+  unsigned long length;
+  if (!response) return NULL;
+  if (hk_ipc_request(path, cmd, 1200, response, 16384, &length) != 0) {
+    free(response);
     return NULL;
   }
-  if (write(fd, cmd, strlen(cmd) + 1) < 0) {
-    close(fd);
-    return NULL;
-  }
-  shutdown(fd, SHUT_WR);
-  buf_t b = {0};
-  char tmp[2048];
-  ssize_t n;
-  while ((n = read(fd, tmp, sizeof tmp)) > 0) buf_add(&b, tmp, (size_t)n);
-  close(fd);
-  return b.p;
+  return response;
 }
 
 /* Is an AirPlay sender connected (RTSP on :7000 established)? */
@@ -1879,6 +1872,10 @@ static void run_prepare_hook(void) {
   const char *cmd = getenv("HK_VOICE_PREPARE");
   if (!cmd || !*cmd) return;
   pid_t p = fork();
+  if (p < 0) {
+    fprintf(stderr, "hk-voice: prepare fork failed: %s\n", strerror(errno));
+    return;
+  }
   if (p == 0) {
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
@@ -2151,6 +2148,12 @@ static int answer_streamed(const char *q, const char *qdir) {
   if (pipe(pfd) != 0) die("pipe");
   long t0 = mono_ms();
   pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    http_close();
+    return answer_sequential(q, qdir);
+  }
   if (pid == 0) {
     close(pfd[0]);
     FILE *out = fdopen(pfd[1], "w");
@@ -2197,7 +2200,7 @@ static int answer_streamed(const char *q, const char *qdir) {
     if (nq == 1) fprintf(stderr, "hk-voice: first sentence ready after %ld ms (gain %.1f dB)\n", mono_ms() - t0, g);
   }
   fclose(in);
-  waitpid(pid, NULL, 0);
+  if (pid > 0) while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
   if (nq == 0) { /* network trouble: say so with a stored prompt */
     snprintf(tmp, sizeof tmp, "%s/q.tmp", qdir);
     if (clip_to_file(tts_svc_err && !net_err ? "ttserr" : "neterr", tmp, g) == 0) {

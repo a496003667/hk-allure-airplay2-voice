@@ -1,0 +1,78 @@
+{
+  "date": "2026-11-14",
+  "audited_base": "741ce5848646717f44026634cb978dfd4c915294",
+  "device_deployed": false,
+  "tests": {
+    "linux_busybox": {
+      "passed": 99,
+      "log_sha256": "4c770d6e9fe54e3349dc4023610fbde04febf33399b8b6705f753a93ff1b31d0"
+    },
+    "arm_ipc": {
+      "passed": 7,
+      "log_sha256": "9f85b2d1018b8ad0fe2f7c685b88196580215384b43cee03bf5ff9ded646de49"
+    }
+  },
+  "artifacts": {
+    "hk-ap2-dsp-bridge": {
+      "sha256": "f78ee7ff32aec9dc5895d23e06745eb9ddd9c89b9b286e339d9a8cee05a8f09b",
+      "maximum_glibc": "0"
+    },
+    "hk-bt-open-redirect.so": {
+      "sha256": "30d670bf574d12e4db352b5c0128954d5c550dd97a149a37f3487deed80bbd60",
+      "maximum_glibc": "2.4"
+    },
+    "hk-mqtt-pub": {
+      "sha256": "c26f891f619860deaad94dd4179dcd5fbcc79e8448937b45c523835324bb122f",
+      "maximum_glibc": "0"
+    },
+    "hk-shm-play": {
+      "sha256": "1f982fe536f26f4d01f9a1b16f0473d337e70921437e6a5c1a24935c43ed1a61",
+      "maximum_glibc": "0"
+    },
+    "hk-unix-request-raw": {
+      "sha256": "bc246ee42a877d814144bfbd54d44ad01d14579500dc20f3b66153cca0c98d76",
+      "maximum_glibc": "0"
+    },
+    "hk-voice": {
+      "sha256": "b15b28292d6736008b6aac2132bea84042b85f172eb9a36573c635908fabdd0b",
+      "maximum_glibc": "2.17"
+    },
+    "libhk-airplay-mute.so": {
+      "sha256": "8e387cfb222afb6816f1b11aa654f10d65a11a89cc583090c51ec6d0e89ca994",
+      "maximum_glibc": "0"
+    },
+    "libhk-airplay-unmute.so": {
+      "sha256": "b6e85e01e3fbf4316a81cacf02a7ed1da6dadf1c58cbc4d330bf15a84a489ae6",
+      "maximum_glibc": "0"
+    },
+    "libhk-ap2-info-shim-soft.so": {
+      "sha256": "a7e60e7d388bc2bb0b898880462cac3bcc09a946c7e1c3a33e3b6140dda3bdef",
+      "maximum_glibc": "2.4"
+    },
+    "libhk-mv-ap2-keys.so": {
+      "sha256": "27de9e94bea746ee0692c80b203791c4b6da1e678b04ccdef397ec187553593c",
+      "maximum_glibc": "2.17"
+    },
+    "libhk-nss-shim.so": {
+      "sha256": "53ce4b367ead3b2d01c548b6d5dced07e8af3602599b4453806bcaf2903030c9",
+      "maximum_glibc": "0"
+    },
+    "shairport-sync": {
+      "sha256": "14bd1d206380bb5496dfcebe0fa7f49f2bca36115d734da18bea116915761150",
+      "maximum_glibc": "2.12"
+    }
+  },
+  "release": {
+    "files": 30,
+    "manifest_sha256": "7d5a7e14b4f4becbadd8f74d05962dc6f1d4006bc7b1583cdb1dc9be02349c7e"
+  },
+  "runtime_rebuild": {
+    "identical": true,
+    "sha256": "ef0d16847e5d34df82246416d9652aec9f694eba3fec8a4b0882d25689fbf6e0"
+  },
+  "limits": [
+    "No device deployment, playback, microphone or firmware operations.",
+    "Shairport --version runs under ARM emulation; -X displays config then exits 139 for both candidate and audited baseline.",
+    "Audible pops, bass hardware, physical loudness and source/voice handoff require user-present device tests."
+  ]
+}

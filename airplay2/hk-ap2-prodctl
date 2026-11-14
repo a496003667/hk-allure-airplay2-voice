@@ -4,8 +4,8 @@
 # With $AP256_DIR present it also bind-mounts Shairport Sync 5.6, NQPTP
 # smi11 and the 5.6 config over the 4.3.6 runtime and uses the 5.6 runtime
 # controller (which also runs the loopback MQTT broker for remote control).
-# "touch $AP256_DIR/disable" selects plain 4.3.6.  If 5.6 fails to arm, the
-# supervisor falls back to 4.3.6 until the next reboot ($AP256_FALLBACK).
+# Legacy 4.3.6 fallback is not accepted as an equivalent healthy runtime.
+# /vendor/airplay2/disable stops AirPlay but retains shared audio protection.
 # The verified runtime is a read-only cramfs image on /vendor.  Only sockets,
 # PID files and small bounded logs are kept in writable tmpfs directories.
 
@@ -16,9 +16,10 @@ IMAGE="$BASE/hk-ap2-runtime.cramfs"
 EXPECTED_SHA256=26b5343b343f459f9b0fd05982ab00496beca77abea93997eeb3da05194d72b8
 INIT_SCRIPT=/etc/init.d/S99hk-airplay2
 INIT_SOURCE="$BASE/S99hk-airplay2"
-RUNDIR=/tmp/hk-ap2
+RUNDIR=${HK_AP2_RUNDIR:-/tmp/hk-ap2}
 OPT="$RUNDIR/opt"
 RUN="$RUNDIR/run"
+SAFE=$RUN/safe
 SAFE_TEST="$OPT/bin/hk-ap2-safe-test"
 AP2CTL="$OPT/bin/hk-ap2ctl"
 AP256_DIR="$BASE/ap2-56"
@@ -26,28 +27,35 @@ AP256_FALLBACK=/tmp/hk-ap2-56.fallback
 AP2CTL_OVERRIDE_436="$BASE/hk-ap2ctl.ap2info"
 AP2CTL_OVERRIDE_436_SHA1=a3cb6e37e236697b31fcf693343ed5df9f72a015
 AP2CTL_OVERRIDE_256="$BASE/hk-ap2ctl.ap256"
-AP2CTL_OVERRIDE_256_SHA1=eb88d61271ebaaa740c3d0a9996acce9cb049076
+AP2CTL_OVERRIDE_256_SHA1=64aa7a861b9348ab38052c00e1253cc53bf2cad0
 AUDIO_HOOK="$OPT/hk-ap2-audio-hook.sh"
 AUDIO_HOOK_OVERRIDE="$BASE/hk-ap2-audio-hook.sh"
 INFO_SHIM="$BASE/libhk-ap2-info-shim-soft.so"
-INFO_SHIM_SHA1=78ab5f7782414b9e33154d6d6ead71c2bd2cc05a
-SPS56_SHA1=b6c5263c3ef6f09fd5bc8f7bc9474f99fab042b7
+INFO_SHIM_SHA1=ffe675c704e3e19a85f5a51296bc38e1c52a6c65
+SPS56_SHA1=ca936a0d88197258aa251f698811e49adf7e6313
 NQPTP56_SHA1=ea5785e47f215cc9d89192a653aa616e3fb0e4f1
-CONF56_SHA1=6268bff9dd042ffcbe4440a664f5552182d1d23a
+CONF56_SHA1=c6922924190f4a8cb7f0d37c888da6c53c0519f2
 DEVICE_PINS=${HK_AP2_DEVICE_PINS:-$BASE/ap2-device.env}
-AUDIO_HOOK_OVERRIDE_SHA1=79b9d346a1783df43a3ee056a2839bfb54346fef
+AUDIO_HOOK_OVERRIDE_SHA1=e42e3cc9336ad8db09704d7173c092061eaa6dd6
 SAFE_TEST_OVERRIDE="$BASE/hk-ap2-safe-test.bt"
-SAFE_TEST_OVERRIDE_SHA1=40ae7efdef6e8d34f38a1b5e1fe02ca512878213
+SAFE_TEST_OVERRIDE_SHA1=1f34917bf80e6b3a9a47e5d1b6a0759097138328
 BT_BRIDGE="$BASE/hk-bt-bridge.sh"
-BT_BRIDGE_SHA1=2c8112b31920f892f848b92099de34df4449a94a
+BT_BRIDGE_SHA1=4d52b2b10bd11d141302ca10dc0be88073f0c742
 DSP_ALSA_CONF="$BASE/hk-dsp-alsa.conf"
 DSP_ALSA_CONF_SHA1=47af209cbaf6432a1d81e14c8bc1e204bd618890
 DSP_BRIDGE="$BASE/hk-ap2-dsp-bridge"
-DSP_BRIDGE_SHA1=cb87d6b76c2d54e3d2efc7e78dd2bb280c79e3cc
+DSP_BRIDGE_SHA1=d1a3d3c0143a263c08cdca3d62b786eef69cbe23
 DSP_FIFO="$RUN/airplay-pcm.fifo"
 REQUEST="$OPT/bin/hk-unix-request-raw"
+REQUEST_OVERRIDE="$BASE/hk-unix-request-raw"
+REQUEST_OVERRIDE_SHA1=0b481c3f255737937c0743a2b59bb907667e6288
+GUARD_OVERRIDE="$BASE/hk-ap2-guard.sh"
+GUARD_OVERRIDE_SHA1=3495b059131cb236ae9b822c315abee3e5dacaa5
+VOLUME_OVERRIDE="$BASE/hk-ap2-volume-log"
+VOLUME_OVERRIDE_SHA1=101d967969d614059b426bdd93512e739c1b7b84
+COMMON_SHA1=02f8c40f3888d3b2125706e59dacbb04c9f6dad2
 VOICE_SCRIPT="$BASE/../hk-voice/hk-voice.sh"
-VOICE_SCRIPT_SHA1=d475f8564e4a50a7be9374b46b2620271b717444
+VOICE_SCRIPT_SHA1=467486eb76fbf0bad6ce48ced7b41f59d42c25c5
 VOICE_RUN=/tmp/hk-voice
 MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-34816}
 PLAYER_SOCKET=/tmp/Requesta01controller
@@ -91,6 +99,10 @@ if [ -r "$DEVICE_PINS" ]; then
     esac
 fi
 
+COMMON=${HK_AUDIO_COMMON:-$BASE/hk-audio-common.sh}
+[ -r "$COMMON" ] || { echo "missing audio primitives: $COMMON" >&2; exit 1; }
+. "$COMMON"
+
 log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*"
 }
@@ -114,8 +126,7 @@ supervisor_alive() {
 hard_mute_raw() {
     env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cset numid=1 0,0 \
         >/dev/null 2>&1 || true
-    env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 cset numid=2 0,0 \
-        >/dev/null 2>&1 || true
+    audio_delay 100000
     env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "Ext Spk" off \
         >/dev/null 2>&1 || true
     env LD_LIBRARY_PATH="$AMIXER_LIB" "$AMIXER" -c 0 sset "Digital" off \
@@ -221,18 +232,15 @@ use_ap256() {
 }
 
 select_runtime_controller() {
-    if use_ap256; then
-        AP2CTL_OVERRIDE=$AP2CTL_OVERRIDE_256
-        AP2CTL_OVERRIDE_SHA1=$AP2CTL_OVERRIDE_256_SHA1
-    else
-        AP2CTL_OVERRIDE=$AP2CTL_OVERRIDE_436
-        AP2CTL_OVERRIDE_SHA1=$AP2CTL_OVERRIDE_436_SHA1
-    fi
+    use_ap256 || { log "verified 5.6 assets required; legacy fallback refused"; return 1; }
+    AP2CTL_OVERRIDE=$AP2CTL_OVERRIDE_256
+    AP2CTL_OVERRIDE_SHA1=$AP2CTL_OVERRIDE_256_SHA1
 }
 
 ensure_runtime_override() {
     ensure_dsp_runtime || return 1
-    select_runtime_controller
+    [ "$(sha1sum "$COMMON" | awk '{print $1}')" = "$COMMON_SHA1" ] || return 1
+    select_runtime_controller || return 1
     if [ ! -x "$AP2CTL_OVERRIDE" ]; then
         log "missing runtime controller override: $AP2CTL_OVERRIDE"
         return 1
@@ -262,6 +270,12 @@ ensure_runtime_override() {
         "$AUDIO_HOOK_OVERRIDE_SHA1" "audio hook" || return 1
     ensure_verified_bind_mount "$SAFE_TEST" "$SAFE_TEST_OVERRIDE" \
         "$SAFE_TEST_OVERRIDE_SHA1" "Bluetooth-aware safety watchdog" || return 1
+    ensure_verified_bind_mount "$REQUEST" "$REQUEST_OVERRIDE" \
+        "$REQUEST_OVERRIDE_SHA1" "bounded IPC client" || return 1
+    ensure_verified_bind_mount "$OPT/bin/hk-ap2-guard.sh" "$GUARD_OVERRIDE" \
+        "$GUARD_OVERRIDE_SHA1" "source-aware resource guard" || return 1
+    ensure_verified_bind_mount "$OPT/bin/hk-ap2-volume-log" "$VOLUME_OVERRIDE" \
+        "$VOLUME_OVERRIDE_SHA1" "bounded volume state writer" || return 1
     [ -x "$BT_BRIDGE" ] && [ "$(sha1sum "$BT_BRIDGE" | awk '{print $1}')" = "$BT_BRIDGE_SHA1" ] || {
         log "Bluetooth bridge missing or checksum mismatch"
         return 1
@@ -335,7 +349,8 @@ mount_runtime() {
 unmount_runtime() {
     unmount_failed=0
     for target_path in "$OPT/etc/ap2/shairport-sync.conf" "$OPT/bin/nqptp" \
-        "$OPT/bin/shairport-sync" "$AUDIO_HOOK" "$AP2CTL" "$SAFE_TEST"; do
+        "$OPT/bin/shairport-sync" "$AUDIO_HOOK" "$AP2CTL" "$SAFE_TEST" \
+        "$REQUEST" "$OPT/bin/hk-ap2-guard.sh" "$OPT/bin/hk-ap2-volume-log"; do
         if bind_mounted_at "$target_path"; then
             if umount "$target_path"; then
                 log "$target_path override unmounted"
@@ -527,6 +542,7 @@ voice_supervisor_alive() {
 }
 
 ensure_voice_supervisor() {
+    [ ! -f "$BASE/.updates/pending" ] || return 0
     [ -x "$VOICE_SCRIPT" ] &&
         [ "$(sha1sum "$VOICE_SCRIPT" 2>/dev/null | awk '{print $1}')" = "$VOICE_SCRIPT_SHA1" ] || return 0
     [ ! -f "$BASE/../hk-voice/disable" ] || return 0
@@ -542,15 +558,23 @@ supervisor_run() {
         log "supervisor already running pid=$(supervisor_pid)"
         return 0
     fi
+    if [ -f "$BASE/.updates/pending" ] && [ "${HK_AP2_UPDATE_START:-0}" != 1 ]; then
+        : >"${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}"
+        hard_mute_raw
+        log "unfinished update; recover the recorded transaction before starting"
+        return 1
+    fi
     echo "$$" >"$PIDFILE"
     echo 11 >"/proc/$$/oom_score_adj" 2>/dev/null || true
     log "supervisor started pid=$$"
 
     cleanup() {
         log "supervisor stopping"
+        # Global maintenance shutdown: fade on the existing clock first.
+        hard_mute_raw
         stop_bt_bridge
-        stop_dsp_bridge
         stop_ap2
+        stop_dsp_bridge
         unmount_runtime || true
         rm -f "$STOPFILE" "$PIDFILE"
         log "supervisor stopped; output hard-muted"
@@ -578,22 +602,12 @@ supervisor_run() {
     # A manual start is an explicit request to clear a previous trip latch.
     # Disarm always hard-mutes first and leaves the physical speaker disabled.
     "$SAFE_TEST" disarm >/dev/null 2>&1 || true
-    if ! "$SAFE_TEST" arm; then
+    arm_command=arm
+    if [ -f "$BASE/disable" ]; then arm_command=arm-shared; fi
+    if ! "$SAFE_TEST" "$arm_command"; then
         log "safe-test arm failed"
-        use_ap256 || return 1
-        # Shairport 5.6 did not come up: run the verified 4.3.6 runtime
-        # until the next reboot rather than leaving AirPlay unavailable.
-        : >"$AP256_FALLBACK"
-        log "falling back to Shairport Sync 4.3.6 until reboot"
-        stop_ap2
-        unmount_runtime || return 1
-        mount_runtime || return 1
-        check_stock_safety || return 1
-        "$SAFE_TEST" disarm >/dev/null 2>&1 || true
-        if ! "$SAFE_TEST" arm; then
-            log "safe-test arm failed with 4.3.6 as well"
-            return 1
-        fi
+        log "5.6 failed; refusing unvalidated 4.3.6 fallback"
+        return 1
     fi
     log "AirPlay 2 armed without playback deadline"
     if ! start_dsp_bridge; then
@@ -613,38 +627,6 @@ supervisor_run() {
         }
         mode=$(cat "$RUN/mode" 2>/dev/null || true)
         watchdog=$(cat "$RUN/safe/watchdog.pid" 2>/dev/null || true)
-        if [ "$mode" != "real" ]; then
-            # Shairport is optional during Bluetooth playback. If LMK reclaims
-            # it, keep the independent bridge and watchdog alive until the
-            # phone stops, then attempt the normal AP2 recovery below.
-            if [ -f "$RUN/bt-owner.pid" ]; then
-                log "AP2 unavailable while Bluetooth is playing; delaying recovery"
-                sleep 10
-                continue
-            fi
-            trip=$(cat "$RUN/low-memory-trip" 2>/dev/null || true)
-            case "$trip" in
-                "shairport exited"|"memory low:"*) restart_reason=$trip ;;
-                *) restart_reason= ;;
-            esac
-            if [ -n "$restart_reason" ] && [ ! -f "$STOPFILE" ] && restart_allowed; then
-                log "AP2 stopped ($restart_reason); restarting"
-                "$SAFE_TEST" disarm >/dev/null 2>&1 || true
-                rm -f "$RUN/low-memory-trip"
-                # The start gate counts MemFree only; reclaim clean page
-                # cache first, as a manual start does.
-                sync
-                echo 1 >/proc/sys/vm/drop_caches 2>/dev/null || true
-                if check_stock_safety && "$SAFE_TEST" arm; then
-                    log "AP2 restarted after Shairport exit"
-                    sleep 10
-                    continue
-                fi
-                log "AP2 restart after Shairport exit failed"
-            fi
-            log "AP2 left real mode"
-            break
-        fi
         case "$watchdog" in
             ''|*[!0-9]*)
                 log "safe watchdog pid is missing"
@@ -672,6 +654,49 @@ supervisor_run() {
                     start_dsp_bridge || break
                 ;;
         esac
+
+        for log_file in "$RUN"/*.log "$SAFE"/*.log "$VOICE_RUN"/*.log "$LOG"; do
+            audio_trim_log "$log_file" 131072
+        done
+        if [ -f "$BASE/disable" ]; then
+            if [ "$mode" = real ]; then "$AP2CTL" stop >/dev/null 2>&1 || break; fi
+            : >"$RUN/ap2-disabled"
+            sleep 10
+            continue
+        fi
+        if [ "$mode" != "real" ]; then
+            # Shairport is optional during Bluetooth playback. If LMK reclaims
+            # it, keep the independent bridge and watchdog alive until the
+            # phone stops, then attempt the normal AP2 recovery below.
+            if audio_bt_valid || { audio_read_lease && [ "$lease_source" = voice ]; }; then
+                log "AP2 unavailable while Bluetooth is playing; delaying recovery"
+                sleep 10
+                continue
+            fi
+            trip=$(cat "$RUN/low-memory-trip" 2>/dev/null || true)
+            [ ! -f "$RUN/ap2-disabled" ] || trip="shairport exited"
+            case "$trip" in
+                "shairport exited"|"memory low:"*) restart_reason=$trip ;;
+                *) restart_reason= ;;
+            esac
+            if [ -n "$restart_reason" ] && [ ! -f "$STOPFILE" ] && restart_allowed; then
+                log "AP2 stopped ($restart_reason); restarting"
+                rm -f "$RUN/low-memory-trip" "$RUN/ap2-disabled"
+                # The start gate counts MemFree only; reclaim clean page
+                # cache first, as a manual start does.
+                sync
+                echo 1 >/proc/sys/vm/drop_caches 2>/dev/null || true
+                if check_stock_safety && "$AP2CTL" start real; then
+                    log "AP2 restarted after Shairport exit"
+                    sleep 10
+                    continue
+                fi
+                log "AP2 restart after Shairport exit failed"
+            fi
+            log "AP2 unavailable; shared Bluetooth/voice supervision retained"
+            sleep 30
+            continue
+        fi
 
         if check_stock_safety; then
             stock_failures=0
@@ -726,6 +751,46 @@ stop_supervisor() {
     echo "AirPlay 2 stopped; output hard-muted"
 }
 
+verify_active() {
+    supervisor_alive && use_ap256 || return 1
+    [ ! -f "$AP256_FALLBACK" ] || return 1
+    [ "$(cat "$RUN/mode" 2>/dev/null)" = real ] || return 1
+    [ -f "$SAFE/armed" ] || return 1
+    [ "$(sha1sum "$COMMON" 2>/dev/null | awk '{print $1}')" = "$COMMON_SHA1" ] || return 1
+    for entry in \
+        "$OPT/bin/shairport-sync:$SPS56_SHA1" \
+        "$OPT/bin/nqptp:$NQPTP56_SHA1" \
+        "$OPT/etc/ap2/shairport-sync.conf:$CONF56_SHA1" \
+        "$AUDIO_HOOK:$AUDIO_HOOK_OVERRIDE_SHA1" \
+        "$SAFE_TEST:$SAFE_TEST_OVERRIDE_SHA1" \
+        "$AP2CTL:$AP2CTL_OVERRIDE_256_SHA1" \
+        "$REQUEST:$REQUEST_OVERRIDE_SHA1" \
+        "$OPT/bin/hk-ap2-guard.sh:$GUARD_OVERRIDE_SHA1" \
+        "$OPT/bin/hk-ap2-volume-log:$VOLUME_OVERRIDE_SHA1"; do
+        path=${entry%:*}; expected=${entry##*:}
+        bind_mounted_at "$path" &&
+            [ "$(sha1sum "$path" 2>/dev/null | awk '{print $1}')" = "$expected" ] || return 1
+    done
+    for entry in \
+        "$SAFE/watchdog.pid:hk-ap2-safe-test" \
+        "$RUN/shairport.pid:$OPT/bin/shairport-sync" \
+        "$RUN/guard.pid:hk-ap2-guard.sh" \
+        "$RUN/bt-bridge.pid:$BT_BRIDGE" \
+        "$RUN/dsp-bridge.pid:$DSP_BRIDGE"; do
+        pidfile=${entry%:*}; command=${entry##*:}
+        pid=$(cat "$pidfile" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*|0|1) return 1;; esac
+        kill -0 "$pid" 2>/dev/null &&
+            tr '\000' ' ' <"/proc/$pid/cmdline" | grep -Fq "$command" || return 1
+    done
+    beat=$(cat "$SAFE/watchdog.heartbeat" 2>/dev/null)
+    current=$(audio_now) || return 1
+    case "$beat:$current" in *[!0-9:]*|:*|*:) return 1;; esac
+    [ "$beat" -le "$current" ] && [ $((current - beat)) -le 4 ] || return 1
+    "$AP2CTL" status 2>/dev/null | grep -q 'airplay port 7000: listening' || return 1
+    echo 'verified: Shairport 5.6, exact runtime/config pins, DSP, Bluetooth bridge and watchdog'
+}
+
 show_status() {
     if supervisor_alive; then
         echo "supervisor: running pid=$(supervisor_pid)"
@@ -741,9 +806,11 @@ show_status() {
         echo "runtime: not mounted"
     fi
     [ -f "$INIT_SCRIPT" ] && echo "boot hook: enabled" || echo "boot hook: disabled"
+    [ ! -f "$BASE/disable" ] || echo "AirPlay disabled; shared audio supervision remains active"
 }
 
 enable_boot() {
+    rm -f "$BASE/disable"
     [ -x "$INIT_SOURCE" ] || {
         echo "missing boot script: $INIT_SOURCE" >&2
         return 1
@@ -755,8 +822,9 @@ enable_boot() {
 }
 
 disable_boot() {
-    rm -f "$INIT_SCRIPT"
-    echo "boot hook disabled"
+    : >"$BASE/disable" || return 1
+    [ ! -x "$AP2CTL" ] || "$AP2CTL" stop >/dev/null 2>&1 || return 1
+    echo "AirPlay disabled persistently; shared Bluetooth/voice protection retained"
 }
 
 case "${1:-status}" in
@@ -772,6 +840,9 @@ case "${1:-status}" in
     restart)
         stop_supervisor
         start_supervisor
+        ;;
+    verify)
+        verify_active
         ;;
     status)
         show_status

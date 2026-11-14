@@ -33,6 +33,10 @@ BT_RELEASE="$RUN/bt-release"
 PCM_STATUS=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
 PROC_ROOT=${HK_AP2_PROC_ROOT:-/proc}
 HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 
 # The AP2 loader must not leak its glibc path into stock shell commands.
 unset LD_LIBRARY_PATH
@@ -40,14 +44,7 @@ unset LD_LIBRARY_PATH
 hook_log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
         >>"$HOOK_LOG" 2>/dev/null || true
-    size=$(wc -c <"$HOOK_LOG" 2>/dev/null || echo 0)
-    case "$size" in
-        ''|*[!0-9]*) return 0 ;;
-    esac
-    if [ "$size" -gt 65536 ]; then
-        tail -c 32768 "$HOOK_LOG" >"$HOOK_LOG.tmp" 2>/dev/null &&
-            mv "$HOOK_LOG.tmp" "$HOOK_LOG" 2>/dev/null || true
-    fi
+    audio_trim_log "$HOOK_LOG" 65536
 }
 
 mixer_set() {
@@ -79,29 +76,12 @@ switch_state() {
         sed -n '1p'
 }
 
-speaker_lock() {
-    n=0
-    while ! mkdir "$SPEAKER_LOCK" 2>/dev/null; do
-        n=$((n + 1))
-        if [ "$n" -ge 30 ]; then             # stale lock (holder killed)
-            rmdir "$SPEAKER_LOCK" 2>/dev/null
-            mkdir "$SPEAKER_LOCK" 2>/dev/null
-            return 0
-        fi
-        usleep 100000 2>/dev/null || sleep 1
-    done
-}
-
-speaker_unlock() { rmdir "$SPEAKER_LOCK" 2>/dev/null || true; }
+speaker_lock() { audio_lock "$SPEAKER_LOCK"; }
+speaker_unlock() { audio_unlock "$SPEAKER_LOCK" 2>/dev/null || true; }
 
 # The voice flag holds the uptime it was taken; ignore it after 5 minutes
 # in case the voice assistant died without clearing it.
-voice_owns() {
-    t=$(sed -n 1p "$VOICE_OWNS" 2>/dev/null)
-    case "$t" in ''|*[!0-9]*) return 1 ;; esac
-    now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
-    [ $((now - t)) -lt 300 ]
-}
+voice_owns() { audio_voice_pending; }
 
 read_file() {
     [ -f "$1" ] && sed -n '1p' "$1" 2>/dev/null || true
@@ -112,8 +92,8 @@ watchdog_alive() {
     heartbeat=$(read_file "$SAFE/watchdog.heartbeat")
     [ -n "$pid" ] && [ -n "$heartbeat" ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
-    current=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
-    [ $((current - heartbeat)) -le 4 ]
+    current=$(audio_now)
+    [ "$heartbeat" -le "$current" ] && [ $((current - heartbeat)) -le 4 ]
 }
 
 stock_pa_mute() {
@@ -132,7 +112,7 @@ stock_pa_mute() {
     pid=$!
     # A Bluetooth source can stop during setup and terminate this hook. Do
     # not leave the temporary helper holding the runtime mount open.
-    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1' HUP INT TERM
+    trap 'kill "$pid" 2>/dev/null || true; start_failed "interrupted PA setup"' HUP INT TERM
     # The preload constructor does the work right away and logs it; poll
     # for that line instead of a fixed 1 s wait (cap 1.5 s).
     n=0
@@ -145,7 +125,7 @@ stock_pa_mute() {
     rm -f "$APPLE_REMOTE_SOCKET"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    trap - HUP INT TERM
+    trap 'start_failed "interrupted speaker transition"' HUP INT TERM
 
     # apple_remote may exit after the constructor because one stock helper
     # symbol is unavailable. The constructor runs first and is the operation
@@ -170,14 +150,10 @@ hard_mute() {
 }
 
 clear_play_lease() {
-    rm -f "$SAFE/play.started" "$SAFE/play.started.tmp"
+    rm -f "$SAFE/play.started" "$SAFE/play.started.tmp" "$SAFE/lease" "$SAFE/lease.tmp"
 }
 
-publish_play_lease() {
-    printf '%s\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)" \
-        >"$SAFE/play.started.tmp" 2>/dev/null &&
-        mv "$SAFE/play.started.tmp" "$SAFE/play.started" 2>/dev/null
-}
+publish_play_lease() { audio_reserve; }
 
 watchdog_heartbeat() {
     read_file "$SAFE/watchdog.heartbeat"
@@ -220,6 +196,8 @@ output_guard_ok() {
     [ -f "$SAFE/armed" ] &&
     [ ! -f "$SAFE/tripped" ] &&
     [ -s "$SAFE/play.started" ] &&
+    audio_lease_is_caller &&
+    audio_voice_generation_valid &&
     watchdog_alive
 }
 
@@ -246,6 +224,14 @@ start_failed() {
 }
 
 case "${1:-}" in
+    reserve)
+        [ ! -f "$HOLD_MUTE" ] && [ -f "$SAFE/armed" ] &&
+            [ ! -f "$SAFE/tripped" ] && watchdog_alive || exit 1
+        speaker_lock || exit 1
+        trap 'speaker_unlock' 0
+        audio_reserve
+        exit $?
+        ;;
     guard)
         # Every speaker user calls this before touching a mixer control or
         # switching the stock amplifier.  It is the single pop-free contract:
@@ -278,14 +264,14 @@ case "${1:-}" in
             exit 1
         fi
         if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
-            speaker_lock
+            speaker_lock || exit 1
             if voice_owns; then
                 : >"$DEFERRED"
                 speaker_unlock
                 hook_log "start deferred: the voice assistant has the speaker"
                 exit 0
             fi
-            cut -d. -f1 /proc/uptime >"$CLAIM" 2>/dev/null
+            audio_now >"$CLAIM" 2>/dev/null
             if [ -f "$BT_OWNER" ]; then
                 : >"$BT_RELEASE"
                 speaker_unlock
@@ -304,6 +290,18 @@ case "${1:-}" in
         [ -f "$SAFE/armed" ] || exit 1
         [ ! -f "$SAFE/tripped" ] || exit 1
         watchdog_alive || exit 1
+        speaker_lock || exit 1
+        trap 'speaker_unlock' 0
+        trap 'start_failed "interrupted speaker transition"' HUP INT TERM
+        if [ -e "$SAFE/lease" ] && audio_read_lease && ! audio_lease_is_caller; then
+            hook_log "start refused: a different owner or generation holds the lease"
+            exit 1
+        fi
+        audio_voice_generation_valid || exit 1
+        if audio_lease_is_caller && [ "$lease_phase" = active ] && pcm_clock_live &&
+           [ "$(switch_state 'Ext Spk')" = on ]; then
+            exit 0
+        fi
 
         # Publish the lease before touching the mixer.  Otherwise the watchdog
         # can observe "no lease" between the baseline writes and the later
@@ -371,25 +369,39 @@ case "${1:-}" in
         mixer_cset 1 "$DIGITAL,$DIGITAL" || start_failed "digital fade-in failed"
         [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] ||
             start_failed "digital fade-in verification failed"
+        output_guard_ok || start_failed "guard lost after fade-in"
+        lease_phase=active
+        audio_write_lease || start_failed "could not commit active lease"
+        if [ "$lease_source" != voice ]; then printf '%s\n' "$lease_source" >"$RUN/media-source"; fi
         hook_log "speaker enabled"
         exit 0
         ;;
     stop|mute)
-        if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
+        if [ "${1:-}" = stop ] && [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
             if [ "${1:-}" = stop ] && [ -f "$BT_OWNER" ]; then
                 hook_log "AirPlay stop ignored: Bluetooth owns the speaker"
                 exit 0
             fi
-            rm -f "$DEFERRED" "$CLAIM"
             if voice_owns; then
                 hook_log "${1:-stop} ignored: the voice assistant has the speaker"
                 exit 0
             fi
         fi
+        speaker_lock || exit 1
+        trap 'speaker_unlock' 0
+        if [ "$1" = stop ] && [ -f "$SAFE/lease" ] && ! audio_read_lease; then
+            start_failed "invalid lease on stop"
+        fi
+        if [ "$1" = stop ] && [ -f "$SAFE/lease" ] && ! audio_lease_is_caller; then
+            hook_log "stop ignored: a different owner or generation holds the lease"
+            exit 0
+        fi
+        if audio_read_lease; then lease_phase=draining; audio_write_lease || exit 1; fi
         hook_log "${1:-stop} requested"
         hard_mute
         [ "$USE_STOCK_PA" != "1" ] || stock_pa_mute 1 || true
         clear_play_lease
+        if [ "$(audio_source)" = airplay ] || [ "$1" = mute ]; then rm -f "$DEFERRED" "$CLAIM"; fi
         mixer_set "Auto Mute" on || true
         exit 0
         ;;

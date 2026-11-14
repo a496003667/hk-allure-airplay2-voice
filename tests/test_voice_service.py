@@ -26,7 +26,7 @@ class VoiceServiceTest(unittest.TestCase):
     def test_all_voice_speaker_paths_use_the_shared_pop_free_guard(self):
         script = VOICE.read_text()
         self.assertIn('"$HOOK" guard', script)
-        self.assertIn('env HK_AP2_BT=1 $HOOK_ENV "$HOOK" guard active', script)
+        self.assertIn('env HK_AP2_BT=1 $HOOK_ENV HK_AUDIO_TOKEN= "$HOOK" guard active', script)
         self.assertNotRegex(script, r'sset "Ext Spk" on|sset Ext Spk on')
         opens = [line for line in script.splitlines()
                  if '"$HOOK" start' in line and 'guard' not in line]
@@ -173,7 +173,7 @@ bt_inject_end
         script = VOICE.read_text()
         health = script.split("supervisor_health() {", 1)[1].split("\ncase ", 1)[0]
         self.assertIn('[ "$prepared" = ok ] && limit=3', health)
-        self.assertIn('if [ "$prepared" != ok ]; then', health)
+        self.assertIn('if [ "$prepared" != ok ] && [ "$prepared" != finished ]; then', health)
 
 
 if __name__ == "__main__":

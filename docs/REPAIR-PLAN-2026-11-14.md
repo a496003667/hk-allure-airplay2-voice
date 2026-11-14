@@ -1,6 +1,6 @@
 # 2026-11-14 审计修复方案 / Audit repair plan
 
-状态：**方案，尚未实施功能修复或部署**。基线提交：`741ce5848646717f44026634cb978dfd4c915294`；修复分支：`fix/audit-20261114`。
+状态：**已进入离线开发，尚未部署到设备**。基线提交：`741ce5848646717f44026634cb978dfd4c915294`；修复分支：`fix/audit-20261114`。
 
 ## 目标与基线
 
@@ -20,7 +20,7 @@
 
 ## 修复顺序与交付
 
-每批独立提交并附回归证据。批次是代码与验证的边界，不表示每批都重启音箱；完整候选包准备好后才部署，避免反复修改共享运行时。
+第一批进程/IPC 安全修复单独提交；其余音频、更新和校验相互依赖，作为完整候选提交并附回归证据，避免中间版本 pin 不一致。批次是代码与验证的边界，不表示每批都重启音箱；完整候选包准备好后才部署。
 
 | 批次 | 覆盖范围 | 主要改动 | 本地通过标准 |
 |---|---|---|---|
@@ -78,7 +78,7 @@ IDLE（物理静音）
 
 在唤醒时记录来源、用户播放意图及本轮是否有恢复责任。AirPlay 指令通过其现有控制接口；蓝牙使用经核实的原厂接口，并回读状态。暂停、继续、上一首、下一首、音量键均通过当前来源适配器；用户手动暂停或语音要求暂停后，不得在回答结束时擅自续播。
 
-默认交互按用户先前反馈处理：唤醒后音乐淡出并暂停，回读确认；若蓝牙暂停释放 PCM，改用独立语音租约播报，结束后仅在本轮有恢复责任时续播。现有同 PCM 混音保留为可选路径，不能把仅压低背景音乐称作暂停；该路径如使用，须保留混音余量并平滑恢复当前有效目标音量。不能依靠退出时写固定数字音量“恢复”。语音清晰度偏低的问题在交接通过后调独立语音相对增益。
+离线实现采用已知声卡约束：原厂蓝牙暂停后仍可能占有独占 PCM，因此默认保留同 PCM 混音，唤醒时将背景音乐平滑压至静音；手机上的曲目进度可能继续，文档不能将它称作暂停。明确的“暂停”指令必须真实派发并确认，回复结束也不得自动续播。另保留 HK_VOICE_BT_MODE=pause 路径：淡出、暂停、确认释放 PCM 后再用独立语音租约；若 PCM 未释放则保持静音并报明原因，留到晚间验证。不能依靠退出时写固定数字音量“恢复”。语音清晰度偏低的问题在交接通过后调独立语音相对增益。
 
 所有 feeder 统一使用 `q.abort` 协议，播放中也检查中断；引入轮次 ID，新唤醒先中断旧轮，旧生产者不能继续提交给新队列。
 
@@ -160,7 +160,7 @@ F01–F12 每项均需有对应改动、回归证据和剩余限制；未完成�
 
 ## English summary
 
-This is a plan, not an implemented repair. The baseline is commit `741ce58`, with 54 passing existing tests and nine reproduced abnormal behaviors. A subsequent read-only device connection succeeded; that snapshot does not constitute runtime acceptance of any fix.
+This plan is now being implemented offline; nothing has been deployed to the speaker. The baseline is commit `741ce58`, with 54 passing existing tests and nine reproduced abnormal behaviors. A subsequent read-only device connection succeeded; that snapshot does not constitute runtime acceptance of any fix.
 
 The six implementation batches are:
 

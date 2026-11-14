@@ -26,15 +26,20 @@ MAX_PLAY_SECONDS=${HK_AP2_MAX_PLAY_SECONDS:-12}
 WATCHDOG_OOM_SCORE_ADJ=${HK_AP2_WATCHDOG_OOM_SCORE_ADJ:-500}
 
 mkdir -p "$SAFE"
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 
 now() {
     # /proc/uptime is monotonic, so NTP corrections cannot extend a lease.
-    cut -d. -f1 /proc/uptime 2>/dev/null || echo 0
+    audio_now
 }
 
 log_action() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
         >>"$SAFE/actions.log" 2>/dev/null || true
+    audio_trim_log "$SAFE/actions.log" 65536
 }
 
 read_file() {
@@ -79,7 +84,7 @@ hard_mute() {
     # Keep several independent layers muted.  The speaker switch and I2S gate
     # are stock hardware controls; Master=0 is an additional safety layer.
     mixer_cset 1 0,0 || true
-    mixer_cset 2 0,0 || true
+    audio_delay 100000
     mixer_set "Ext Spk" off || true
     mixer_set "Digital" off || true
     mixer_set "aml audio i2s mute" on || true
@@ -170,8 +175,34 @@ watchdog_loop() {
             mv "$SAFE/watchdog.heartbeat.tmp" "$SAFE/watchdog.heartbeat" 2>/dev/null || true
 
         marker=$(read_file "$SAFE/play.started")
+        if [ -f "$HOLD_MUTE" ]; then
+            write_file "$SAFE/tripped" "manual mute" || true
+        fi
         if [ -f "$SAFE/tripped" ]; then
             hard_mute
+            sleep 1
+            continue
+        fi
+
+        if [ -n "$marker" ] && ! audio_read_lease; then
+            # Loss of an optional AirPlay owner closes its lease, not the
+            # user's global manual-mute latch. A fresh session still needs
+            # the complete guarded start sequence after AP2 recovery.
+            if [ "${lease_source:-}" = airplay ] &&
+               ! audio_pid_live "${lease_pid:-}" "${lease_start:-}"; then
+                hard_mute
+                rm -f "$SAFE/play.started" "$SAFE/lease"
+                log_action "AP2 stream process ended; hard mute (recoverable)"
+                sleep 1
+                continue
+            fi
+            lease_error="invalid playback lease"
+            if [ -f "$BT_OWNER" ]; then lease_error="Bluetooth bridge lost"; fi
+            write_file "$SAFE/tripped" "$lease_error" || true
+            hard_mute
+            rm -f "$SAFE/play.started" "$SAFE/lease"
+            if [ "$lease_error" = "Bluetooth bridge lost" ]; then rm -f "$BT_OWNER" "$BT_HEARTBEAT"; fi
+            log_action "$lease_error; hard mute"
             sleep 1
             continue
         fi
@@ -204,8 +235,8 @@ watchdog_loop() {
             fi
             if [ "$bt_valid" = 0 ]; then
                 write_file "$SAFE/tripped" "Bluetooth bridge lost" || true
-                rm -f "$SAFE/play.started" "$BT_OWNER" "$BT_HEARTBEAT"
                 hard_mute
+                rm -f "$SAFE/play.started" "$BT_OWNER" "$BT_HEARTBEAT"
                 deadline=
                 last_marker=
                 log_action "Bluetooth bridge lost; hard mute pid=$bt_pid heartbeat=$bt_heartbeat now=${bt_current:-unknown}"
@@ -229,8 +260,8 @@ watchdog_loop() {
 
         if [ -n "$deadline" ] && [ "$current" -ge "$deadline" ]; then
             write_file "$SAFE/tripped" "watchdog deadline exceeded" || true
-            rm -f "$SAFE/play.started"
             hard_mute
+            rm -f "$SAFE/play.started"
             log_action "watchdog tripped: hard mute"
             deadline=
             sleep 1
@@ -249,17 +280,43 @@ watchdog_loop() {
             # A Bluetooth lease does not belong to Shairport.  LMK may recycle
             # the optional AirPlay process while Bluetooth continues playing;
             # that must not revoke the independent bridge's valid lease.
-            if [ ! -f "$BT_OWNER" ]; then
+            if [ "$lease_source" = airplay ]; then
                 shairport_pid=$(read_file "$RUN/shairport.pid")
                 if [ -z "$shairport_pid" ] || ! kill -0 "$shairport_pid" 2>/dev/null; then
-                    rm -f "$SAFE/play.started"
                     hard_mute
+                    rm -f "$SAFE/play.started"
                     deadline=
                     last_marker=
                     log_action "AP2 stream process ended; hard mute"
                     sleep 1
                     continue
                 fi
+            fi
+            if [ "$lease_phase" = active ]; then
+                pcm=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
+                pcm_pid=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$pcm" 2>/dev/null)
+                pcm_ok=0
+                if grep -q '^state: RUNNING' "$pcm" 2>/dev/null; then
+                    case "$lease_source" in
+                        bluetooth) audio_bt_valid && pcm_ok=1;;
+                        voice) [ "$(cat "$AUDIO_PROC/$pcm_pid/comm" 2>/dev/null)" = aplay ] && pcm_ok=1;;
+                        airplay) [ "$pcm_pid" = "$(read_file "$RUN/dsp-bridge.pid")" ] && pcm_ok=1;;
+                    esac
+                fi
+                if [ "$pcm_ok" = 0 ]; then
+                    write_file "$SAFE/tripped" "PCM owner or clock lost" || true
+                    hard_mute
+                    rm -f "$SAFE/play.started" "$SAFE/lease"
+                    log_action "PCM owner or clock lost; hard mute"
+                    sleep 1
+                    continue
+                fi
+            fi
+            if [ "$lease_source" = voice ] && [ $((current - lease_time)) -gt 180 ]; then
+                write_file "$SAFE/tripped" "voice lease expired" || true
+                hard_mute
+                rm -f "$SAFE/play.started" "$SAFE/lease"
+                continue
             fi
             # Bluetooth follows the stock 0..32 Master control. The AP2
             # path retains its existing setting; both retain the separate
@@ -276,8 +333,8 @@ watchdog_loop() {
             case "$master" in
                 ''|*[!0-9]*)
                     write_file "$SAFE/tripped" "invalid Master reading" || true
-                    rm -f "$SAFE/play.started"
                     hard_mute
+                    rm -f "$SAFE/play.started"
                     log_action "watchdog tripped: invalid Master"
                     deadline=
                     sleep 1
@@ -297,8 +354,8 @@ watchdog_loop() {
             case "$digital_left:$digital_right" in
                 *[!0-9:]*|:|*:)
                     write_file "$SAFE/tripped" "invalid digital volume reading" || true
-                    rm -f "$SAFE/play.started"
                     hard_mute
+                    rm -f "$SAFE/play.started"
                     log_action "watchdog tripped: invalid digital volume"
                     deadline=
                     sleep 1
@@ -315,8 +372,9 @@ watchdog_loop() {
 
             playback="$(mixer_values 2)"
             if [ "$playback" != "$playback_safe" ]; then
-                mixer_cset 2 "$playback_safe" || true
-                log_action "watchdog restored Playback Volume to $playback_safe"
+                write_file "$SAFE/tripped" "analog baseline changed" || true
+                hard_mute
+                log_action "analog baseline changed; muted without switching gain"
             fi
         fi
         sleep 1
@@ -372,7 +430,7 @@ arm() {
     "$AP2CTL" stop >/dev/null 2>&1 || true
     hard_mute
     safe_baseline
-    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
     : >"$SAFE/armed"
 
     if ! start_watchdog; then
@@ -394,7 +452,7 @@ arm() {
         hard_mute
     fi
 
-    if ! "$AP2CTL" start real; then
+    if [ "${1:-real}" != shared ] && ! "$AP2CTL" start real; then
         echo "real AP2 failed to start; disarming" >&2
         rm -f "$SAFE/armed"
         stop_watchdog
@@ -408,16 +466,16 @@ arm() {
     echo "speaker remains off until playback begins"
     echo "max playback: ${MAX_PLAY_SECONDS}s, Master cap: ${MASTER_SAFE}/32"
     echo "digital cap: ${DIGITAL_SAFE}/255, playback attenuation: ${PLAYBACK_SAFE} (-6 dB when 0)"
-    echo "AP2 source volume is independently capped at -9 dB by shairport-sync"
+    echo "AP2 source volume is controlled by the pinned shairport-sync configuration"
     echo "run '$0 status' before testing and '$0 disarm' afterwards"
 }
 
 disarm() {
+    hard_mute
     rm -f "$SAFE/armed"
     "$AP2CTL" stop >/dev/null 2>&1 || true
-    hard_mute
     stop_watchdog
-    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
     safe_baseline
     log_action "safe test disarmed"
     echo "AP2 stopped; output hard-muted; safe baseline restored"
@@ -426,7 +484,7 @@ disarm() {
 mute_now() {
     hard_mute
     write_file "$SAFE/tripped" "manual mute" || true
-    rm -f "$SAFE/play.started" "$SAFE/deadline"
+    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline"
     log_action "manual hard mute"
     echo "output hard-muted"
 }
@@ -447,7 +505,7 @@ selftest() {
     echo "running non-audio watchdog selftest"
     hard_mute
     safe_baseline
-    rm -f "$SAFE/armed" "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/armed" "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
     rm -f "$RUN/shairport.pid"
     sleep 10 >/dev/null 2>&1 &
     selftest_pid=$!
@@ -468,10 +526,17 @@ selftest() {
         safe_baseline
         return 1
     fi
-    # This marker is intentionally not accompanied by opening the speaker.
-    write_file "$SAFE/play.started" "$(now)" || true
+    # Exercise a valid priming lease, not an unowned marker that would trip
+    # before the deadline path. This never opens the physical output.
+    if ! audio_reserve; then
+        rm -f "$SAFE/armed"
+        stop_watchdog
+        cleanup_selftest_process
+        hard_mute
+        return 1
+    fi
     sleep 2
-    if [ -f "$SAFE/tripped" ] &&
+    if [ "$(read_file "$SAFE/tripped")" = "watchdog deadline exceeded" ] &&
         [ "$(switch_state 'Ext Spk')" = "off" ] &&
         [ "$(switch_state 'aml audio i2s mute')" = "on" ]; then
         rm -f "$SAFE/armed"
@@ -479,7 +544,7 @@ selftest() {
         cleanup_selftest_process
         hard_mute
         safe_baseline
-        rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+        rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
         log_action "watchdog selftest passed"
         echo "watchdog selftest: PASS (speaker never enabled)"
         return 0
@@ -489,7 +554,7 @@ selftest() {
     cleanup_selftest_process
     hard_mute
     safe_baseline
-    rm -f "$SAFE/play.started" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
     log_action "watchdog selftest failed"
     echo "watchdog selftest: FAIL" >&2
     return 1
@@ -498,6 +563,9 @@ selftest() {
 case "${1:-status}" in
     __watchdog)
         watchdog_loop
+        ;;
+    arm-shared)
+        arm shared
         ;;
     arm)
         arm

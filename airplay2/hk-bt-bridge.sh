@@ -19,11 +19,15 @@ LOG=$RUN/bt-bridge.log
 PCM=${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
 PLAYER_SOCKET=${HK_BT_PLAYER_SOCKET:-/tmp/Requesta01controller}
 PROC_ROOT=${HK_BT_PROC_ROOT:-/proc}
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 active=0
 child=
 
-now() { cut -d. -f1 /proc/uptime 2>/dev/null || echo 0; }
-log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; }
+now() { audio_now; }
+log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; audio_trim_log "$LOG"; }
 heartbeat() { now >"$HEARTBEAT.tmp" && mv "$HEARTBEAT.tmp" "$HEARTBEAT"; }
 
 watchdog_live() {
@@ -95,13 +99,7 @@ ap2_recent_claim() {
     [ "$stamp" -le "$current" ] && [ $((current - stamp)) -lt 8 ]
 }
 
-lock_speaker() {
-    n=0
-    while ! mkdir "$LOCK" 2>/dev/null; do
-        n=$((n + 1)); [ "$n" -lt 30 ] || return 1
-        usleep 100000 2>/dev/null || sleep 1
-    done
-}
+lock_speaker() { audio_lock "$LOCK"; }
 
 run_hook() {
     action=$1
@@ -121,7 +119,7 @@ run_hook() {
     # PCM5121 uses an inverted digital-volume scale: 0 is mute and 207 is
     # 0 dB. Keep the analogue step at the stock -6 dB setting and apply the
     # stock 33-step Master control before the Harman limiter.
-    env HK_AP2_BT=1 HK_AP2_USE_STOCK_PA=1 HK_AP2_MASTER_SAFE="$bt_master" \
+    env HK_AP2_BT=1 HK_AUDIO_TOKEN="${BT_TOKEN:-}" HK_AP2_USE_STOCK_PA=1 HK_AP2_MASTER_SAFE="$bt_master" \
         HK_AP2_DIGITAL_SAFE=207 HK_AP2_PLAYBACK_SAFE=0 "$HOOK" "$action" &
     child=$!
     count=0
@@ -129,7 +127,7 @@ run_hook() {
         heartbeat || return 1
         if [ "$action" = start ]; then
             if ! { [ -f "$SAFE/armed" ] && [ ! -f "$SAFE/tripped" ] &&
-                [ ! -f "$RELEASE" ] && [ ! -f "$RUN/voice-owns" ] &&
+                [ ! -f "$RELEASE" ] && ! audio_voice_pending &&
                 bt_playing; }; then
                 kill "$child" 2>/dev/null || true
                 wait "$child" 2>/dev/null || true
@@ -138,7 +136,7 @@ run_hook() {
                 # It is safe to close and retry only while the watchdog is
                 # healthy and there is no competing speaker owner or trip.
                 if [ -f "$SAFE/armed" ] && [ ! -f "$SAFE/tripped" ] &&
-                   [ ! -f "$RELEASE" ] && [ ! -f "$RUN/voice-owns" ] &&
+                   [ ! -f "$RELEASE" ] && ! audio_voice_pending &&
                    watchdog_live; then
                     return 10
                 fi
@@ -156,32 +154,26 @@ run_hook() {
 
 release_output() {
     [ "$active" = 1 ] || return 0
-    if [ -f "$RUN/voice-owns" ] && [ ! -f "$VOICE_INJECT" ]; then
-        # A voice reply has already claimed the path; it owns any new lease.
-        rm -f "$OWNER" "$HEARTBEAT" "$RELEASE"
-        active=0
-        log 'Bluetooth handed output to voice'
-        return 0
-    else
-        if ! run_hook stop; then
-            "$TEST" mute >/dev/null 2>&1 || true
-            log 'stop hook failed; manual mute latched'
-        fi
+    if ! run_hook stop; then
+        "$TEST" mute >/dev/null 2>&1 || true
+        log 'stop hook failed; manual mute latched'
     fi
-    rm -f "$SAFE/play.started" "$OWNER" "$HEARTBEAT" "$RELEASE"
+    rm -f "$OWNER" "$HEARTBEAT" "$RELEASE"
     active=0
     log 'Bluetooth released output'
 }
 
 cleanup() {
     trap - EXIT HUP INT TERM
-    [ -z "$child" ] || kill -KILL "$child" 2>/dev/null || true
-    if [ "$active" = 1 ]; then
+    if [ -n "$child" ]; then
         "$TEST" mute >/dev/null 2>&1 || true
-        rm -f "$SAFE/play.started" "$OWNER" "$HEARTBEAT" "$RELEASE"
+        kill -TERM "$child" 2>/dev/null || true
+        child=
     fi
+    release_output
     rm -f "$RUN/bt-bridge.pid"
 }
+
 trap cleanup EXIT
 trap 'exit 0' HUP INT TERM
 
@@ -192,7 +184,7 @@ echo "$$" >"$RUN/bt-bridge.pid"
 log "bridge started pid=$$"
 while [ -f "$SAFE/armed" ]; do
     if [ "$active" = 0 ] && [ ! -f "$SAFE/tripped" ] &&
-       [ ! -f "$RELEASE" ] && [ ! -f "$RUN/voice-owns" ] &&
+       [ ! -f "$RELEASE" ] && ! audio_voice_pending &&
        [ ! -s "$SAFE/play.started" ] && ! ap2_recent_claim &&
        watchdog_live; then
         repair_stalled_bluetooth || true
@@ -205,15 +197,17 @@ while [ -f "$SAFE/armed" ]; do
             release_output
         fi
     elif [ ! -f "$SAFE/tripped" ] && [ ! -f "$RELEASE" ] &&
-         [ ! -f "$RUN/voice-owns" ] && [ ! -s "$SAFE/play.started" ] &&
+         ! audio_voice_pending && [ ! -s "$SAFE/play.started" ] &&
          ! ap2_recent_claim && bt_playing; then
         if lock_speaker; then
             if [ ! -f "$SAFE/tripped" ] && [ ! -f "$RELEASE" ] &&
-               [ ! -f "$RUN/voice-owns" ] && [ ! -s "$SAFE/play.started" ] &&
+               ! audio_voice_pending && [ ! -s "$SAFE/play.started" ] &&
                ! ap2_recent_claim; then
+                BT_SEQ=$((${BT_SEQ:-0} + 1))
+                BT_TOKEN="bt-$$-$(now)-$BT_SEQ"
                 heartbeat && printf '%s\n' "$$" >"$OWNER.tmp" && mv "$OWNER.tmp" "$OWNER" && active=1
             fi
-            rmdir "$LOCK" 2>/dev/null || true
+            audio_unlock "$LOCK" 2>/dev/null || true
         fi
         if [ "$active" = 1 ]; then
             if run_hook start; then

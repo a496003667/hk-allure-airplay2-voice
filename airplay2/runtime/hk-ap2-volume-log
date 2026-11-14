@@ -1,9 +1,25 @@
 #!/bin/sh
-
-# Diagnostic hook for shairport's run_this_when_volume_is_set setting.
-# The desired AirPlay volume is passed as the final argument.
-
-LOG=${HK_AP2_RUN:-/tmp/hk-ap2/run}/volume.log
-mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-printf '%s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$*" >>"$LOG" 2>/dev/null || true
-exit 0
+# Last valid volume is a small atomic state file, separate from bounded history.
+RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
+CONF=${HK_AP2_VOLUME_CONF:-${HK_AP2_ROOT:-/tmp/hk-ap2/opt}/etc/ap2/shairport-sync.conf}
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
+mkdir -p "$RUN" || exit 1
+v=
+for argument in "$@"; do v=$argument; done
+range=$(sed -n 's/^[[:space:]]*volume_range_db[[:space:]]*=[[:space:]]*\([0-9][0-9]*\);.*/\1/p' "$CONF")
+max=$(sed -n 's/^[[:space:]]*volume_max_db[[:space:]]*=[[:space:]]*\(-[0-9.][0-9.]*\);.*/\1/p' "$CONF")
+stamp=$(audio_now) || exit 1
+state=$(awk -v v="$v" -v r="$range" -v m="$max" -v t="$stamp" 'BEGIN {
+    if (v !~ /^-?[0-9]+([.][0-9]+)?$/ || r !~ /^[0-9]+$/ || m !~ /^-[0-9]+([.][0-9]+)?$/) exit 1;
+    if (r<1 || r>150 || m>0 || m < -96) exit 1;
+    if (v == -144) {printf "%s -144 -144 1\n", t; exit}
+    if (v < -30 || v > 0) exit 1;
+    printf "%s %.6f %.6f 0\n", t, v, m-r+(v+30)*r/30;
+}') || exit 1
+printf '%s\n' "$state" >"$RUN/volume.state.$$" &&
+    mv "$RUN/volume.state.$$" "$RUN/volume.state" || exit 1
+printf '%s %s\n' "$stamp" "$v" >>"$RUN/volume.log"
+audio_trim_log "$RUN/volume.log" 32768

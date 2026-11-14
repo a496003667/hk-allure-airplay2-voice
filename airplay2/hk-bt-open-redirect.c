@@ -48,6 +48,7 @@ static void mix_logf(const char *format, ...)
     int fd = open("/tmp/hk-ap2/run/bt-voice-mix.log",
                   O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
+    if (lseek(fd, 0, SEEK_END) > 65536 && ftruncate(fd, 0) != 0) { close(fd); return; }
     (void)write(fd, message, (size_t)n);
     (void)write(fd, "\n", 1);
     close(fd);
@@ -117,6 +118,13 @@ static snd_pcm_sframes_t mix_voice(snd_pcm_t *pcm, const void *data,
     char path[256];
     size_t voice_frames = 0;
     int active = marker_exists("active");
+    if (marker_exists("abort")) {
+        close_voice();
+        marker_remove("start");
+        marker_remove("abort");
+        marker_create("aborted");
+        mix_logf("aborted voice generation");
+    }
 
     if (!active && duck_gain >= 0.999f && voice_fd < 0)
         return real_write(pcm, data, frames);

@@ -26,21 +26,18 @@ PCM_STATUS=${HK_LIGHTS_PCM_STATUS:-$PCM_STATUS}
 PROC_ROOT=${HK_LIGHTS_PROC_ROOT:-/proc}
 PIDFILE=$D/lights.pid
 LOG=$D/lights.log
+DISABLE=${HK_LIGHTS_DISABLE_FILE:-/vendor/hk-lights/disable}
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../airplay2/hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 
 log() {
     echo "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null) $*" >>"$LOG"
-    size=$(wc -c <"$LOG" 2>/dev/null || echo 0)
-    if [ "$size" -gt 65536 ]; then
-        tail -c 16384 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
-    fi
+    audio_trim_log "$LOG" 65536
 }
 
-voice_owns() {
-    stamp=$(sed -n 1p "$RUN/voice-owns" 2>/dev/null)
-    case "$stamp" in ''|*[!0-9]*) return 1 ;; esac
-    now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
-    [ $((now - stamp)) -lt 300 ]
-}
+voice_owns() { audio_voice_pending; }
 
 airplay_playback_active() {
     # Shairport keeps the PCM running (feeding silence) for the whole active
@@ -86,7 +83,9 @@ broker_listening() {
 }
 
 update_forward_flag() {
-    if [ ! -f "$D/disable" ] && sender_connected && broker_listening &&
+    if [ ! -f "$DISABLE" ] && [ ! -f "$D/disable" ] &&
+       [ "$(cat "$RUN/media-source" 2>/dev/null)" != bluetooth ] &&
+       sender_connected && broker_listening &&
        [ ! -f "$RUN/bt-owner.pid" ]; then
         if [ -d "$RUN" ] && [ ! -f "$RUN/buttons.forward" ]; then
             : >"$RUN/buttons.forward" && log "buttons -> AirPlay sender"
@@ -138,13 +137,13 @@ run() {
     echo $$ >"$PIDFILE"
     owned=0
     idle=0
-    last_volume=$(tail -n 1 "$RUN/volume.log" 2>/dev/null)
+    last_volume=$(cut -d' ' -f1,2 "$RUN/volume.state" 2>/dev/null)
     trap '[ "$owned" = 1 ] && release; rm -f "$PIDFILE" "$RUN/buttons.forward"; log stopped; exit 0' INT TERM
     log "started pid=$$"
     while :; do
         sleep 1
         update_forward_flag
-        if [ -f "$D/disable" ]; then
+        if [ -f "$DISABLE" ] || [ -f "$D/disable" ]; then
             [ "$owned" = 1 ] && { release; owned=0; }
             continue
         fi
@@ -168,7 +167,7 @@ run() {
             fi
         fi
 
-        volume=$(tail -n 1 "$RUN/volume.log" 2>/dev/null)
+        volume=$(cut -d' ' -f1,2 "$RUN/volume.state" 2>/dev/null)
         if [ -n "$volume" ] && [ "$volume" != "$last_volume" ]; then
             last_volume=$volume
             notify_volume "${volume#* }"
@@ -177,7 +176,7 @@ run() {
 }
 
 boot() {
-    [ -f /vendor/hk-lights/disable ] && exit 0
+    [ -f "$DISABLE" ] && exit 0
     i=0
     while [ "$i" -lt 300 ] && [ ! -x "$REQUEST" ]; do
         sleep 5

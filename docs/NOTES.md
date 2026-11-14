@@ -1,6 +1,6 @@
 # 技术笔记与踩坑记录
 
-在一台 Harman Kardon Allure 上实测得到的结论。别的固件版本可能不同，动手前先只读核查。
+包含历史实测与当前实现说明；2026-11-14 修复候选尚未部署，验收状态以 [AUDIT-REPAIRS-2026-11-14.md](AUDIT-REPAIRS-2026-11-14.md) 为准。此前在一台 Harman Kardon Allure 上实测。别的固件版本可能不同，动手前先只读核查。
 
 ## 硬件与系统
 
@@ -14,7 +14,7 @@
 
 - 蓝牙、AirPlay 和语音播报最终都进入原厂 `harmandsp`：它先做左右相加、约 300 Hz 分频和低音/EQ 处理，再写 PCM512x。ALSA `Master` 是原厂播放器的 softvol，对 AirPlay 和语音响度没有作用。
 - 只开 `Ext Spk`、解除 I2S 静音还不够，还要解除**原厂功放静音**：用 `LD_PRELOAD` 预加载一个小库再启动原厂 `apple_remote`，它的构造函数会调用原厂的 `Snd_Ctrl airplay to mute 0/1`。
-- **无爆音的打开顺序**（和用户逐步对听确认）：
+- **防爆音的目标打开顺序**（旧版曾逐步对听，本次完整生命周期仍待试听）：
   1. 数字音量先设 0，等 DAC 静音斜坡完成，随后解除 I2S 静音并等待数据时钟；
   2. 数字静音保持不变，解除一次原厂功放静音并打开 `Ext Spk`；
   3. 等功放稳定、复核 PCM 时钟仍由当前来源持有，再恢复数字音量（DAC
@@ -41,11 +41,11 @@
 - 修正 get_info plist 里多出的 `</dict>`（严格的 plist 解析会得到空 plist）。
 - 没有会话时的远程控制回退；事件 socket 接收 2 秒超时。
 - Shairport 5.6 是 soft-float 构建，原厂 `harmandsp` 是 hard-float 插件，动态加载器不能把两者直接放进一个进程。因此 Shairport 先输出固定 S32_LE/48 kHz PCM 到 `/tmp/hk-ap2/run/airplay-pcm.fifo`，再由 hard-float `hk-ap2-dsp-bridge` 使用原厂 ALSA 打开 DSP。
-- `hk-ap2-dsp-bridge` 只在 FIFO 有数据时打开声卡，约 1 秒没有新数据就关闭；它退出后由 AP2 supervisor 拉起，启动和关闭阶段仍有独立 watchdog 与硬静音保护。
+- `hk-ap2-dsp-bridge` 按受监督租约维持静音时钟；hold/trip 阻止新开声，已打开的时钟等淡出与物理静音完成、租约释放后才关闭。supervisor 会恢复桥进程，独立 watchdog 控制硬静音。
 - 44.1 kHz 源会在 Shairport 内重采样到 48 kHz，因为原始 pipe 没有格式变更通知；这样桥进程始终只处理一种确定的格式。
 - 另一台设备 pair-setup 时立即让出旧会话，解决 iPhone 和 Mac 互相接管时的爆音。最初 pair-verify 也会触发，但后台做 pair-verify 的设备会把正在播放的发送端踢掉，已去掉。抢占、TEARDOWN、播放中断线都会以 `hk:` 开头写进 shairport.log。
 - 告诉发送端的缓冲区（audioBufferSize）从 8 MB 改成 2 MB：发送端会把它填满，原来播放几分钟后 Shairport 会多占约 8 MB 内存。
-- `/tmp/hk-ap2/run/release-dac` 存在时，现有 Shairport 补丁会阻止 ALSA 自动重开。改用 pipe 后，桥进程在数据停止约 1 秒后自行关闭 DSP，语音助手主要依据这个关闭状态接管声卡。
+- `/tmp/hk-ap2/run/release-dac` 存在时，现有 Shairport 补丁会阻止 ALSA 自动重开。改用 pipe 后，桥进程依据播放租约维持或释放 DSP；语音助手须先关闭输出、释放租约，再等声卡关闭后接管。
 - 已知现象：AirPlay 重启后，Mac 不会主动重发音量，手动断开再重连一次就好。
 
 ## 按键与灯效
@@ -59,7 +59,7 @@
 
 - 唤醒：原厂 `asr_tts` 的 Amazon 本地唤醒词 "Alexa"；没登录 Alexa 时，它也会照常点亮 LISTENING 灯效。
 - 录音：给 `/tmp/RequestASRTTS` 发 `recordFileStart:<路径>` / `recordFileStop`，录成 44.1 kHz 双声道 WAV，较响的那个声道是麦克风。录音时写的是 `<路径>.swp`，停止后才改名。
-- **坑 1**：唤醒后 `asr_tts` 要过好几秒才响应新的录音请求，问题的开头会被截掉。解决办法是一直预录（放在 tmpfs，每 20 秒轮换），唤醒后从预录里截取。
+- **坑 1**：唤醒后 `asr_tts` 要过好几秒才响应新的录音请求，问题的开头会被截掉。解决办法是一直预录（放在 tmpfs，默认每 10 秒轮换），唤醒后从预录里截取。
 - **坑 2**：`asr_tts` 在**没有录音时收到 `recordFileStop` 会崩溃**，随后被重新拉起。循环触发会把内存耗尽，低内存杀手会连 AirPlay 和原厂进程一起杀掉。所以只对仍在增长的 `.swp` 发送 stop，并给预录文件设了 2 倍轮换大小的上限。
 - 判断开口：预加重后计算 100 ms 帧能量，阈值随底噪调整（约 `floor*1.8+40`）；截取音频时从开口处往回找到不短于 0.2 秒的停顿，避免截掉紧跟在 "Alexa" 后面的话。
 - 识别：百度短语音标准版（dev_pid 1537）。试过百度极速版、远场模型 1936（账号无权限）、谱减法降噪、硅基流动 SenseVoice，在这台机器上都没有稳定的提升。
@@ -74,8 +74,8 @@
 ## 内存
 
 - 正常空闲约 18–30 MB（按 MemFree 算，页缓存多时会显得偏低）。
-- 语音循环 `oom_score_adj=15`，AirPlay 是 11，原厂进程是 0：内存紧张时先杀语音助手。
-- 低内存杀手（lowmemorykiller）只在空闲内存和文件缓存**同时**低于 6 MB 时才会杀 `oom_score_adj` 为 15 的语音循环。语音监护进程每 5 秒检查一次，两者之和低于 24 MB 时，把内存快照写进 `/tmp/hk-voice/mem.log`。
+- 当前语音循环/监护进程 `oom_score_adj=5`，AP2 可选进程为 11，原厂进程通常为 0。都保留正数；这些值不能保证“语音一定先于 AirPlay 被回收”。旧版 15 的描述不再适用。
+- 设备采用分档 lowmemorykiller，不能套用单一 6 MB 阈值解释所有回收。语音监护每 5 秒观察内存，顺序执行网络阶段以降低峰值；AP2 资源保护器单独检查余量。日志原 inode 轮转，最后有效音量独立保存在 `volume.state`。
 - 大模型流式回答时，父进程合成 TTS、子进程同时读大模型，TLS 与音频缓冲的峰值会叠加。Allure 曾在回答已经生成、准备 TTS 时被 LMK 以 `rc=137` 杀掉，表现为“Alexa 听懂了但没有出声”。
 - `hk-voice` 用 `MemFree + Cached - Shmem` 估算可回收内存；低于 64 MiB 时关闭流式重叠，先完成大模型回答并释放 ModelScope 的 HTTP/TLS 句柄，再单独请求百度 TTS。可用 `HK_VOICE_SEQUENTIAL=1`、`HK_VOICE_STREAM=0` 强制顺序模式，或用 `HK_VOICE_STREAM_MIN_KIB` 调整门槛。
 - 预录每 10 秒轮换一次，内存盘里最多约 1.7 MB。

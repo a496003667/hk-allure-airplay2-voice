@@ -26,6 +26,10 @@ AP2_OOM_SCORE_ADJ=${HK_AP2_OOM_SCORE_ADJ:-700}
 DEBUG=${HK_AP2_DEBUG:-0}
 
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$RUN/dbus/system_bus_socket"
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 
 # NQPTP 1.2.5 (smi11) answers on UDP 9000 once its shared memory is set up.
 # Shairport 5.6 exits if it starts first, so wait for the port and give NQPTP
@@ -65,18 +69,7 @@ check_resources() {
     fi
 }
 
-rotate_log() {
-    log=$1
-    [ -f "$log" ] || return 0
-    size=$(wc -c <"$log" 2>/dev/null || echo 0)
-    case "$size" in
-        ''|*[!0-9]*) size=0 ;;
-    esac
-    if [ "$size" -gt 131072 ]; then
-        rm -f "$log.1"
-        mv "$log" "$log.1" 2>/dev/null || :
-    fi
-}
+rotate_log() { audio_trim_log "$1" 131072; }
 
 expected_comm() {
     case "$1" in
@@ -347,12 +340,14 @@ start_guard() {
 }
 
 stop_all() {
-    stop_guard
-    stop_kind mosquitto
-    stop_kind shairport
+    # Close the AP2 output on a running clock. The hook preserves a different
+    # Bluetooth/voice owner; optional service recycling must not revoke it.
     if [ -x "$ROOT/hk-ap2-audio-hook.sh" ]; then
-        "$ROOT/hk-ap2-audio-hook.sh" mute >/dev/null 2>&1 || true
+        "$ROOT/hk-ap2-audio-hook.sh" stop >/dev/null 2>&1 || true
     fi
+    stop_guard
+    stop_kind shairport
+    stop_kind mosquitto
     stop_kind nqptp
     stop_kind avahi
     stop_kind dbus

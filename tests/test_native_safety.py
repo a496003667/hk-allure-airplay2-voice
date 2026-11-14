@@ -16,6 +16,9 @@ class IpcTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix='hk-ipc-')
         cls.binary = Path(cls.tmp.name) / 'request'
+        if os.environ.get('HK_IPC_TEST_BINARY'):
+            cls.binary = Path(os.environ['HK_IPC_TEST_BINARY'])
+            return
         subprocess.run(['cc', '-std=c99', '-D_POSIX_C_SOURCE=200809L', '-O2',
                         str(ROOT / 'tools/hk-unix-request-raw.c'), '-o', str(cls.binary)],
                        check=True, capture_output=True)

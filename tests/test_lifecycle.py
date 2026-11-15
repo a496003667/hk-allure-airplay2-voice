@@ -38,8 +38,12 @@ import json,os,sys
 p=os.environ['MIXER_STATE']; a=sys.argv[3:]; k=a[1].replace('numid=','')
 s=json.load(open(p))
 if a[0] in ('sset','cset'):
- s[k]=a[2]; json.dump(s,open(p,'w')); open(os.environ['EVENTS'],'a').write(k+' '+a[2]+'\\n')
-elif a[0]=='cget': print('  : values='+s[k])
+ s[k]=a[2]; temporary=p+'.'+str(os.getpid()); json.dump(s,open(temporary,'w')); os.replace(temporary,p)
+ open(os.environ['EVENTS'],'a').write(k+' '+a[2]+'\\n')
+elif a[0]=='cget':
+ if k=='2' and os.environ.get('ANALOG_PREVIOUS')==s[k]:
+  open(os.environ['ANALOG_READ'],'w').close()
+ print('  : values='+s[k])
 elif k=='Master': print('Front Left: '+s[k])
 else: print('Front Left: Playback ['+s[k]+']')
 ''')
@@ -287,6 +291,127 @@ mx_get() { "$HK_AP2_AMIXER" -c 0 sget "$1" | sed -n 's/.*\\[\\(on\\|off\\)\\].*/
         self.assertFalse((self.run / 'bt-release').exists())
         self.assertFalse((self.run / 'ap2-claim').exists())
         self.assertEqual(self.events.read_text(), '')
+
+    def check_analog_handoff(self, source):
+        previous = '1,1' if source == 'bluetooth' else '0,0'
+        target = '0,0' if source == 'bluetooth' else '1,1'
+        state = json.loads((self.root / 'mixer').read_text())
+        state['2'] = previous
+        (self.root / 'mixer').write_text(json.dumps(state))
+        (self.run / 'shairport.pid').write_text(str(os.getpid()))
+        (self.run / 'dsp-bridge.pid').write_text('42')
+        if source == 'bluetooth':
+            (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
+            (self.run / 'bt-heartbeat').write_text('100')
+            (self.root / 'proc/42/comm').write_text('a01controller\n')
+        else:
+            (self.root / 'proc/42/comm').write_text('hk-ap2-dsp-bridge\n')
+        analog_read = self.root / 'analog-read'
+        self.executable('sleep', '#!/bin/sh\nexec /bin/sleep 0.02\n')
+        self.executable('usleep', '''#!/bin/sh
+if [ "$1" = 300000 ]; then
+ i=0
+ while [ ! -f "$ANALOG_READ" ] && [ "$i" -lt 150 ]; do /bin/sleep 0.02; i=$((i + 1)); done
+ /bin/sleep 0.4
+else /bin/sleep 0.02
+fi
+''')
+        env = self.env | {
+            'HK_AP2_DIGITAL_SAFE': '192', 'HK_AP2_PLAYBACK_SAFE': '1',
+            'HK_AP2_BT_DIGITAL_SAFE': '207', 'HK_AP2_BT_PLAYBACK_SAFE': '0',
+            'HK_AP2_MAX_PLAY_SECONDS': '0', 'ANALOG_PREVIOUS': previous,
+            'ANALOG_READ': str(analog_read),
+        }
+        watchdog = subprocess.Popen(['sh', str(REPO / 'airplay2/runtime/hk-ap2-safe-test'), '__watchdog'],
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stop = threading.Event()
+        def advance_clock():
+            while not stop.wait(.01):
+                if (self.safe / 'lease').exists():
+                    clock = self.root / 'clock-next'
+                    clock.write_text('101.00 0.00\n')
+                    clock.replace(self.root / 'clock')
+                    if source == 'bluetooth':
+                        beat = self.run / 'bt-heartbeat-next'
+                        beat.write_text('101')
+                        beat.replace(self.run / 'bt-heartbeat')
+                    return
+        thread = threading.Thread(target=advance_clock)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 3
+            while (self.safe / 'watchdog.pid').read_text().strip() != str(watchdog.pid):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            hook_env = env | {'HK_AP2_PLAYBACK_SAFE': target[0],
+                              'HK_AP2_DIGITAL_SAFE': '207' if source == 'bluetooth' else '192'}
+            if source == 'bluetooth': hook_env['HK_AP2_BT'] = '1'
+            result = subprocess.run(['sh', str(HOOK), 'start'], env=hook_env,
+                                    capture_output=True, text=True, timeout=12)
+            details = result.stderr + '\n' + (self.run / 'hook.log').read_text()
+            if (self.safe / 'actions.log').exists(): details += '\n' + (self.safe / 'actions.log').read_text()
+            self.assertEqual(result.returncode, 0, details)
+            self.assertTrue(analog_read.exists(), 'watchdog must inspect the old step before the hook changes it')
+            self.assertFalse((self.safe / 'tripped').exists(), details)
+            self.assertTrue((self.safe / 'lease').read_text().endswith('active\n'))
+            self.assertEqual(json.loads((self.root / 'mixer').read_text())['2'], target)
+
+            # The same mismatch after activation must still latch a fault,
+            # mute, and leave analogue gain untouched rather than toggling it.
+            self.events.write_text('')
+            state = json.loads((self.root / 'mixer').read_text())
+            state['2'] = previous
+            temporary = self.root / 'tampered-mixer'
+            temporary.write_text(json.dumps(state))
+            temporary.replace(self.root / 'mixer')
+            deadline = time.monotonic() + 4
+            while not (self.safe / 'tripped').exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            self.assertEqual((self.safe / 'tripped').read_text().strip(), 'analog baseline changed')
+            self.assertFalse(any(s.startswith('2 ') for s in self.events.read_text().splitlines()))
+        finally:
+            stop.set()
+            thread.join(2)
+            watchdog.terminate()
+            watchdog.wait(4)
+
+    def test_bluetooth_priming_accepts_airplay_step_only_before_muted_transition(self):
+        self.check_analog_handoff('bluetooth')
+
+    def test_airplay_priming_accepts_bluetooth_step_only_before_muted_transition(self):
+        self.check_analog_handoff('airplay')
+
+    def test_analog_priming_exception_rejects_audible_or_unknown_baselines(self):
+        for digital, speaker, analog in (('100,100', 'off', '1,1'),
+                                         ('0,0', 'on', '1,1'),
+                                         ('0,0', 'off', '2,2')):
+            with self.subTest(digital=digital, speaker=speaker, analog=analog):
+                for name in ('lease', 'play.started', 'tripped'):
+                    (self.safe / name).unlink(missing_ok=True)
+                (self.safe / 'watchdog.pid').write_text(str(os.getpid()))
+                (self.safe / 'watchdog.heartbeat').write_text('100')
+                (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
+                (self.run / 'bt-heartbeat').write_text('100')
+                state = json.loads((self.root / 'mixer').read_text())
+                state.update({'1': digital, '2': analog, 'Ext Spk': speaker})
+                (self.root / 'mixer').write_text(json.dumps(state))
+                self.events.write_text('')
+                self.assertEqual(self.call('reserve', env=self.env | {'HK_AP2_BT': '1'}).returncode, 0)
+                env = self.env | {'HK_AP2_DIGITAL_SAFE': '192', 'HK_AP2_PLAYBACK_SAFE': '1',
+                                  'HK_AP2_BT_PLAYBACK_SAFE': '0', 'HK_AP2_MAX_PLAY_SECONDS': '0'}
+                watchdog = subprocess.Popen(['sh', str(REPO / 'airplay2/runtime/hk-ap2-safe-test'), '__watchdog'],
+                                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    deadline = time.monotonic() + 4
+                    while not (self.safe / 'tripped').exists():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.02)
+                    self.assertEqual((self.safe / 'tripped').read_text().strip(), 'analog baseline changed')
+                    self.assertFalse(any(s.startswith('2 ') for s in self.events.read_text().splitlines()))
+                finally:
+                    watchdog.terminate()
+                    watchdog.wait(4)
 
     def test_supervisor_closes_output_before_dsp_process(self):
         source=(REPO/'airplay2/hk-ap2-prodctl').read_text()

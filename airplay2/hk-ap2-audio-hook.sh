@@ -371,6 +371,8 @@ case "${1:-}" in
         usleep "$warmup" 2>/dev/null || sleep 1
         output_guard_ok || start_failed "output guard lost during amplifier warm-up"
         wait_for_pcm_clock 5 || start_failed "audio clock lost during amplifier warm-up"
+        [ "$(mixer_values 2)" = "$PLAYBACK,$PLAYBACK" ] ||
+            start_failed "Playback Volume changed during amplifier warm-up"
         mixer_cset 1 "$DIGITAL,$DIGITAL" || start_failed "digital fade-in failed"
         [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] ||
             start_failed "digital fade-in verification failed"

@@ -120,13 +120,38 @@ grep hk-bt /proc/$pid/maps
 - 机身按键在蓝牙时保留原厂路径；AirPlay 接管后走发送端，AirPlay 语音交接期间仍可调发送端音量。已生成的播报片段不会因为滑块改变而重新合成，实时响度效果仍需听测。
 - 安装必须使用发布清单与受控依赖重载；更换 `.so` 文件不会自动改变已经映射它的原厂播放器。见 [BUILD-AND-UPDATE.md](BUILD-AND-UPDATE.md)。
 
-本分支尚未部署；下列历史记录不能替代新的实机验收。
+本分支已部署到作者设备；2026-11-15 的实际验收和随后暴露的问题见下文，历史记录不能替代当前版本的实机验收。
 
 ## 验证状态
 
-离线测试已确认私有配置能加载原厂 DSP、打开 `pcmC0D0p`，且测试期间
-`Ext Spk=off`、`aml audio i2s mute=on`、`Auto Mute=on`。真实的手机蓝牙音量、
-暂停/恢复、切歌、AirPlay 接管和低音听感仍需在用户在场时验证。
+2026-11-15 用户确认蓝牙启动出声、手机音量归零与恢复、暂停约三秒后恢复均正常，
+无爆音或音量突增；蓝牙音乐中唤醒语音助手，回复清楚，音乐正常恢复，无爆音。
+这轮先修复了新租约在数字静音阶段被旧模拟增益误触发保护的竞态。
+
+随后切换到测试页面时，原厂播放器保留了进入 `XRUN` 的 PCM，watchdog 将其误判为
+持续故障并锁存静音；连 500 Hz 参考音也无法听到，因此这次结果不能判断低音单元。
+新的 shell 修正区分可信蓝牙暂停与真正的 owner/心跳故障：暂停立即静音并释放旧租约，
+等待手机手动播放建立新的 `RUNNING` PCM，再通过完整保护序列打开输出。
+暂停后即使原厂状态仍为 `play`，也不会据此发送自动续播命令。
+错误 owner、失效心跳、未知 PCM 状态和维护静音仍保留故障保护。
+
+最新 **125 项 Linux/BusyBox 测试通过**，覆盖 watchdog 与 bridge 先后发现 XRUN、
+新 PCM 恢复、错误 owner 锁存以及断开重连。修正已完成受控部署、事务提交和精确版本核验，
+用户随后确认参考音两次都能听到、无啪声；设备核对播放结束后的可信 XRUN 正常释放租约，未锁存故障。
+随后用户确认 500、200、120、80、60 Hz 各段均能听到，低频有振动；播放结束未触发故障锁存。
+用户随后确认熟悉音乐的低频明显改善、听感正常。该听测确认低频输出存在，不是对具体单元或功放的独立测量；单元完整健康、真实来源切换及长测仍待验证。
+本轮不修改 C 二进制、DSP 配置或音量曲线；AirPlay 仍为 −30…−6 dB。
+
+离线测试还确认私有配置能加载原厂 DSP、打开 `pcmC0D0p`，且测试期间
+`Ext Spk=off`、`aml audio i2s mute=on`、`Auto Mute=on`。
+
+English: Bluetooth startup, phone mute/restore, pause/resume and voice reply/music restoration
+passed user-present listening tests without reported pops or gain jumps. Switching to test tones
+later exposed a persistent mute after a trusted stock PCM underrun. The shell repair is deployed
+and exactly verified; it mutes and releases the old lease, waits for manually resumed PCM, and
+retains protection against wrong owners, stale heartbeats and unknown states. All 125 Linux/BusyBox
+tests pass. Two reference-tone replays were audible without pops; stopped PCM released its lease without a persistent fault latch.
+The user also heard every 500/200/120/80/60 Hz segment and felt low-frequency vibration, with no persistent fault after playback. This establishes low-frequency output, not a measurement of an individual driver or amplifier. The user subsequently reported clearly improved, normal-sounding bass in familiar music. Full driver health, real source switching and sustained operation remain unverified. Neither the DSP configuration nor the AirPlay −30…−6 dB curve changed.
 
 2026-11-08 的整机硬静音测试又向实际私有路由送入 6 秒全零 S16 采样：PCM 进入
 `RUNNING`，进程映射了 `libasound_module_pcm_harmandsp.so`，插件日志为

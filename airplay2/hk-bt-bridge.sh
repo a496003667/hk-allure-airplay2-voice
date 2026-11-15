@@ -13,6 +13,7 @@ TEST=$ROOT/bin/hk-ap2-safe-test
 OWNER=$RUN/bt-owner.pid
 HEARTBEAT=$RUN/bt-heartbeat
 RELEASE=$RUN/bt-release
+WAIT_PCM=$RUN/bt-wait-pcm
 VOICE_INJECT=$RUN/voice-inject/active
 LOCK=$RUN/speaker.lock
 LOG=$RUN/bt-bridge.log
@@ -48,6 +49,12 @@ bt_source_playing() {
     watchdog_live || return 1
     [ -x "$REQ" ] && [ -S "$PLAYER_SOCKET" ] || return 1
     data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+    if printf '%s' "$data" | grep -q '"mode":"-1"'; then
+        # A confirmed disconnect ends the paused stream's generation. A
+        # subsequent connection may use the initial unowned-PCM repair.
+        rm -f "$WAIT_PCM"
+        return 1
+    fi
     printf '%s' "$data" | grep -q '"mode":"41"' || return 1
     printf '%s' "$data" | grep -q '"status":"play"' || return 1
     printf '%s' "$data" | grep -q '"mute":"0"' || return 1
@@ -72,6 +79,13 @@ repair_stalled_bluetooth() {
     # reaches /tmp/bt-avk-fifo. Rebuild that transport with its own pause and
     # resume commands. Keep the speaker path closed throughout.
     [ "${HK_BT_STALL_REPAIR:-1}" = 1 ] || return 1
+    [ ! -f "$WAIT_PCM" ] || return 1
+    # A retained XRUN PCM is also normal after a phone pause. Never send
+    # pause/resume based on stale "play" metadata in that state.
+    case "$(sed -n '1p' "$PCM" 2>/dev/null)" in
+        closed|'state: closed'|'state: CLOSED') ;;
+        *) return 1;;
+    esac
     current=$(now)
     bt_source_playing || { stall_since=; return 1; }
     bt_pcm_live && { stall_since=; return 1; }
@@ -154,6 +168,12 @@ run_hook() {
 
 release_output() {
     [ "$active" = 1 ] || return 0
+    # After any established stream stops, wait for a new valid PCM rather
+    # than resuming a phone that may have deliberately paused playback.
+    if ! { printf '%s\n' "${BT_TOKEN:-}" >"$WAIT_PCM.tmp" && mv "$WAIT_PCM.tmp" "$WAIT_PCM"; }; then
+        "$TEST" mute >/dev/null 2>&1 || true
+        log 'could not record Bluetooth pause; manual mute latched'
+    fi
     if ! run_hook stop; then
         "$TEST" mute >/dev/null 2>&1 || true
         log 'stop hook failed; manual mute latched'
@@ -191,7 +211,7 @@ while [ -f "$SAFE/armed" ]; do
     fi
     if [ "$active" = 1 ]; then
         heartbeat || { "$TEST" mute >/dev/null 2>&1 || true; break; }
-        if [ -f "$SAFE/tripped" ] || [ -f "$RELEASE" ] ||
+        if [ -f "$SAFE/tripped" ] || [ -f "$RELEASE" ] || [ -f "$WAIT_PCM" ] ||
            [ ! -s "$SAFE/play.started" ] ||
            ! bt_playing; then
             release_output
@@ -203,6 +223,7 @@ while [ -f "$SAFE/armed" ]; do
             if [ ! -f "$SAFE/tripped" ] && [ ! -f "$RELEASE" ] &&
                ! audio_voice_pending && [ ! -s "$SAFE/play.started" ] &&
                ! ap2_recent_claim; then
+                rm -f "$WAIT_PCM" || { audio_unlock "$LOCK"; "$TEST" mute >/dev/null 2>&1 || true; break; }
                 BT_SEQ=$((${BT_SEQ:-0} + 1))
                 BT_TOKEN="bt-$$-$(now)-$BT_SEQ"
                 heartbeat && printf '%s\n' "$$" >"$OWNER.tmp" && mv "$OWNER.tmp" "$OWNER" && active=1

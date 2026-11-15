@@ -303,6 +303,47 @@ watchdog_loop() {
                         airplay) [ "$pcm_pid" = "$(read_file "$RUN/dsp-bridge.pid")" ] && pcm_ok=1;;
                     esac
                 fi
+                if [ "$pcm_ok" = 0 ] && [ "$lease_source" = bluetooth ]; then
+                    clock_token=$lease_token
+                    # Source stop and lease replacement can race this sample.
+                    # Re-read before acting on a previous generation's PCM.
+                    if ! audio_read_lease; then
+                        hard_mute
+                        sleep 1
+                        continue
+                    fi
+                    if [ "$lease_source" != bluetooth ] || [ "$lease_token" != "$clock_token" ] ||
+                       [ "$lease_phase" != active ]; then
+                        sleep 1
+                        continue
+                    fi
+                    if audio_bt_bridge_live && [ "$lease_token" = "$clock_token" ] &&
+                       audio_bt_clock_stopped; then
+                        # Revoke through the bridge's serialized stop hook.
+                        # The physical path closes immediately; the next
+                        # manual stream must earn a new lease and full guard.
+                        if ! write_file "$RUN/bt-wait-pcm" "$clock_token"; then
+                            write_file "$SAFE/tripped" "Bluetooth recovery marker failed" || true
+                        fi
+                        hard_mute
+                        log_action "Bluetooth PCM stopped; hard mute, awaiting a fresh clock"
+                        sleep 1
+                        continue
+                    fi
+                    # A brief underrun may already have recovered. Preserve
+                    # protection without latching a fault from an old sample.
+                    if ! audio_read_lease; then
+                        hard_mute
+                        sleep 1
+                        continue
+                    fi
+                    if [ "$lease_source" != bluetooth ] || [ "$lease_token" != "$clock_token" ] ||
+                       [ "$lease_phase" != active ]; then
+                        sleep 1
+                        continue
+                    fi
+                    audio_bt_valid && pcm_ok=1
+                fi
                 if [ "$pcm_ok" = 0 ]; then
                     write_file "$SAFE/tripped" "PCM owner or clock lost" || true
                     hard_mute
@@ -372,9 +413,26 @@ watchdog_loop() {
 
             playback="$(mixer_values 2)"
             if [ "$playback" != "$playback_safe" ]; then
-                write_file "$SAFE/tripped" "analog baseline changed" || true
-                hard_mute
-                log_action "analog baseline changed; muted without switching gain"
+                # The hook reserves a priming lease before changing gain and
+                # waits for our heartbeat. The previous source's analogue
+                # step is still present during that acknowledgement. Permit
+                # only the two known steps, while both independent output
+                # gates are silent; active playback still requires its exact
+                # baseline. Never switch analogue gain from this watchdog.
+                analog_transition=0
+                if [ "$lease_phase" = priming ] &&
+                   [ "$(mixer_values 1)" = "0,0" ] &&
+                   [ "$(switch_state 'Ext Spk')" = off ]; then
+                    case "$playback" in 0,0|1,1) analog_transition=1;; esac
+                fi
+                # The hook can finish its muted baseline while we sample the
+                # gates. Re-read before latching a fault from an old value.
+                if [ "$analog_transition" = 0 ] &&
+                   [ "$(mixer_values 2)" != "$playback_safe" ]; then
+                    write_file "$SAFE/tripped" "analog baseline changed" || true
+                    hard_mute
+                    log_action "analog baseline changed; muted without switching gain"
+                fi
             fi
         fi
         sleep 1

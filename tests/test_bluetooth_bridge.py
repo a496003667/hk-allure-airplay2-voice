@@ -65,6 +65,8 @@ if [ "$1" = start ]; then
   . "$HK_AUDIO_COMMON"
   HK_AP2_BT=1
   audio_reserve || exit 1
+  lease_phase=active
+  audio_write_lease || exit 1
 else
   rm -f "$HK_AP2_RUN/safe/play.started" "$HK_AP2_RUN/safe/lease"
 fi
@@ -159,6 +161,110 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
         self.assertLess(events.index('onepause'), events.index('resume'))
         self.assertLess(events.index('resume'), events.index('start'))
         self.assertTrue((self.run / 'bt-owner.pid').exists())
+
+    def clock_recovery_watchdog(self):
+        mixer = self.base / 'clock-mixer'
+        self.executable(mixer, '''#!/bin/sh
+echo "$*" >>"$MOCK_MIXER_LOG"
+case "$*" in
+ *"sget Master"*) echo 'Front Left: 4';;
+ *"cget numid=1"*) echo '  : values=207,207';;
+ *"cget numid=2"*) echo '  : values=0,0';;
+esac
+''')
+        env = self.env | {'HK_AP2_AMIXER': str(mixer),
+                          'MOCK_MIXER_LOG': str(self.base / 'clock-mixer.log'),
+                          'HK_AP2_MAX_PLAY_SECONDS': '0', 'HK_AP2_PLAYBACK_SAFE': '1',
+                          'HK_AP2_BT_PLAYBACK_SAFE': '0'}
+        return self.launch(['sh', str(WATCHDOG), '__watchdog'], env)
+
+    def check_clock_recovery(self, watchdog_first):
+        self.state('play')
+        bridge = self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: (self.safe / 'lease').exists()
+                   and (self.safe / 'lease').read_text().endswith('active\n'))
+        old_token = (self.safe / 'lease').read_text().split()[3]
+        stopped = False
+        try:
+            if watchdog_first:
+                # Delay bridge handling deterministically. The independent
+                # watchdog must mute before the bridge can process the pause.
+                bridge.send_signal(signal.SIGSTOP)
+                stopped = True
+                self.clock_recovery_watchdog()
+            self.pcm.write_text('state: XRUN\nowner_pid   : 42\n')
+            eventually(lambda: (self.run / 'bt-wait-pcm').exists())
+            self.assertFalse((self.safe / 'tripped').exists(), 'ordinary XRUN must not latch global mute')
+            if watchdog_first:
+                eventually(lambda: (self.base / 'clock-mixer.log').exists()
+                           and 'Ext Spk off' in (self.base / 'clock-mixer.log').read_text())
+                bridge.send_signal(signal.SIGCONT)
+                stopped = False
+            eventually(lambda: not (self.run / 'bt-owner.pid').exists()
+                       and not (self.safe / 'lease').exists())
+            # The source incorrectly retains "play" while paused. Neither
+            # retained XRUN nor a later close may auto-resume the phone.
+            time.sleep(2)
+            self.pcm.write_text('closed\n')
+            time.sleep(2)
+            self.assertNotIn('onepause', self.events())
+            self.assertNotIn('resume', self.events())
+            self.assertEqual(self.events().count('start'), 1)
+            self.assertFalse((self.safe / 'tripped').exists())
+            # Only new manual audio/PCM permits a fresh guarded lease.
+            self.pcm.write_text('state: RUNNING\nowner_pid   : 42\n')
+            eventually(lambda: self.events().count('start') == 2
+                       and (self.safe / 'lease').exists()
+                       and (self.safe / 'lease').read_text().endswith('active\n'))
+            self.assertNotEqual((self.safe / 'lease').read_text().split()[3], old_token)
+            self.assertFalse((self.run / 'bt-wait-pcm').exists())
+            self.assertFalse((self.safe / 'tripped').exists())
+        finally:
+            if stopped: bridge.send_signal(signal.SIGCONT)
+
+    def test_watchdog_first_bluetooth_xrun_waits_for_manual_audio(self):
+        self.check_clock_recovery(True)
+
+    def test_bridge_first_bluetooth_xrun_waits_for_manual_audio(self):
+        self.check_clock_recovery(False)
+
+    def check_foreign_owner_fault(self, state):
+        self.state('play')
+        bridge = self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: (self.safe / 'lease').exists()
+                   and (self.safe / 'lease').read_text().endswith('active\n'))
+        bridge.send_signal(signal.SIGSTOP)
+        try:
+            (self.proc / '42/comm').write_text('aplay\n')
+            self.pcm.write_text('state: %s\nowner_pid   : 42\n' % state)
+            self.clock_recovery_watchdog()
+            eventually(lambda: (self.safe / 'tripped').exists())
+            self.assertEqual((self.safe / 'tripped').read_text().strip(), 'PCM owner or clock lost')
+            self.assertFalse((self.run / 'bt-wait-pcm').exists())
+        finally:
+            bridge.send_signal(signal.SIGCONT)
+
+    def test_running_wrong_pcm_owner_still_latches_fault(self):
+        self.check_foreign_owner_fault('RUNNING')
+
+    def test_stopped_wrong_pcm_owner_still_latches_fault(self):
+        self.check_foreign_owner_fault('XRUN')
+
+    def test_disconnect_allows_initial_repair_for_a_new_connection(self):
+        self.state('play')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: (self.safe / 'lease').exists())
+        self.state('stop')
+        eventually(lambda: not (self.run / 'bt-owner.pid').exists()
+                   and (self.run / 'bt-wait-pcm').exists())
+        self.pcm.write_text('closed\n')
+        self.status.write_text('{"mode":"-1","status":"","vol":"12","mute":"0"}')
+        eventually(lambda: not (self.run / 'bt-wait-pcm').exists())
+        self.state('play')
+        eventually(lambda: self.events().count('start') == 2, timeout=15)
+        self.assertIn('onepause', self.events())
+        self.assertIn('resume', self.events())
+        self.assertFalse((self.safe / 'tripped').exists())
 
     def test_voice_mixer_keeps_the_bluetooth_lease(self):
         self.state('play')

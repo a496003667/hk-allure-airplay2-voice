@@ -159,17 +159,36 @@ audio_lease_is_caller() {
     [ "$lease_source" = "$(audio_source)" ] || return 1
     [ -z "${HK_AUDIO_TOKEN:-}" ] || [ "$lease_token" = "$HK_AUDIO_TOKEN" ]
 }
-audio_bt_valid() {
+audio_bt_bridge_live() {
     [ -s "$SAFE/play.started" ] && audio_read_lease &&
         [ "$lease_source" = bluetooth ] || return 1
     [ "$(cat "$RUN/bt-owner.pid" 2>/dev/null)" = "$lease_pid" ] || return 1
     _ab_beat=$(cat "$RUN/bt-heartbeat" 2>/dev/null)
     _ab_now=$(audio_now) || return 1
     case "$_ab_beat:$_ab_now" in *[!0-9:]*|:*|*:) return 1;; esac
-    [ "$_ab_beat" -le "$_ab_now" ] && [ $((_ab_now - _ab_beat)) -le 4 ] || return 1
+    [ "$_ab_beat" -le "$_ab_now" ] && [ $((_ab_now - _ab_beat)) -le 4 ]
+}
+audio_bt_valid() {
+    audio_bt_bridge_live || return 1
     _ab_pcm=${HK_AP2_PCM_STATUS:-${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}}
     grep -q '^state: RUNNING' "$_ab_pcm" 2>/dev/null || return 1
     _ab_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_ab_pcm")
     case "$_ab_owner" in ''|*[!0-9]*) return 1;; esac
     [ "$(cat "$AUDIO_PROC/$_ab_owner/comm" 2>/dev/null)" = a01controller ]
+}
+
+# A stock Bluetooth pause can retain its PCM in XRUN instead of closing it.
+# Only known stopped states owned by that player (or an actually closed
+# device) qualify for a guarded restart. A different running owner does not.
+audio_bt_clock_stopped() {
+    _abc_pcm=${HK_AP2_PCM_STATUS:-${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}}
+    _abc_state=$(sed -n '1p' "$_abc_pcm" 2>/dev/null)
+    case "$_abc_state" in
+        closed|'state: closed'|'state: CLOSED') return 0;;
+        'state: XRUN'|'state: SETUP'|'state: PREPARED'|'state: PAUSED'|'state: SUSPENDED'|'state: DRAINING') ;;
+        *) return 1;;
+    esac
+    _abc_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_abc_pcm" 2>/dev/null)
+    case "$_abc_owner" in ''|*[!0-9]*) return 1;; esac
+    [ "$(cat "$AUDIO_PROC/$_abc_owner/comm" 2>/dev/null)" = a01controller ]
 }

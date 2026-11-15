@@ -74,6 +74,8 @@ action, name = a[:2]
 key = name.removeprefix('numid=')
 if action in ('sset', 'cset'):
     state[key] = a[2]
+    if os.environ.get('MOCK_ANALOG_TAMPER') and key == 'Ext Spk' and a[2] == 'on':
+        state['2'] = '0,0'
     with open(state_path, 'w') as f: json.dump(state, f)
     with open(os.environ['MOCK_EVENTS'], 'a') as f: f.write('mixer ' + key + ' ' + a[2] + '\\n')
 elif action == 'cget': print('  : values=' + state[key])
@@ -147,6 +149,23 @@ echo "Snd_Ctrl airplay to mute $level"
         self.assertNotEqual(result.returncode, 0, 'a missing PCM clock must refuse output')
         self.assertNotIn('pa 0', events.read_text())
         self.assertNotIn('mixer Ext Spk on', events.read_text())
+
+        # If the analogue step changes after the baseline check while the
+        # amplifier warms up, output must remain digitally silent.
+        (safe / 'play.started').unlink(missing_ok=True)
+        (safe / 'lease').unlink(missing_ok=True)
+        (self.root / 'clock').write_text('0.00 0.00\n')
+        (safe / 'watchdog.heartbeat').write_text('0')
+        pcm.write_text('state: RUNNING\nowner_pid   : 42\n')
+        events.write_text('')
+        thread = threading.Thread(target=acknowledge)
+        thread.start()
+        result = subprocess.run(['sh', str(HOOK), 'start'], env=env | {'MOCK_ANALOG_TAMPER': '1'},
+                                capture_output=True, text=True, timeout=25)
+        thread.join(timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('mixer 1 100,100', events.read_text())
+        self.assertIn('Playback Volume changed during amplifier warm-up', (self.run / 'hook.log').read_text())
 
     def test_shared_guard_never_enables_output_and_rejects_unsafe_paths(self):
         safe = self.run / 'safe'

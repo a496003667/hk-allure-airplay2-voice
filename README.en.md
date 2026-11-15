@@ -6,7 +6,7 @@ Adds **AirPlay 2** to the Harman Kardon Allure (the Alexa smart speaker) and rep
 
 AirPlay, the stock Bluetooth player and voice replies use the Harman DSP. The project retains the stock wake word and physical controls, and provides a persistent mTLS maintenance channel, audio handoff safeguards and rollback procedures.
 
-The 2026-11-14 repairs on `fix/audit-20261114` passed **111 Linux/BusyBox tests and muted deployment checks on the author's speaker**. The active stack is Shairport 5.6 with the 24 dB flat configuration, Harman DSP, Bluetooth bridge and independent protection; voice, lights and keys were reloaded. Maintenance mute remains held for this round's listening tests. Audible pops, source switching, complete voice handoff, bass hardware and sustained operation remain unverified. See the bilingual [device record](docs/DEVICE-VALIDATION-2026-11-14.md), [repair status](docs/AUDIT-REPAIRS-2026-11-14.md) and [repair plan](docs/REPAIR-PLAN-2026-11-14.md).
+The 2026-11-15 suite passes **117 Linux/BusyBox tests**. User-present AirPlay startup, audible volume mute, pause/resume, reconnect and physical-control tests passed without reported pops or gain jumps. The voice reply was clear, but music did not resume; the DSP clock/lease handoff deadlock has a repair awaiting a complete listening retest. Bluetooth, source switching, bass hardware and sustained operation remain pending. See the [latest listening record](docs/LISTENING-VALIDATION-2026-11-15.md), [deployment record](docs/DEVICE-VALIDATION-2026-11-14.md) and [repair status](docs/AUDIT-REPAIRS-2026-11-14.md).
 
 ## ⚠️ Read this first
 
@@ -31,7 +31,7 @@ The 2026-11-14 repairs on `fix/audit-20261114` passed **111 Linux/BusyBox tests 
 | **Local commands** | Pause / resume / next / previous / louder / quieter, handled without the LLM |
 | **Weather** | open-meteo (free, no key); default city by IP geolocation; any city, today to the day after tomorrow |
 | **Reminders / alarms / timers** | e.g. "十分钟后提醒我关火" (remind me in ten minutes), "明早七点叫我" (wake me at 7), "倒计时五分钟" (5-minute timer), list and cancel; many phrasings are recognised |
-| **AirPlay + voice** | Waking it during playback fades out and pauses the music, frees the DAC, answers, then resumes |
+| **AirPlay + voice** | Waking it fades and pauses music, then frees the DAC; after the reply, the guarded hook rebuilds the DSP clock and requests playback. Complete handoff repair awaits listening retest |
 | **Reliability** | Stored spoken prompts for network and service errors; optional processes keep positive OOM scores; AP2 reclamation preserves a valid Bluetooth lease; pre-roll and logs are bounded; kernel reclaim order is not guaranteed |
 | **Debloat** | Stops the OTA updater, Alexa alarms and Alexa multi-room at boot (reversible) |
 

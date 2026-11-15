@@ -904,30 +904,36 @@ resume_bluetooth() {
     return 1
 }
 
-# After we are done: let AirPlay have the DAC back and reopen the speaker
-# path (pop-free order, via the hook) as soon as Shairport plays again.
+# Restore the pipe/DSP path through the shared hook. The bridge opens its
+# silent clock only after the hook publishes an AirPlay claim and lease;
+# waiting for a RUNNING PCM here deadlocks after voice has closed it.
+# Reopening a paused session restores its silent output path, not playback.
+# Only the caller that interrupted music sends the separate play command.
 reopen_watch() {
-    mkdir "$RUN/reopen.lock" 2>/dev/null || return   # one watcher at a time
-    i=0
-    while [ "$i" -lt 7200 ]; do              # up to 1 h for a manual resume
-        if airplay_owns_dac && pcm_running; then
-            # Give Shairport's own hook a moment; open the path only if
-            # nobody did, and retry (the PA helper can fail when racing).
-            sleep 2
-            for try in 1 2 3; do
-                [ -f "$SAFE/play.started" ] &&
-                    [ "$(mx_get "Ext Spk")" = on ] && break
-                env $HOOK_ENV HK_AP2_VOICE= HK_AUDIO_TOKEN= "$HOOK" start && { log "AirPlay speaker path reopened"; break; }
-                log "AirPlay speaker reopen failed (try $try)"
-                sleep 2
-            done
-            break
+    audio_lock "$RUN/reopen.lock" || return 1
+    trap 'audio_unlock "$RUN/reopen.lock" 2>/dev/null || true' 0
+    reopen_pid=$(cat "${SAFE%/safe}/shairport.pid" 2>/dev/null)
+    reopen_start=$(audio_pid_start "$reopen_pid") || return 1
+    for reopen_try in 1 2 3; do
+        audio_pid_live "$reopen_pid" "$reopen_start" || return 1
+        [ ! -f "${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}" ] &&
+            [ -f "$SAFE/armed" ] && [ ! -f "$SAFE/tripped" ] || return 1
+        # A newer voice round or source switch owns its own handoff. Never
+        # use an old watcher to steal Bluetooth or reopen during a reply.
+        [ ! -e "$RELEASE" ] && [ ! -e "$VOICE_OWNS" ] &&
+            [ ! -e "$BT_OWNER" ] || return 1
+        "$D/hk-voice" connected >/dev/null 2>&1 || return 1
+        if env $HOOK_ENV HK_AP2_VOICE= HK_AUDIO_TOKEN= HK_AP2_REOPEN=1 "$HOOK" start &&
+           audio_read_lease && [ "$lease_source" = airplay ] &&
+           [ "$lease_phase" = active ] && airplay_owns_dac && pcm_running &&
+           [ "$(mx_get "Ext Spk")" = on ]; then
+            log "AirPlay speaker path reopened and verified"
+            return 0
         fi
-        netstat -tn 2>/dev/null | grep -q ':7000 .*ESTABLISHED' || break
-        usleep 500000
-        i=$((i + 1))
+        log "AirPlay speaker reopen unconfirmed (try $reopen_try)"
+        sleep 1
     done
-    rmdir "$RUN/reopen.lock" 2>/dev/null
+    return 1
 }
 
 handle_wake() {
@@ -1018,7 +1024,7 @@ handle_wake() {
     [ "$BT_PAUSED" = 1 ] && resume_bluetooth
     if [ "$PAUSED" = 1 ]; then
         "$MQTT" hk-ap2/remote play >/dev/null 2>&1
-        log "resumed AirPlay"
+        log "AirPlay resume requested"
     fi
     cleanup_round_queue
     log "done"

@@ -42,6 +42,25 @@ class StartupMemoryTest(unittest.TestCase):
     def test_sufficient_free_memory_passes_without_cache(self):
         self.assertEqual(self.check(free=60000, cached=0).returncode, 0)
 
+    def test_admitted_budget_propagates_the_same_floor_to_nested_runtime(self):
+        runtime = (ROOT / 'airplay2/runtime/hk-ap2ctl').read_text()
+        resources = 'check_resources() {' + runtime.split('check_resources() {', 1)[1].split('\nrotate_log()', 1)[0]
+        with tempfile.TemporaryDirectory(prefix='hk-memory-nested-') as directory:
+            root = Path(directory)
+            meminfo = root / 'meminfo'
+            meminfo.write_text('MemFree: 29908 kB\nBuffers: 0 kB\nCached: 30000 kB\nShmem: 5320 kB\n')
+            nested = root / 'runtime-check.sh'
+            nested.write_text('''MIN_FREE_KIB=${HK_AP2_MIN_FREE_KIB:-30720}
+free_kib() { awk '/^MemFree:/ {print $2; exit}' "$MEMINFO"; }
+''' + resources + '\ncheck_resources\n')
+            shell = FUNCTIONS + '\nlog() { :; }\nstartup_memory_ok && sh "$NESTED_CHECK"\n'
+            result = subprocess.run(['sh', '-c', shell], capture_output=True, text=True, timeout=3,
+                                    env=os.environ | {'MEMINFO': str(meminfo), 'MIN_START_FREE_KIB': '8192',
+                                                      'MIN_START_AVAILABLE_KIB': '49152',
+                                                      'HK_AP2_MIN_FREE_KIB': '30720',
+                                                      'NESTED_CHECK': str(nested)})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_invalid_or_missing_memory_counters_fail_closed(self):
         self.assertNotEqual(self.check(free='invalid', cached=90000).returncode, 0)
         with tempfile.TemporaryDirectory(prefix='hk-memory-empty-') as directory:

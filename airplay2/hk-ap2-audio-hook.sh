@@ -265,6 +265,11 @@ case "${1:-}" in
         fi
         if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
             speaker_lock || exit 1
+            if [ -n "${HK_AP2_REOPEN:-}" ] && [ -e "$BT_OWNER" ]; then
+                speaker_unlock
+                hook_log "AirPlay reopen refused: Bluetooth owns speaker"
+                exit 1
+            fi
             if voice_owns; then
                 : >"$DEFERRED"
                 speaker_unlock

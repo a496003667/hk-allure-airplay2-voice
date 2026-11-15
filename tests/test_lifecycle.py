@@ -202,6 +202,92 @@ else: print('Front Left: Playback ['+s[k]+']')
                 try: watchdog.wait(3)
                 except subprocess.TimeoutExpired: watchdog.kill();watchdog.wait()
 
+    def reopen_after_voice(self):
+        source = (REPO / 'voice/hk-voice.sh').read_text()
+        reopen = 'reopen_watch() {' + source.split('reopen_watch() {', 1)[1].split('\nhandle_wake() {', 1)[0]
+        voice = self.root / 'voice'
+        sender = self.root / 'connected'
+        sender.touch()
+        helper = voice / 'hk-voice'
+        helper.write_text('#!/bin/sh\n[ "$1" = connected ] && [ -f "$CONNECTED" ]\n')
+        helper.chmod(0o755)
+        shell = '''. "$HK_AUDIO_COMMON"
+log() { printf '%s\\n' "$*" >>"$REOPEN_LOG"; }
+airplay_owns_dac() { grep -q '^owner_pid.*42' "$PCM_STATUS"; }
+pcm_running() { grep -q '^state: RUNNING' "$PCM_STATUS"; }
+mx_get() { "$HK_AP2_AMIXER" -c 0 sget "$1" | sed -n 's/.*\\[\\(on\\|off\\)\\].*/\\1/p'; }
+''' + reopen + '\nreopen_watch\n'
+        env = self.env | {
+            'RUN': str(voice), 'SAFE': str(self.safe), 'D': str(voice),
+            'HOOK': str(HOOK), 'HOOK_ENV': '', 'CONNECTED': str(sender),
+            'REOPEN_LOG': str(self.root / 'reopen.log'),
+            'PCM_STATUS': str(self.root / 'pcm'),
+            'RELEASE': str(self.run / 'release-dac'),
+            'VOICE_OWNS': str(self.run / 'voice-owns'),
+            'BT_OWNER': str(self.run / 'bt-owner.pid'),
+        }
+        return subprocess.run(['sh', '-c', shell], env=env, capture_output=True, text=True, timeout=10)
+
+    def test_voice_reopens_a_closed_airplay_pipe_before_waiting_for_its_clock(self):
+        (self.run / 'shairport.pid').write_text(str(os.getpid()))
+        (self.run / 'dsp-bridge.pid').write_text('42\n')
+        (self.root / 'proc/42/comm').write_text('hk-ap2-dsp-bridge\n')
+        (self.root / 'pcm').write_text('closed\n')
+        stop = threading.Event()
+        observed = []
+        def bridge_and_watchdog():
+            while not stop.wait(.01):
+                # The actual DSP bridge cannot open until BOTH markers exist.
+                if (self.run / 'ap2-claim').exists() and (self.safe / 'lease').exists():
+                    observed.append(True)
+                    (self.root / 'pcm').write_text('state: RUNNING\nowner_pid : 42\n')
+                    (self.root / 'clock').write_text('101.00 0.00\n')
+                    (self.safe / 'watchdog.heartbeat').write_text('101')
+                    return
+        thread = threading.Thread(target=bridge_and_watchdog)
+        thread.start()
+        try:
+            result = self.reopen_after_voice()
+        finally:
+            stop.set()
+            thread.join(2)
+        details = result.stderr + '\n' + self.events.read_text()
+        for path in (self.run / 'hook.log', self.root / 'reopen.log'):
+            if path.exists(): details += '\n' + path.read_text()
+        self.assertEqual(result.returncode, 0, details)
+        self.assertTrue(observed, 'handoff must bootstrap the gated silent clock')
+        self.assertTrue((self.safe / 'lease').read_text().endswith('active\n'))
+        self.assertIn('reopened and verified', (self.root / 'reopen.log').read_text())
+        self.assertEqual(json.loads((self.root / 'mixer').read_text())['Ext Spk'], 'on')
+        self.assertFalse((self.root / 'voice/reopen.lock').exists())
+
+    def test_voice_reopen_preserves_faults_and_new_source_ownership(self):
+        (self.run / 'shairport.pid').write_text(str(os.getpid()))
+        for marker in (self.safe / 'tripped', self.root / 'hold',
+                       self.run / 'bt-owner.pid', self.run / 'voice-owns',
+                       self.run / 'release-dac'):
+            with self.subTest(marker=marker.name):
+                marker.touch()
+                try:
+                    result = self.reopen_after_voice()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.events.read_text(), '')
+                    self.assertFalse((self.safe / 'lease').exists())
+                    self.assertFalse((self.run / 'ap2-claim').exists())
+                    self.assertFalse((self.root / 'voice/reopen.lock').exists())
+                finally:
+                    marker.unlink()
+
+    def test_delayed_voice_reopen_cannot_steal_bluetooth(self):
+        # Even if Bluetooth appears after the watcher's source check, the
+        # shared hook must check again under its speaker lock.
+        (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
+        result = self.call('start', env=self.env | {'HK_AP2_REOPEN': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.run / 'bt-release').exists())
+        self.assertFalse((self.run / 'ap2-claim').exists())
+        self.assertEqual(self.events.read_text(), '')
+
     def test_supervisor_closes_output_before_dsp_process(self):
         source=(REPO/'airplay2/hk-ap2-prodctl').read_text()
         cleanup='cleanup() {'+source.split('    cleanup() {',1)[1].split('\n    trap cleanup',1)[0]

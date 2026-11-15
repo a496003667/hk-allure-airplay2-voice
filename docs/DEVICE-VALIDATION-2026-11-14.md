@@ -1,5 +1,7 @@
 # 实机部署记录 / Device deployment record — 2026-11-14
 
+本页保留 11 月 14 日的安装快照；后续用户试听、音量控制恢复与语音续播修正见[11 月 15 日记录](LISTENING-VALIDATION-2026-11-15.md)。 / This page preserves the November 14 installation snapshot; see the [November 15 record](LISTENING-VALIDATION-2026-11-15.md) for subsequent listening and handoff work.
+
 状态：已完成作者设备的安装与静音核验；保留维护 hold 和 `manual mute` 等待用户在场试听。没有主动播放音乐、测试音或触发唤醒。不能据此宣称爆音、低频或完整语音交接已解决。
 
 ## 已核验

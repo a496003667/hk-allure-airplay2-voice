@@ -257,10 +257,10 @@ launch_kind() {
     if [ -n "$preload_file" ]; then
         nohup env LD_PRELOAD="$preload_file" \
             "$LOADER" --library-path "$LIBRARY_PATH" "$@" \
-            </dev/null >"$log" 2>&1 &
+            </dev/null >>"$log" 2>&1 &
     else
         nohup "$LOADER" --library-path "$LIBRARY_PATH" "$@" \
-            </dev/null >"$log" 2>&1 &
+            </dev/null >>"$log" 2>&1 &
     fi
 
     pid=$!
@@ -410,11 +410,11 @@ start_ap2() {
         return 1
     fi
 
-    if [ "$DEBUG" = "1" ]; then
-        shairport_debug=-vv
-    else
-        shairport_debug=
-    fi
+    case "$DEBUG" in
+        1|2) shairport_debug=-vv ;;
+        3) shairport_debug=-vvv ;;
+        *) shairport_debug= ;;
+    esac
     # Shairport 5.6 returns vv, volumeControlType and initialVolume itself,
     # so the 4.3.6 /info shim is not preloaded.
     if ! wait_for_nqptp; then

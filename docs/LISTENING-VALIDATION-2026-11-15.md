@@ -11,7 +11,8 @@
 | 暂停约 3 秒后恢复 | 正常，无爆音、无音量突增 |
 | 取消选择音箱后重新连接 | 正常，滑块继续有效，无爆音 |
 | 机身音量加减、播放/暂停 | Mac“音乐”音量与播放状态同步，用户未报告异常 |
-| 播放中唤醒并询问星期 | 语音回复清楚、无爆音；用户随后更正：**音乐没有恢复** |
+| 播放中唤醒（修正前） | 语音回复清楚、无爆音；用户随后更正：**音乐没有恢复** |
+| 续播修正后复测 | 一次问答及追问后，用户确认音乐自动恢复、音量正常、无爆音；接收端核实 active 租约、DSP owner 和 RUNNING PCM |
 
 发送端重建前，界面滑块变化未体现在接收器音量日志，Mac 报告音箱 selected=true、active=false。正常退出并重新打开“音乐”、重新建立 AirPlay 会话后，主音量和音箱旁滑块的实际静音、重连测试通过。只能据此确认重建会话恢复了控制，不能认定 Apple 内部故障的具体原因；本轮没有改音量协议代码或接收器身份。
 
@@ -23,9 +24,19 @@
 
 修正让恢复任务先调用共享 hook：发布租约、建立静音时钟、验证保护与功放顺序，再恢复数字增益。恢复成功必须同时核实 AirPlay active 租约、实际声卡 owner、RUNNING 状态和喇叭开关，不再把“已发送 play”写成“已续播”。暂停会话可以恢复静音输出路径；只有需要续播的调用方发送 play。任务保留 hold/trip，核对接收器进程身份，并在检查及共享锁内拒绝抢占蓝牙。恢复锁记录 PID 与进程起始时间，退出时释放，可回收已死亡任务留下的锁。
 
-本修正的完整语音打断 → 回复 → 音乐恢复仍需再次用户试听。此前清楚的语音回复不等同于完整交接通过。
+北京时间 17:34 的修正后复测通过：用户确认一次问答及追问结束后音乐自动恢复、音量正常、无爆音。日志在 09:34:44 UTC 请求续播，09:34:46 验证输出恢复；同一 Shairport、DSP 和 watchdog 保持运行，没有故障静音。这一结果不等同于蓝牙语音或所有来源交接已验收。
 
 四文件修正包已在维护静音下完成事务安装，返回 0、状态 committed、pending 清除；控制器、hook 和语音脚本的安装哈希与候选一致，活动 Shairport 5.6 / DSP / 蓝牙桥 / watchdog 的精确验证通过。接收器详细协议日志已关闭，−30…−6 dB 配置不变。检查空闲声卡和无租约后解除维护 hold 与其 manual mute，等待用户手动播放；没有设置正常播放时限。
+
+## 音量控制再次失效的会话对照
+
+17:36 用户报告滑块再次失效，蓝牙验收因此推迟。音箱继续播放，但只保留开始播放时的 −27.6 dB 衰减；Mac 报告音箱 selected=true、active=false。把 Mac 主音量归零也没有更新接收端的音量状态。正常暂停后开启接收端详细诊断，保留 Mac“音乐”进程；用户重选、播放且没有唤醒 Alexa，滑块仍不能静音。因此不能将此次失效归因于语音交接。
+
+保持同一个接收器进程不变，保存播放位置、正常退出并重新打开 Mac“音乐”，重新选择音箱后，用户确认滑块能真正静音。接收端收到并执行 −144，Mac 报告 active=true。该对照确认重建发送端会话恢复了控制；尚未建立 Apple 内部原因，也没有修改接收器身份、音量协议、曲线或扬声器增益。维护重启后仅重选音箱可能不足，需要确认实际静音有效；详见[交付步骤](BUILD-AND-UPDATE.md)。
+
+18:00 组合复测通过：在有效发送端会话中低音量播放、唤醒并回复、音乐自动恢复，随后滑块归零仍能真正静音，用户确认无爆音。接收端再次验证 AirPlay active 租约、DSP 时钟恢复和新的 −144 静音状态。之后关闭临时详细诊断，并按上述顺序重建最终发送端会话；这项修正没有替换音量曲线或修改协议二进制。
+
+正常日志级别下的最终检查也通过：用户确认播放正常、音量可调、无爆音；接收端收到多个不同音量值及 −144，active 租约与 DSP-owned RUNNING PCM 正常，精确版本核验返回 0，无故障锁存或播放时限。临时诊断、观察与安装文件归档到私有目录后清理，持久回滚事务保留。按用户要求，本轮暂不进入蓝牙调试。
 
 ## 诊断期间补充的可靠性修正
 
@@ -39,10 +50,16 @@
 
 ## English summary
 
-User-present Mac Music AirPlay tests passed for audible startup, both master and per-speaker mute, pause/resume, disconnect/reconnect and physical volume/playback controls. No pops or gain jumps were reported in those tests. The voice reply was clear and pop-free, but the user corrected the initial result: **music did not resume**. Bluetooth, source switching, complete voice handoff, bass hardware and sustained operation remain pending.
+User-present Mac Music AirPlay tests passed for audible startup, both master and per-speaker mute, pause/resume, disconnect/reconnect and physical volume/playback controls. No pops or gain jumps were reported in those tests. The first voice test had a clear reply but no music resume. After the handoff repair, a question and follow-up completed with music automatically restored at normal volume and no reported pop; the receiver verified the active AirPlay lease and DSP-owned running PCM. Bluetooth, other source handoffs, bass hardware and sustained operation remain pending.
 
 Rebuilding the Music AirPlay session restored working volume commands and audible mute. The earlier session was selected but inactive; that observation does not establish an Apple internal root cause. No receiver identity or volume protocol code changed. The existing DSP pipe and flat software range −30…−6 dB remain intact; protocol −144 is mute.
 
-The failed voice handoff left Music playing and Shairport emitting frames, with no receiver fault or maintenance hold, but no playback lease and a closed PCM. The old watcher waited for a running PCM before invoking the hook, while the DSP bridge required the hook's claim and lease before opening its clock. The repair bootstraps the silent clock through the existing guarded hook and verifies the resulting AirPlay lease, PCM owner/state and speaker switch. It preserves faults and new voice/source ownership, rejects Bluetooth takeover under the speaker lock, and uses a process-identity lock that can recover dead owners. Reopening a paused session restores its silent path without sending play; only the interrupted-playback caller requests playback. The four-file guarded transaction committed successfully, exact deployed hashes and the active 5.6/DSP/protection stack were verified, detailed protocol logging was disabled, and maintenance mute was released only after checking idle output. No normal-playback deadline was added. A new complete listening test is still required.
+The failed voice handoff left Music playing and Shairport emitting frames, with no receiver fault or maintenance hold, but no playback lease and a closed PCM. The old watcher waited for a running PCM before invoking the hook, while the DSP bridge required the hook's claim and lease before opening its clock. The repair bootstraps the silent clock through the existing guarded hook and verifies the resulting AirPlay lease, PCM owner/state and speaker switch. It preserves faults and new voice/source ownership, rejects Bluetooth takeover under the speaker lock, and uses a process-identity lock that can recover dead owners. Reopening a paused session restores its silent path without sending play; only the interrupted-playback caller requests playback. The four-file guarded transaction committed successfully, exact deployed hashes and the active 5.6/DSP/protection stack were verified, and the subsequent voice listening test passed. No normal-playback deadline was added.
+
+Volume control later failed again after maintenance, so Bluetooth testing was deferred. Music reported selected=true but active=false, and master mute did not update the receiver. Restarting only the receiver with detailed diagnostics and testing without a wake still reproduced the failure. Keeping that receiver process unchanged and normally reopening Music restored actual per-speaker mute: the receiver applied −144 and Music reported active=true. This confirms the sender-session workaround, not an established Apple internal cause or a new receiver protocol fix. Maintenance acceptance must check audible mute rather than relying on selection alone.
+
+The subsequent combined test passed: a voice reply automatically returned to music, the per-speaker slider still produced audible mute, and no pop was reported. The receiver verified the restored DSP path and a new −144 mute state. Detailed diagnostics were then disabled and the final sender session rebuilt; no volume-curve or protocol-binary change was made for this session workaround.
+
+The final normal-logging configuration also passed playback, volume adjustment and no-pop listening checks. The receiver applied multiple volume values and −144, retained an active AirPlay lease and a DSP-owned running PCM, and passed exact verification without a fault latch or playback deadline. Temporary test/install files were privately archived and removed; persistent rollback transactions remain. Bluetooth testing was deferred at the user's request.
 
 Additional fixes make daemon log descriptors append across inode-preserving rotation and propagate the admitted 8 MiB raw-free floor into the nested runtime. Outer 8/48 MiB startup and 4/32 MiB runtime protection remain. All 117 Linux/BusyBox tests pass, including a gated-clock handoff reproduction and fault/source ownership regressions. Detailed protocol logs and all device configuration, secrets and backups remain private. Voice supervisor singleton enforcement is still outstanding; no reboot, firmware partition or unknown hardware-register writes were performed.

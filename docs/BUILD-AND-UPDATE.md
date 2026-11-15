@@ -74,6 +74,8 @@ python3 tools/make-runtime.py \
 6. 若包涉及语音、灯效、按键或蓝牙库，由事务内校验并保存的 `hk-audio-dependents.sh` 重载相应组件。原厂播放器只在静音、独立 watchdog 已恢复时受控重载；不重启 `rootApp` 或维护通道。原厂播放器未成功重载即更新失败。
 7. 成功保留维护 hold 等待用户在场试听；不用定时静音打断后续长测。不能直接删除 hold 而不检查 latched trip 和正常关闭顺序。
 
+完成所有接收器重启和临时诊断清理后，再建立发送端试听会话。Mac“音乐”在维护后可能仍显示音箱已选择，但接收端收不到后续音量变化；这台设备上仅重选音箱曾不足以恢复。保存播放位置、正常退出并重开“音乐”后，同一接收器进程恢复有效静音控制。先低音量试听，再把音箱旁滑块归零，确认实际静音且接收端执行 −144；仅看到勾选或滑块移动不算音量验收通过。未证实 Apple 内部原因，不应为此修改设备身份或提高增益。后续如再次重启接收器，需要重做这项检查。
+
 原厂 BusyBox 没有 `stat` applet；更新器通过 POSIX `ls` 权限字段读取并保留普通及特殊权限位。失败启动可能删除运行目录，回退静音会先重建锁的父目录。旧控制器没有 `verify` 命令时，只有回退路径可使用兼容验收：整批恢复文件、实际 5.6 绑定、进程身份、watchdog 心跳及状态均必须匹配；新候选仍必须提供 `verify`。
 
 这台小内存设备需要释放上传/解包副本的 tmpfs 占用。暂存并核对全部 `.new` 后，把已校验的候选更新器和 manifest 复制到独立临时路径，再清理上传压缩包及解包目录；电脑上保留完整私有包。可用 `HK_AP2_UPDATE_RELEASE_STAGING=1 sh <已校验更新器> --manifest <manifest>`，在整批安装文件通过哈希/权限校验后、启动前释放 `.new` 副本。回退使用独立事务备份；重试须从原包重新暂存。不要清理未完成事务或唯一回滚副本。
@@ -115,6 +117,8 @@ This branch passed muted deployment checks on the author's device; listening and
 Existing-device updates reuse the verified base runtime and update only the candidate overrides. A fresh installation additionally needs the locked third-party dependency tree, runtime image, NQPTP, broker and prior root/boot setup. `make-runtime.py` creates a little-endian cramfs from explicit inputs; it is not a third-party source builder or proof of a tested fresh installation. The small vendor partition can prevent a full image transaction; keep the rollback-space check.
 
 On the device, stage `.new` siblings, then run the verified candidate updater with `--manifest`. It backs up the full set, holds output muted, closes audio before stopping clocks, unmounts, installs, verifies the exact 5.6/configuration/protection stack, and reloads affected dependents. It never restarts rootApp or the maintenance channel. Failure returns nonzero; failed recovery retains mute and a persistent journal. Successful installation also stays held until user-present verification.
+
+Finish receiver restarts and temporary diagnostics before establishing the final sender session. On this Mac, Music could show the speaker selected while subsequent volume changes did not reach the receiver; simply reselecting it was insufficient. Saving playback position and normally reopening Music restored actual mute with the same receiver process. Check low-level playback, then per-speaker zero and the receiver's applied −144; selection or slider movement alone does not establish working volume control. The Apple internal cause is unproven. Repeat this check after any further receiver restart rather than changing identity or gain.
 
 Stock BusyBox lacks `stat`, so permissions are decoded from POSIX `ls`, including special bits. Recovery recreates the runtime lock directory after failed startup. A controller lacking `verify` is accepted only during rollback and only after matching the saved files, active 5.6 bindings, live process identities, watchdog heartbeat and status. New candidates must pass their own `verify` command.
 

@@ -390,6 +390,7 @@ prepare_output() {
             >/dev/null 2>&1 && mv "$QD/chime.tmp" "$QD/chime.raw"
         log "Bluetooth voice output prepared"
     else
+        env $HOOK_ENV "$HOOK" park || return 1
         i=0
         while [ "$i" -lt 40 ] && ! pcm_closed; do
             usleep 100000

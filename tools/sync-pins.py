@@ -10,6 +10,7 @@ parser.add_argument('--binaries',type=Path,default=REPO/'build/bin')
 args=parser.parse_args()
 # Keep the small previously shipped bridge artifacts reproducible and testable.
 for name,target in [('hk-ap2-dsp-bridge','airplay2/hk-ap2-dsp-bridge'),
+                    ('libasound_module_pcm_hkbtpark.so','airplay2/libasound_module_pcm_hkbtpark.so'),
                     ('hk-bt-open-redirect.so','airplay2/hk-bt-open-redirect.so'),
                     ('hk-unix-request-raw','airplay2/hk-unix-request-raw'),
                     ('libhk-ap2-info-shim-soft.so','airplay2/libhk-ap2-info-shim-soft.so')]:
@@ -27,9 +28,13 @@ import re
 text=wrapper.read_text()
 shim=digest(args.binaries/'hk-bt-open-redirect.so')
 text=re.sub(r'(SHIM_SHA256=\$\{HK_BT_REDIRECT_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+shim,text)
+private_conf=digest(REPO/'airplay2/hk-bt-alsa.conf')
+park=digest(args.binaries/'libasound_module_pcm_hkbtpark.so')
+text=re.sub(r'(CONF_SHA256=\$\{HK_BT_PRIVATE_CONF_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+private_conf,text)
+text=re.sub(r'(PARK_SHA256=\$\{HK_BT_PARK_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+park,text)
 wrapper.write_text(text)
 boot=REPO/'airplay2/hk-bt-boot';text=boot.read_text()
-for name,value in [('SHIM_SHA256',shim),('WRAPPER_SHA256',digest(wrapper))]:
+for name,value in [('SHIM_SHA256',shim),('WRAPPER_SHA256',digest(wrapper)),('CONF_SHA256',private_conf),('PARK_SHA256',park)]:
     text=re.sub(r'(^'+name+r'=\$\{[^:]+:-)[0-9a-f]{64}',lambda m:m[1]+value,text,flags=re.M)
 boot.write_text(text)
 print('Updated public artifact pins; no device configuration was read or modified.')

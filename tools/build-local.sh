@@ -27,6 +27,11 @@ done
     -Wl,-e,_start -Wl,--gc-sections airplay2/hk-ap2-dsp-bridge.c "$HK_STOCK_ASOUND" \
     -o "$OUT/hk-ap2-dsp-bridge"
 "${HARD}gcc" -Os -shared -fPIC airplay2/hk-bt-open-redirect.c -ldl -static-libgcc -o "$OUT/hk-bt-open-redirect.so"
+# Supply stock-compatible ALSA development headers through HK_ALSA_HEADERS
+# when they are not installed in the cross compiler's normal include path.
+"${HARD}gcc" -Os -shared -fPIC -DPIC ${HK_ALSA_HEADERS:+-I"$HK_ALSA_HEADERS"} \
+    airplay2/hk-bt-pcm.c "$HK_STOCK_ASOUND" -ldl -static-libgcc \
+    -o "$OUT/libasound_module_pcm_hkbtpark.so"
 "${HARD}gcc" -Os -shared -fPIC keys/hk-mv-ap2-keys.c -ldl -static-libgcc -o "$OUT/libhk-mv-ap2-keys.so"
 for setting in mute:1 unmute:0; do
     "${HARD}gcc" -Os -shared -fPIC -nostdlib -DHK_AIRPLAY_MUTE=${setting#*:} \

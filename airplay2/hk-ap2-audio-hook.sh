@@ -33,6 +33,9 @@ BT_RELEASE="$RUN/bt-release"
 PCM_STATUS=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
 PROC_ROOT=${HK_AP2_PROC_ROOT:-/proc}
 HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
+BT_PCM_CONTROL=${HK_BT_PCM_CONTROL:-${RUN%/run}/bt-pcm-control}
+BT_PCM_OPENING=${HK_BT_PCM_OPENING:-${RUN%/run}/bt-pcm-opening}
+REQUEST=${HK_AP2_REQUEST:-$ROOT/bin/hk-unix-request-raw}
 COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
 [ -r "$COMMON" ] || COMMON=$(dirname "$0")/hk-audio-common.sh
 [ -r "$COMMON" ] || exit 1
@@ -155,6 +158,49 @@ clear_play_lease() {
 
 publish_play_lease() { audio_reserve; }
 
+# Called under speaker.lock, before reserving the new source's lease. The
+# factory player retains its virtual Bluetooth PCM; its private backend can
+# return the actual hardware only after the old output has been muted.
+park_bluetooth_pcm() {
+    _park_wait=0
+    while [ -e "$BT_PCM_OPENING" ] && [ "$_park_wait" -lt 20 ]; do
+        usleep 100000 2>/dev/null || sleep 1
+        _park_wait=$((_park_wait + 1))
+    done
+    [ ! -e "$BT_PCM_OPENING" ] || return 1
+    _park_pcm=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
+    _park_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_park_pcm" 2>/dev/null)
+    case "$_park_owner" in ''|*[!0-9]*) return 0;; esac
+    [ "$(cat "$AUDIO_PROC/$_park_owner/comm" 2>/dev/null)" = a01controller ] || return 0
+    [ ! -e "$BT_OWNER" ] && [ ! -s "$SAFE/play.started" ] && [ ! -e "$SAFE/lease" ] || return 1
+    [ -S "$BT_PCM_CONTROL" ] && [ -x "$REQUEST" ] || {
+        hook_log 'Bluetooth PCM cannot be released: private backend unavailable'
+        return 1
+    }
+    hard_mute
+    [ "$(mixer_values 1)" = '0,0' ] &&
+        [ "$(switch_state 'Ext Spk')" = off ] &&
+        [ "$(switch_state 'aml audio i2s mute')" = on ] || return 1
+    _park_token="$$-$(audio_now)"
+    printf '%s\n' "$_park_token" >"$RUN/bt-pcm-park.tmp" &&
+        mv "$RUN/bt-pcm-park.tmp" "$RUN/bt-pcm-park" || return 1
+    _park_reply=$("$REQUEST" "$BT_PCM_CONTROL" "park:$_park_token" 1800 2>/dev/null)
+    _park_rc=$?
+    rm -f "$RUN/bt-pcm-park"
+    [ "$_park_rc" = 0 ] && [ "$_park_reply" = parked ] || return 1
+    _park_try=0
+    while [ "$_park_try" -lt 10 ]; do
+        case "$(sed -n '1p' "$_park_pcm" 2>/dev/null)" in
+            closed|'state: closed'|'state: CLOSED')
+                hook_log 'Bluetooth hardware PCM released before new lease'
+                return 0;;
+        esac
+        _park_try=$((_park_try + 1))
+        usleep 100000 2>/dev/null || sleep 1
+    done
+    return 1
+}
+
 watchdog_heartbeat() {
     read_file "$SAFE/watchdog.heartbeat"
 }
@@ -224,6 +270,24 @@ start_failed() {
 }
 
 case "${1:-}" in
+    park)
+        speaker_lock || exit 1
+        trap 'speaker_unlock' 0
+        [ -f "$SAFE/armed" ] && watchdog_alive && audio_voice_generation_valid || exit 1
+        # Reserve voice intent before waiting for any in-flight Bluetooth
+        # open. Its ordinary lease is still created by the existing guard.
+        if [ -n "${HK_AP2_VOICE:-}" ]; then
+            [ ! -s "$SAFE/play.started" ] && [ ! -e "$SAFE/lease" ] && [ ! -e "$BT_OWNER" ] || exit 1
+            audio_now >"$VOICE_OWNS" && printf '%s\n' "${HK_AUDIO_TOKEN:-}" >"$RUN/voice-token" || exit 1
+        fi
+        if ! park_bluetooth_pcm; then
+            if [ -n "${HK_AP2_VOICE:-}" ] &&
+               [ "$(cat "$RUN/voice-token" 2>/dev/null)" = "${HK_AUDIO_TOKEN:-}" ]; then
+                rm -f "$VOICE_OWNS" "$RUN/voice-token"
+            fi
+            exit 1
+        fi
+        ;;
     reserve)
         [ ! -f "$HOLD_MUTE" ] && [ -f "$SAFE/armed" ] &&
             [ ! -f "$SAFE/tripped" ] && watchdog_alive || exit 1
@@ -303,6 +367,9 @@ case "${1:-}" in
             exit 1
         fi
         audio_voice_generation_valid || exit 1
+        if [ -z "${HK_AP2_BT:-}" ]; then
+            park_bluetooth_pcm || start_failed 'Bluetooth hardware PCM release failed'
+        fi
         if audio_lease_is_caller && [ "$lease_phase" = active ] && pcm_clock_live &&
            [ "$(switch_state 'Ext Spk')" = on ]; then
             exit 0

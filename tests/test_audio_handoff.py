@@ -3,6 +3,7 @@
 import os
 import json
 import pathlib
+import socket
 import subprocess
 import tempfile
 import threading
@@ -248,6 +249,85 @@ else: print('Front Left: Playback [' + state[key] + ']')
         result = subprocess.run(['sh', str(HOOK), 'guard', 'active'], env=env,
                                 capture_output=True, text=True, timeout=5)
         self.assertNotEqual(result.returncode, 0, 'an active path at full gain must fail closed')
+
+
+class PcmParkingHandoffTest(unittest.TestCase):
+    setUp = HandoffTest.setUp
+    tearDown = HandoffTest.tearDown
+
+    def parking_env(self):
+        safe = self.run / 'safe'
+        (safe / 'armed').touch()
+        (safe / 'watchdog.pid').write_text(str(os.getpid()))
+        (safe / 'watchdog.heartbeat').write_text('0\n')
+        (self.root / 'proc/42').mkdir(parents=True)
+        (self.root / 'proc/42/comm').write_text('a01controller\n')
+        self.pcm = self.root / 'pcm'
+        self.pcm.write_text('state: XRUN\nowner_pid   : 42\n')
+        self.events = self.root / 'events'
+        self.events.touch()
+        mixer = self.root / 'mixer'
+        mixer.write_text('''#!/bin/sh
+echo "$*" >>"$MOCK_EVENTS"
+case "$3:$4" in
+ cget:numid=1) echo ' : values=0,0';;
+ sget:Ext*) echo 'Front Left: Playback [off]';;
+ sget:aml*) echo 'Front Left: Playback [on]';;
+esac
+''')
+        mixer.chmod(0o755)
+        delay = self.root / 'usleep'
+        delay.write_text('#!/bin/sh\nexit 0\n'); delay.chmod(0o755)
+        request = self.root / 'request'
+        subprocess.run(['cc', '-D_POSIX_C_SOURCE=200809L',
+                        str(HOOK.parents[1] / 'tools/hk-unix-request-raw.c'),
+                        '-o', str(request)], check=True, capture_output=True)
+        return self.env | {'HK_AP2_PCM_STATUS': str(self.pcm),
+                           'HK_AP2_PROC_ROOT': str(self.root / 'proc'),
+                           'HK_AP2_AMIXER': str(mixer), 'HK_AP2_REQUEST': str(request),
+                           'HK_AP2_USE_STOCK_PA': '0', 'MOCK_EVENTS': str(self.events),
+                           'PATH': str(self.root) + ':' + os.environ['PATH']}
+
+    def run_park(self, close_pcm):
+        env = self.parking_env()
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(self.run.parent / 'bt-pcm-control')); server.listen(1)
+        seen = []
+        def serve():
+            try:
+                server.settimeout(3)
+                with server.accept()[0] as client:
+                    request = b''
+                    while chunk := client.recv(100): request += chunk
+                    token = (self.run / 'bt-pcm-park').read_text().strip()
+                    log = self.events.read_text()
+                    seen.append(request == ('park:' + token).encode() + b'\0'
+                                and not (self.run / 'safe/lease').exists()
+                                and 'cset numid=1 0,0' in log
+                                and 'sset Ext Spk off' in log
+                                and 'sset aml audio i2s mute on' in log)
+                    if close_pcm: self.pcm.write_text('closed\n')
+                    client.sendall(b'parked\n')
+            finally:
+                server.close()
+        thread = threading.Thread(target=serve); thread.start()
+        result = subprocess.run(['sh', str(HOOK), 'park'], env=env,
+                                text=True, capture_output=True, timeout=5)
+        thread.join(timeout=4)
+        self.assertEqual(seen, [True], result.stderr + self.events.read_text())
+        self.assertFalse((self.run / 'safe/lease').exists())
+        self.assertFalse((self.run / 'bt-pcm-park').exists())
+        self.assertNotIn('Ext Spk on', self.events.read_text())
+        return result
+
+    def test_guarded_park_mutes_before_ipc_and_does_not_reserve_or_open(self):
+        result = self.run_park(close_pcm=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pcm.read_text(), 'closed\n')
+
+    def test_park_ack_without_hardware_release_is_not_success(self):
+        result = self.run_park(close_pcm=False)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == '__main__':

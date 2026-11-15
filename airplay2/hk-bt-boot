@@ -8,13 +8,15 @@ STOCK=${HK_BT_STOCK_EXE:-/system/workdir/bin/a01controller}
 WRAPPER="$BASE/hk-bt-controller-wrapper.sh"
 SHIM="$BASE/hk-bt-open-redirect.so"
 CONF="$BASE/hk-bt-alsa.conf"
+PARK="$BASE/libasound_module_pcm_hkbtpark.so"
 TARGET=${HK_BT_TARGET:-/tmp/bin/a01controller}
 TARGET_DIR=${TARGET%/*}
 LOG=${HK_BT_BOOT_LOG:-/tmp/hk-bt-boot.log}
 STOCK_SHA256=${HK_BT_STOCK_SHA256:-150bdfbe5757fd81010d2b99ed700fff591664ba729e901617e31b5d32f748f1}
-WRAPPER_SHA256=${HK_BT_WRAPPER_SHA256:-9d67f46b0078daa03c3d1d57dfabd5ae5ae6b4d032ceca1ec3913f5f15f5bac6}
+WRAPPER_SHA256=${HK_BT_WRAPPER_SHA256:-a8c2cc2d1ea9e3362b9164ed8efa02901183cdd83ef1b24af0ee2d365b9ac711}
 SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-30d670bf574d12e4db352b5c0128954d5c550dd97a149a37f3487deed80bbd60}
-CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2d128861ebd8285815d2247230fe9d32b43936b36a7bf916a90955e30c21c44a}
+CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-5a2da0aa64d6347278fadfcc1cf527658c3538cf6032dbc496bf45364a1bfa33}
+PARK_SHA256=${HK_BT_PARK_SHA256:-271f2c304eb52337f0143ac9eea44ce31984ec06210e2e9b7ffec98fa0d7cbd8}
 
 log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
@@ -41,10 +43,12 @@ fail() {
 [ -x "$WRAPPER" ] || fail "wrapper is missing or not executable"
 [ -r "$SHIM" ] || fail "redirect shim is missing"
 [ -r "$CONF" ] || fail "private ALSA configuration is missing"
+[ -r "$PARK" ] || fail "releasable PCM backend is missing"
 [ "$(hash_of "$STOCK")" = "$STOCK_SHA256" ] || fail "stock player checksum mismatch"
 [ "$(hash_of "$WRAPPER")" = "$WRAPPER_SHA256" ] || fail "wrapper checksum mismatch"
 [ "$(hash_of "$SHIM")" = "$SHIM_SHA256" ] || fail "redirect shim checksum mismatch"
 [ "$(hash_of "$CONF")" = "$CONF_SHA256" ] || fail "private ALSA configuration checksum mismatch"
+[ "$(hash_of "$PARK")" = "$PARK_SHA256" ] || fail "releasable PCM backend checksum mismatch"
 
 mkdir -p "$TARGET_DIR" || fail "cannot create $TARGET_DIR"
 cp "$WRAPPER" "$TARGET.new" || fail "cannot stage wrapper"

@@ -14,7 +14,7 @@ while read -r sum perm target extra; do
         "$VENDOR/hk-voice/"*) voice=1;;
         "$VENDOR/hk-lights/"*) lights=1;;
         "$VENDOR/hk-keys/"*) keys=1;;
-        "$BASE/hk-bt-open-redirect.so"|"$BASE/hk-bt-controller-wrapper.sh"|"$BASE/hk-bt-alsa.conf"|"$BASE/hk-bt-boot") bluetooth=1;;
+        "$BASE/hk-bt-open-redirect.so"|"$BASE/libasound_module_pcm_hkbtpark.so"|"$BASE/hk-bt-controller-wrapper.sh"|"$BASE/hk-bt-alsa.conf"|"$BASE/hk-bt-boot") bluetooth=1;;
     esac
 done <"$MANIFEST"
 stock_pid() {

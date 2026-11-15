@@ -38,6 +38,7 @@ BINARIES={
  'hk-mqtt-pub':['hk-voice/hk-mqtt-pub'], 'hk-voice':['hk-voice/hk-voice'],
  'hk-ap2-dsp-bridge':['airplay2/hk-ap2-dsp-bridge'],
  'hk-bt-open-redirect.so':['airplay2/hk-bt-open-redirect.so'],
+ 'libasound_module_pcm_hkbtpark.so':['airplay2/libasound_module_pcm_hkbtpark.so'],
  'libhk-mv-ap2-keys.so':['hk-keys/libhk-mv-ap2-keys.so'],
  'hk-shm-play':['hk-lights/hk-shm-play'],
  'libhk-ap2-info-shim-soft.so':['airplay2/libhk-ap2-info-shim-soft.so'],
@@ -48,6 +49,7 @@ PINS={
  'AUDIO_HOOK_OVERRIDE_SHA1':'airplay2/hk-ap2-audio-hook.sh',
  'SAFE_TEST_OVERRIDE_SHA1':'airplay2/hk-ap2-safe-test.bt',
  'BT_BRIDGE_SHA1':'airplay2/hk-bt-bridge.sh', 'DSP_ALSA_CONF_SHA1':'airplay2/hk-dsp-alsa.conf',
+ 'BT_PARK_SHA1':'airplay2/libasound_module_pcm_hkbtpark.so',
  'DSP_BRIDGE_SHA1':'airplay2/hk-ap2-dsp-bridge', 'VOICE_SCRIPT_SHA1':'hk-voice/hk-voice.sh',
  'COMMON_SHA1':'airplay2/hk-audio-common.sh', 'REQUEST_OVERRIDE_SHA1':'airplay2/hk-unix-request-raw',
  'GUARD_OVERRIDE_SHA1':'airplay2/hk-ap2-guard.sh', 'VOLUME_OVERRIDE_SHA1':'airplay2/hk-ap2-volume-log',
@@ -83,12 +85,14 @@ def pin_tree(vendor):
     wrapper=vendor/'airplay2/hk-bt-controller-wrapper.sh'
     shim=digest(vendor/'airplay2/hk-bt-open-redirect.so')
     private_conf=digest(vendor/'airplay2/hk-bt-alsa.conf')
+    park=digest(vendor/'airplay2/libasound_module_pcm_hkbtpark.so')
     text=wrapper.read_text()
     text=re.sub(r'(SHIM_SHA256=\$\{HK_BT_REDIRECT_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+shim,text)
     text=re.sub(r'(CONF_SHA256=\$\{HK_BT_PRIVATE_CONF_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+private_conf,text)
+    text=re.sub(r'(PARK_SHA256=\$\{HK_BT_PARK_SHA256:-)[0-9a-f]{64}',lambda m:m[1]+park,text)
     wrapper.write_text(text)
     boot=vendor/'airplay2/hk-bt-boot';text=boot.read_text()
-    for key,value in [('SHIM_SHA256',shim),('WRAPPER_SHA256',digest(wrapper)),('CONF_SHA256',private_conf)]:
+    for key,value in [('SHIM_SHA256',shim),('WRAPPER_SHA256',digest(wrapper)),('CONF_SHA256',private_conf),('PARK_SHA256',park)]:
         text=re.sub(r'(^'+key+r'=\$\{[^:]+:-)[0-9a-f]{64}',lambda m:m[1]+value,text,flags=re.M)
     boot.write_text(text)
 

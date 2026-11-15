@@ -11,17 +11,20 @@ STOCK_SHA256=${HK_BT_STOCK_SHA256:-150bdfbe5757fd81010d2b99ed700fff591664ba729e9
 SHIM=${HK_BT_REDIRECT_LIB:-/vendor/airplay2/hk-bt-open-redirect.so}
 SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-30d670bf574d12e4db352b5c0128954d5c550dd97a149a37f3487deed80bbd60}
 CONF=${HK_BT_PRIVATE_CONF:-/vendor/airplay2/hk-bt-alsa.conf}
-CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2d128861ebd8285815d2247230fe9d32b43936b36a7bf916a90955e30c21c44a}
+CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-5a2da0aa64d6347278fadfcc1cf527658c3538cf6032dbc496bf45364a1bfa33}
+PARK=${HK_BT_PARK_LIB:-/vendor/airplay2/libasound_module_pcm_hkbtpark.so}
+PARK_SHA256=${HK_BT_PARK_SHA256:-271f2c304eb52337f0143ac9eea44ce31984ec06210e2e9b7ffec98fa0d7cbd8}
 
 hash_of() {
     sha256sum "$1" 2>/dev/null | awk '{print $1}'
 }
 
 if [ -z "${LD_PRELOAD:-}" ] &&
-   [ -x "$STOCK" ] && [ -r "$SHIM" ] && [ -r "$CONF" ] &&
+   [ -x "$STOCK" ] && [ -r "$SHIM" ] && [ -r "$CONF" ] && [ -r "$PARK" ] &&
    [ "$(hash_of "$STOCK")" = "$STOCK_SHA256" ] &&
    [ "$(hash_of "$SHIM")" = "$SHIM_SHA256" ] &&
-   [ "$(hash_of "$CONF")" = "$CONF_SHA256" ]; then
+   [ "$(hash_of "$CONF")" = "$CONF_SHA256" ] &&
+   [ "$(hash_of "$PARK")" = "$PARK_SHA256" ]; then
     export ALSA_CONFIG_PATH="$CONF"
     export LD_PRELOAD="$SHIM"
     export HK_BT_INJECT_DIR=/tmp/hk-ap2/run/voice-inject

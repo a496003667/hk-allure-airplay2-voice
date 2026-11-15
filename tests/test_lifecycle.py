@@ -92,8 +92,14 @@ else: print('Front Left: Playback ['+s[k]+']')
             end=time.monotonic()+4
             while not (self.safe/'play.started').exists() and time.monotonic()<end: time.sleep(.01)
             if self.safe.exists():
-                (self.root/'clock').write_text('101.00 0.00\n')
-                (self.safe/'watchdog.heartbeat').write_text('101')
+                # /proc/uptime reads and the real watchdog's rename never
+                # expose a truncated empty value to a concurrent reader.
+                clock_next = self.root/'clock.next'
+                clock_next.write_text('101.00 0.00\n')
+                clock_next.replace(self.root/'clock')
+                beat_next = self.safe/'watchdog.heartbeat.next'
+                beat_next.write_text('101')
+                beat_next.replace(self.safe/'watchdog.heartbeat')
         t=threading.Thread(target=ack);t.start()
         result=self.call('start');t.join(5)
         self.assertEqual(result.returncode,0,result.stderr+(self.run/'hook.log').read_text())

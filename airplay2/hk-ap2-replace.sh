@@ -290,7 +290,7 @@ main() {
     while read -r sum perm target extra; do
         case "$target" in
             "${BASE%/*}/hk-voice/"*|"${BASE%/*}/hk-keys/"*|"${BASE%/*}/hk-lights/"*|\
-            "$BASE/hk-bt-open-redirect.so"|"$BASE/hk-bt-controller-wrapper.sh"|"$BASE/hk-bt-alsa.conf"|"$BASE/hk-bt-boot") needs_dependents=1;;
+            "$BASE/hk-bt-open-redirect.so"|"$BASE/libasound_module_pcm_hkbtpark.so"|"$BASE/hk-bt-controller-wrapper.sh"|"$BASE/hk-bt-alsa.conf"|"$BASE/hk-bt-boot") needs_dependents=1;;
         esac
     done <"$TX/candidate.manifest"
     if [ "$needs_dependents" = 1 ]; then

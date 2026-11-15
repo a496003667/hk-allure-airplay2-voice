@@ -10,6 +10,7 @@
 | soft-float 工具链 | `arm-unknown-linux-gnueabi`，本轮使用 GCC 8.5.0、glibc 2.27、Linux 3.10.108 头文件 |
 | hard-float 工具链 | `armv7-linux-gnueabihf`，本轮 GCC 15.2.0；产物需检查最大 GLIBC 符号不超过设备 2.19 |
 | 原厂 ALSA | 从自己固件提取的 hard-float `libasound.so.2`，仅供本地链接，不随仓库分发 |
+| ALSA 开发头文件 | `HK_ALSA_HEADERS` 指向含 `alsa/asoundlib.h` 的目录；蓝牙 ioplug 固定协议 1.0.1，需兼容原厂 ALSA 1.0.25 |
 | 隔离运行时依赖 | `runtime-inputs.lock.json` 固定第三方 ELF 输入的 SHA-256；需要自行准备对应依赖树 |
 | 服务端配置 | 设备 ID、API key、证书和私钥均为私有输入，不进入公开构建输入或 Git |
 
@@ -19,6 +20,7 @@
 
 ```sh
 export HK_STOCK_ASOUND=/absolute/path/to/stock/libasound.so.2
+export HK_ALSA_HEADERS=/absolute/path/to/alsa-development/include
 export HK_SOFT_DEPS=/absolute/path/to/soft-float-prefix
 export HK_SPS_SOURCE=/absolute/path/to/shairport-checkout
 export HK_SOFT_PREFIX=/absolute/path/to/toolchain/bin/arm-unknown-linux-gnueabi-
@@ -106,7 +108,7 @@ pending 未完成时普通启动保持静音并拒绝开始。保存事务内的
 
 ## 验收与实际限制
 
-完整测试运行 `python3 -m unittest discover -s tests -v`；另有 BusyBox、ARM raw IPC、ELF/GLIBC、哈希和打包检查。Shairport 的 `--version` 可在 ARM 模拟器运行；`-X` 读取配置后在当前模拟环境崩溃，旧实机基线二进制也有同样表现，不能把配置打印成功当作常驻启动通过。
+Linux 原生测试需 C 编译器与 ALSA 开发包（Debian/Ubuntu 为 `libasound2-dev`），新蓝牙后端测试只向文件/null 输出。完整测试运行 `python3 -m unittest discover -s tests -v`；另有 BusyBox、ARM raw IPC、ELF/GLIBC、哈希和打包检查。Shairport 的 `--version` 可在 ARM 模拟器运行；`-X` 读取配置后在当前模拟环境崩溃，旧实机基线二进制也有同样表现，不能把配置打印成功当作常驻启动通过。
 
 软件音量统一的是有效状态与控制来源：AirPlay 的 flat 映射、蓝牙的 33 级 Master、语音的源相关增益仍各在自己的必要位置。蓝牙混音已处于 Master 之前，不能再按 Master 重复衰减。机身按键保留对应来源控制；已经合成的语音片段不会重合成，正在播报时的实时响度仍待听测。DSP 汇流不等于已找到一个可安全调用的 DSP 主音量 API。
 
@@ -125,3 +127,6 @@ Stock BusyBox lacks `stat`, so permissions are decoded from POSIX `ls`, includin
 After verified staging, retain a separate verified updater/manifest and remove uploaded/extracted tmpfs copies while preserving the original private package on the host. `HK_AP2_UPDATE_RELEASE_STAGING=1` additionally removes `.new` duplicates after the complete installed set is verified and before startup; rollback still uses transaction backups. Startup requires both 8 MiB raw free and 48 MiB conservatively estimated available memory, excluding tmpfs and dirty/writeback cache and crediting half the reclaimable slab. Invalid counters fail closed. The existing 4 MiB free / 32 MiB available runtime protection remains unchanged.
 
 Disabling AirPlay retains shared Bluetooth/voice protection. Other modules have distinct persistent-disable and reload behavior as listed above. Automated and emulated tests do not establish audible pop prevention, bass output, physical-button loudness or sustained playback acceptance. The simulator's Shairport `-X` crash is shared by the old baseline; persistent startup remains an on-device test.
+
+
+The releasable Bluetooth PCM also needs ALSA development headers (`HK_ALSA_HEADERS`) and the stock hard-float libasound. It uses ioplug protocol 1.0.1; do not raise the protocol to match newer build headers without checking the stock library. Linux native tests require a C compiler and `libasound2-dev`, and use file/null output. Backend, private route, wrapper and boot pins form one transaction with the verified dependent reload helper; a library replacement alone does not update an already running player. Keep maintenance mute until user-present listening on the new backend.

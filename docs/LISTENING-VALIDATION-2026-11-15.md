@@ -109,3 +109,18 @@ English: The user manually played all 500/200/120/80/60 Hz segments over Bluetoo
 熟悉音乐对比：用户随后用蓝牙重听《可以了》前奏或熟悉音乐，反馈相对最初“几乎没有低频”的状态**明显改善，听感正常**。这项主观试听通过；未做校准声学测试或逐单元电测。
 
 Familiar-music comparison: the user subsequently reported that Bluetooth bass was **clearly improved and sounded normal** compared with the original near-absent bass. This subjective listening check passed; no calibrated acoustic or individual-driver electrical test was performed.
+
+
+## 2026-11-16：来源切换失败与新后端静音部署
+
+用户随后测试“手机蓝牙暂停且保持连接 → Mac AirPlay 播放”，反馈无声。原厂 PCM 仍由蓝牙线程持有，AirPlay 的新租约无法建立 DSP 时钟；这轮是已复现的接收器资源交接问题。保护静音后暂停了无声的 Mac 会话。原厂 stop / switchmode:wifi 命令未关闭 PCM，因此没有把成功响应当成交接完成。
+
+新增可释放底层 DSP/hardware slave 的私有蓝牙 ALSA ioplug，保持原厂虚拟句柄、手机音量、Harman DSP 和蓝牙同 PCM 语音混音。共享 hook 在创建新租约前静音、释放并验证硬件 closed，语音独立输出亦遵守该步骤；来源意图与打开中标记防止并发争抢。旧 voice 标记按五分钟有效期处理，控制 socket 经 run 重建仍可用。
+
+最终 **136 项 Linux/BusyBox 测试通过**，测试日志 SHA-256：`8455f12c6e25d92993c340a1b34d0d5aa3e69692841aa4d48a5ebdba20f33b37`。ARM 原厂 ALSA 空输出循环返回 0：同一虚拟 PCM 完成打开、写全零、park、占用期间丢弃、重新打开和关闭；真实声卡未被该检查打开。插件固定兼容原厂的 ioplug 1.0.1，最大 GLIBC 需求 2.17。一次测试失败来自模拟时钟文件直接截断写导致并发读到空值；改为与生产 heartbeat 一致的原子 rename 后，完整回归通过。
+
+九文件更新事务成功提交，返回 0、pending 清除、九文件 SHA-256 全部相符、运行时精确验证返回 0。新后端 SHA-256 为 `271f2c304eb52337f0143ac9eea44ce31984ec06210e2e9b7ffec98fa0d7cbd8`。受控重载播放器和受影响自定义模块后，rootApp 未重启；AirPlay 5.6、蓝牙桥、独立保护及语音监督/主循环各正常运行，端口 7000 监听。PCM closed，无租约，Master/Digital 0、Ext Spk off、I2S mute on，安装维护 hold/manual mute 保留。AirPlay 配置逐字节保留为 −30…−6 dB。私有备份、配置和完整日志未进入仓库。
+
+**本次尚未对新后端进行真实蓝牙、双向来源切换、语音或长时间听测。** 此前参考音、低频与熟悉音乐通过的结果属于上一版通路，不能替代本次回归。
+
+English: The subsequent user-present Bluetooth-paused/still-connected → Mac AirPlay test was silent: the stock player retained the exclusive PCM, preventing the new AirPlay lease from establishing its DSP clock. Supported stop/source-switch commands did not close the handle on this device. The new private ALSA ioplug keeps the stock virtual handle while releasing its DSP/hardware slave through a mute-first guarded handoff. It preserves the existing volume/DSP/mixing path, discards blocked samples, and uses source intent plus an in-flight-open marker to avoid races. Control survives runtime-directory reconstruction. All 136 Linux/BusyBox tests and the stock-ALSA null-only open/park/reopen cycle passed. The nine-file update committed with return code 0, no pending transaction, exact hashes and runtime verification. The player was reloaded under maintenance mute; rootApp stayed running, and AP2/bridge/watchdog/voice were healthy with PCM closed. AirPlay configuration was preserved byte-for-byte. Audible Bluetooth, bidirectional handoff, voice and sustained tests on this backend remain pending; earlier bass/music acceptance does not substitute for them.

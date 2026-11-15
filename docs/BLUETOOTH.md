@@ -24,7 +24,7 @@ Allure 的 PCM5121 两个输出通道不是一个普通立体声对：
 这能说明软件分频路径存在差异，不能单凭它排除低音功放、接线或单元故障。当前未找到可独立启用低音单元的已验证控制接口。蓝牙路径应为：
 
 ```text
-a01controller -> Master softvol -> harmandsp -> hw:0,0
+a01controller -> Master softvol -> hkbtpark -> harmandsp -> hw:0,0
 ```
 
 本次离线修复分支的 AirPlay 使用 Shairport 软件音量与新增的 24 dB flat 范围，
@@ -82,8 +82,8 @@ armv7-linux-gnueabihf-gcc -Os -fPIC -shared \
 
 在已经取得 root 维护通道、且手机蓝牙暂停、音箱保持三层硬静音时：
 
-1. 将 `hk-bt-controller-wrapper.sh`、`hk-bt-open-redirect.so` 和
-   `hk-bt-alsa.conf` 放到 `/vendor/airplay2/`。
+1. 将 `hk-bt-controller-wrapper.sh`、`hk-bt-open-redirect.so`、
+   `libasound_module_pcm_hkbtpark.so` 和 `hk-bt-alsa.conf` 放到 `/vendor/airplay2/`。
 2. 将 `hk-bt-boot` 放到 `/vendor/airplay2/` 并设为可执行。
 3. 用 `init/S05linkplay.sh` 替换 `/etc/init.d/S05linkplay.sh`。原脚本是符号
    链接；替换前要留下回滚副本。
@@ -171,3 +171,20 @@ The user also heard every 500/200/120/80/60 Hz segment and felt low-frequency vi
   <https://zaage.it/projects/harman-kardon-allure-software/>
 - 独立复刻项目中的原厂音量模型：
   <https://git.zaage.it/robert/allure-os/src/branch/main/allure/volume.py>
+
+
+## 可释放的蓝牙 PCM（2026-11-16）
+
+后续实机切换复现了另一个问题：手机暂停但保留蓝牙连接时，原厂播放器仍持有硬件 PCM。AirPlay 已获得新租约，却无法打开自己的 DSP 时钟，最终保护静音。原厂 `setPlayerCmd:stop` 和 `setPlayerCmd:switchmode:wifi` 的命令均成功返回，后者也改变了模式，但本机的声卡句柄仍未关闭；这些实机观察不能由通用 [HTTP API 文档](https://developer.arylic.com/httpapi/)的命令返回值代替。
+
+新增 `hk-bt-pcm.c` / `libasound_module_pcm_hkbtpark.so`，作为蓝牙私有配置里的 ALSA ioplug。原厂播放器继续持有同一个虚拟 PCM；只有允许的新手机采样到达时才打开原有 Harman DSP 硬件通路。其他来源占用时丢弃蓝牙采样，恢复后不补播。每次重开仍调用原厂可选的 `snd_pcm_info_set(..., 11)` 标记蓝牙客户端；Master 音量仍在 DSP 之前。
+
+共享 hook 在新来源租约产生前，先发布来源意图并等待正在进行的蓝牙 open 完成，再淡出、硬静音并验证数字 0 / Ext Spk off / I2S mute on。私有 Unix socket 的 park 请求需要匹配当前轮次标记、旧租约已释放且没有蓝牙 owner；ACK 后还必须实际读到硬件 PCM closed。语音的独立输出也先经过这一释放步骤；蓝牙同 PCM 混音保持原路径。
+
+控制 socket 为 `/tmp/hk-ap2/bt-pcm-control`，打开中标记为同目录 `bt-pcm-opening`，均位于可被重建的 `run/` 之外。回归覆盖运行时删除并重建 run 后仍能释放声卡，以及新来源意图与蓝牙 open 并发时退让。语音占用标记沿用共享脚本的五分钟有效期。控制线程位于原厂播放器内，不新增网络监听服务。
+
+本机原厂 ALSA 1.0.25 只接受 ioplug 1.0.0/1.0.1。插件明确使用 1.0.1 协议；所用字段与[旧 SDK](https://raw.githubusercontent.com/alsa-project/alsa-lib/v1.0.24/include/pcm_ioplug.h)一致，ARM 产物最大 GLIBC 需求为 2.17。原厂 aplay 的 info 查询依赖全局硬件 FD，连直接 null 都会失败；兼容性检查使用与播放器一致的 open/set_params/writei 调用，并只向 null 写全零，完整打开/park/占用期间丢弃/重新打开/关闭循环返回 0。该检查不代替真实音频试听。
+
+完整 **136 项 Linux/BusyBox 测试通过**；九文件受控更新返回 0、事务提交、pending 清除、全部文件哈希及运行时精确验证通过。播放器在保护静音下受控重载，rootApp 保持运行，硬件 PCM 已 closed，维护 hold 仍保留。AirPlay 配置逐字节保留，软件范围仍为 −30…−6 dB。**新后端的真实蓝牙播放、来源双向切换、语音回归及长测仍待完成**；上文蓝牙与低频通过记录属于加入本后端之前的版本。
+
+English: The retained stock hardware handle reproduced a silent Bluetooth-to-AirPlay handoff. Stop and Wi-Fi source commands returned successfully but did not close PCM on this speaker. The new private ALSA ioplug keeps the stock virtual handle while returning its DSP/hardware slave through the guarded hook before a new lease. It discards blocked phone samples and reopens only for new allowed samples, retaining pre-DSP Master volume and the stock Bluetooth client tag. Source intent and an in-flight-open marker protect concurrent takeover; control survives run-directory reconstruction. Native tests cover actual file-descriptor release/reopen, discarded samples, guards, socket lifecycle and source races. The stock-ALSA null-only cycle and all 136 Linux/BusyBox tests passed. The nine-file deployment committed with exact hashes and runtime verification; maintenance mute remains. AirPlay configuration and its −30…−6 dB range are preserved. Audible Bluetooth, bidirectional handoff, voice regression and sustained testing on this backend remain pending.

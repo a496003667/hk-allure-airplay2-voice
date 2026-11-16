@@ -157,3 +157,8 @@ Builds also produce `hk-stock-audio-state`, released with its controller pin and
 蓝牙最新开声分支不启动临时 `apple_remote` 功放辅助进程，也不写 AirPlay client3 的静音状态；通过原厂蓝牙来源意图与全局/PA 回读确认开启条件。只有关闭输出的数字静音准备可以与 watchdog 确认重叠，模拟基线和任何开启操作仍在确认之后。AirPlay 和独立语音保留原有辅助进程顺序。若在维护中人为复现原厂全局静音，结束时须在已静音且声卡空闲的条件下通过官方接口恢复并回读，不能把测试状态留给其他来源。
 
 The current Bluetooth opening path does not launch temporary `apple_remote` amplifier helpers or change AirPlay client3 mute. It validates native Bluetooth intent and reads back global/PA state. Only digital output closing may overlap watchdog acknowledgement; baseline writes and every enable operation still follow it. AirPlay and standalone voice retain their helper sequence. Any global-mute state deliberately introduced during maintenance must be restored through the official interface and checked with output muted and the PCM idle before leaving it for another source.
+
+
+首次蓝牙开声的临时全局静音标记保存在 `/tmp/hk-ap2/bt-cold-global-mute`；重建 run 目录不会清除恢复依据。维护清理前需先确认临时全局静音已解除，不能只删标记。正常失败/取消先物理静音再清理；SIGKILL 等遗留状态由下一来源在静音时钟、租约和 watchdog 都有效时恢复后才开输出。
+
+The Bluetooth cold-clock mute recovery marker is outside the disposable run directory. Maintenance must verify the temporary global override has cleared before removing it. Normal failure/cancellation closes output before cleanup; a marker left by SIGKILL is recovered by the next source under a guarded silent clock before enabling output.

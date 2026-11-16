@@ -18,6 +18,9 @@ APPLE_REMOTE=${HK_AP2_APPLE_REMOTE:-/system/workdir/bin/apple_remote}
 APPLE_REMOTE_SOCKET=${HK_AP2_APPLE_REMOTE_SOCKET:-/tmp/RequestAppleRemote}
 PA_UNMUTE_LIB=${HK_AP2_PA_UNMUTE_LIB:-$ROOT/lib/libhk-airplay-unmute.so}
 PA_MUTE_LIB=${HK_AP2_PA_MUTE_LIB:-$ROOT/lib/libhk-airplay-mute.so}
+BT_PA_READY=$RUN/bt-pa-ready
+BT_COLD_GLOBAL=${HK_BT_COLD_GLOBAL:-${RUN%/run}/bt-cold-global-mute}
+BT_PCM_OWNER=${HK_BT_PCM_OWNER:-${RUN%/run}/bt-pcm-owner}
 PA_LOG="$RUN/pa-hook.log"
 HOOK_LOG="$RUN/hook.log"
 # Speaker hand-off with the on-device voice assistant, which calls this hook
@@ -147,22 +150,44 @@ stock_pa_mute() {
         grep -q "Snd_Ctrl airplay to mute $level"
 }
 
-bt_sync_global_mute() {
+pause_bluetooth_for_airplay() {
+    # Parking releases the local sound card; AVRCP pause also stops the
+    # phone's timeline. Never send resume when AirPlay later releases it.
+    _bp_data=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+    _bp_mode=$(printf '%s' "$_bp_data" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+    [ "$_bp_mode" = 41 ] || return 0
+    case "$_bp_data" in *'"status":"stop"'*|*'"status":"pause"'*) return 0;; esac
+    printf '%s' "$_bp_data" | grep -q '"status":"play"' || return 1
+    printf 'airplay-%s\n' "$(audio_now)" >"$RUN/bt-wait-pcm" || return 1
+    "$REQUEST" "$BT_PLAYER_SOCKET" setPlayerCmd:onepause 1200 >/dev/null 2>&1 || true
+    _bp_n=0
+    while [ "$_bp_n" -lt 5 ]; do
+        _bp_data=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+        case "$_bp_data" in
+            *'"mode":"-1"'*|*'"status":"stop"'*|*'"status":"pause"'*)
+                hook_log 'Bluetooth phone pause acknowledged before AirPlay takeover'
+                return 0;;
+        esac
+        usleep 200000 2>/dev/null || sleep 1
+        _bp_n=$((_bp_n + 1))
+    done
+    hook_log 'Bluetooth phone pause not acknowledged; AirPlay output remains closed'
+    return 1
+}
+
+stock_sync_global_mute() {
     # A source can be unmuted while the stock global override still holds
-    # the amplifier closed. Synchronize only an explicitly unmuted Bluetooth
-    # source, after establishing the clock and before restoring DAC gain.
+    # the amplifier closed. Bluetooth validates explicit source intent;
+    # another source calls this only to recover our retained cold marker.
+    # Both require a guarded silent clock before restoring DAC gain.
     [ "$(mixer_values 1)" = '0,0' ] &&
         [ "$(switch_state 'Ext Spk')" = off ] && pcm_clock_live && output_guard_ok || return 1
     [ -x "$STOCK_AUDIO_STATE" ] && [ -x "$REQUEST" ] || return 1
     [ "$(sha256sum "$STOCK_AUDIO_LIB" 2>/dev/null | awk '{print $1}')" = "$STOCK_AUDIO_LIB_SHA256" ] || return 1
-    _bg_player=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
-    printf '%s' "$_bg_player" | grep -q '"mode":"41"' &&
-        printf '%s' "$_bg_player" | grep -q '"status":"play"' &&
-        printf '%s' "$_bg_player" | grep -q '"mute":"0"' || return 1
     _bg_rc=0
     _bg_state=$(env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted) || _bg_rc=$?
     case "$_bg_rc" in
-        0) return 0 ;;
+        0) rm -f "$BT_COLD_GLOBAL"; return 0 ;;
         3) ;;
         *) return 1 ;;
     esac
@@ -174,12 +199,57 @@ bt_sync_global_mute() {
     while [ "$_bg_try" -lt 10 ]; do
         output_guard_ok && pcm_clock_live && [ "$(mixer_values 1)" = '0,0' ] || return 1
         if env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted >/dev/null 2>&1; then
-            hook_log "Bluetooth stock global and amplifier mute cleared and verified"
+            rm -f "$BT_COLD_GLOBAL"
+            hook_log "stock global and amplifier mute cleared and verified"
             return 0
         fi
         _bg_try=$((_bg_try + 1))
         usleep 100000 2>/dev/null || sleep 1
     done
+    return 1
+}
+
+
+bt_sync_global_mute() {
+    _bg_player=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+    printf '%s' "$_bg_player" | grep -q '"mode":"41"' &&
+        printf '%s' "$_bg_player" | grep -q '"status":"play"' &&
+        printf '%s' "$_bg_player" | grep -q '"mute":"0"' || return 1
+    stock_sync_global_mute
+}
+
+bt_cold_pre_mute() {
+    # A source mute alone need not close the shared PA. Hold the official
+    # global override across a fresh clock's analogue/I2S transitions.
+    [ "$(mixer_values 1)" = '0,0' ] && [ "$(switch_state 'Ext Spk')" = off ] &&
+        output_guard_ok && pcm_clock_live || return 1
+    printf '%s\n' "${HK_AUDIO_TOKEN:-cold-clock}" >"$BT_COLD_GLOBAL.tmp" &&
+        mv "$BT_COLD_GLOBAL.tmp" "$BT_COLD_GLOBAL" || return 1
+    "$REQUEST" "$IOGUARD_SOCKET" GNOTIFY=AUDIOMUTE:1 1200 >/dev/null 2>&1 || true
+    _bc_try=0
+    while [ "$_bc_try" -lt 10 ]; do
+        output_guard_ok && pcm_clock_live || return 1
+        _bc_state=$(env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE") || return 1
+        [ "$_bc_state" != 'PA mute=1 force_mute=1 gate=1' ] || return 0
+        _bc_try=$((_bc_try + 1))
+        usleep 100000 2>/dev/null || sleep 1
+    done
+    return 1
+}
+
+restore_cold_global_mute() {
+    [ -f "$BT_COLD_GLOBAL" ] || return 0
+    # Failed/cancelled starts must not leave their temporary override for
+    # another source. Closing output precedes this cleanup; no clock opens.
+    [ "$(mixer_values 1)" = '0,0' ] && [ "$(switch_state 'Ext Spk')" = off ] &&
+        [ "$(switch_state 'aml audio i2s mute')" = on ] || return 1
+    [ "$(sha256sum "$STOCK_AUDIO_LIB" 2>/dev/null | awk '{print $1}')" = "$STOCK_AUDIO_LIB_SHA256" ] || return 1
+    "$REQUEST" "$IOGUARD_SOCKET" GNOTIFY=AUDIOMUTE:0 1200 >/dev/null 2>&1 || true
+    if env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --global-unmuted >/dev/null 2>&1; then
+        rm -f "$BT_COLD_GLOBAL"
+        return 0
+    fi
+    hook_log 'temporary Bluetooth global mute cleanup awaits next guarded start'
     return 1
 }
 
@@ -310,6 +380,7 @@ start_failed() {
     hook_log "start failed: $reason"
     hard_mute
     if [ "$USE_STOCK_PA" = "1" ] && [ -z "${HK_AP2_BT:-}" ]; then stock_pa_mute 1 || true; fi
+    restore_cold_global_mute || true
     clear_play_lease
     mixer_set "Auto Mute" on || true
     exit 1
@@ -368,6 +439,7 @@ case "${1:-}" in
         exit 0
         ;;
     start)
+        takeover_bt=0
         hook_log "start requested armed=$([ -f "$SAFE/armed" ] && echo yes || echo no) tripped=$([ -f "$SAFE/tripped" ] && echo yes || echo no)"
         if [ -n "${HK_AP2_BT:-}" ] && voice_owns; then
             hook_log "Bluetooth start refused: voice owns speaker"
@@ -388,6 +460,7 @@ case "${1:-}" in
             fi
             audio_now >"$CLAIM" 2>/dev/null
             if [ -f "$BT_OWNER" ]; then
+                takeover_bt=1
                 : >"$BT_RELEASE"
                 speaker_unlock
                 tries=0
@@ -414,7 +487,12 @@ case "${1:-}" in
         fi
         audio_voice_generation_valid || exit 1
         if [ -z "${HK_AP2_BT:-}" ]; then
+            _park_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM_STATUS" 2>/dev/null)
+            if [ -z "${HK_AP2_VOICE:-}" ] && audio_bt_pcm_owned "$_park_owner"; then takeover_bt=1; fi
             park_bluetooth_pcm || start_failed 'Bluetooth hardware PCM release failed'
+            if [ -z "${HK_AP2_VOICE:-}" ] && [ "$takeover_bt" = 1 ] && [ -z "${HK_AP2_REOPEN:-}" ]; then
+                pause_bluetooth_for_airplay || start_failed 'Bluetooth phone pause failed'
+            fi
         fi
         if audio_lease_is_caller && [ "$lease_phase" = active ] && pcm_clock_live &&
            [ "$(switch_state 'Ext Spk')" = on ]; then
@@ -438,6 +516,24 @@ case "${1:-}" in
         fi
         wait_for_lease_ack "$previous_heartbeat" ||
             start_failed "watchdog did not acknowledge playback lease"
+
+        bt_pa_key=
+        if [ -n "${HK_AP2_BT:-}" ] && [ "$USE_STOCK_PA" = 1 ]; then
+            [ -x "$STOCK_AUDIO_STATE" ] &&
+                [ "$(sha256sum "$STOCK_AUDIO_LIB" 2>/dev/null | awk '{print $1}')" = "$STOCK_AUDIO_LIB_SHA256" ] ||
+                start_failed 'Bluetooth stock layout verification failed'
+            output_guard_ok && pcm_clock_live && [ "$(mixer_values 1)" = '0,0' ] ||
+                start_failed 'Bluetooth pre-mute guard failed'
+            # Only a verified descriptor generation can reuse the warm path.
+            # Reconnect/park creates a new generation and needs a native
+            # global pre-mute before analogue/I2S setup. Client3 is untouched.
+            bt_pa_key=$(read_file "$BT_PCM_OWNER")
+            if [ -z "$bt_pa_key" ] || [ "$(read_file "$BT_PA_READY")" != "$bt_pa_key" ]; then
+                mixer_set 'Ext Spk' off || start_failed 'Bluetooth external pre-mute failed'
+                bt_cold_pre_mute || start_failed 'Bluetooth cold amplifier pre-mute failed'
+                hook_log 'Bluetooth new PCM amplifier pre-mute verified'
+            fi
+        fi
 
         # Prepare every gain and switch while the physical path is still off.
         # The stock amplifier is enabled only once here, while the DAC remains
@@ -488,6 +584,9 @@ case "${1:-}" in
                 hook_log "Bluetooth native amplifier acknowledged"
             else
                 stock_pa_mute 0 || start_failed "stock PA unmute failed"
+                if [ -f "$BT_COLD_GLOBAL" ]; then
+                    stock_sync_global_mute || start_failed "orphaned Bluetooth global mute recovery failed"
+                fi
                 hook_log "stock PA unmuted"
             fi
         fi
@@ -510,6 +609,11 @@ case "${1:-}" in
         output_guard_ok || start_failed "guard lost after fade-in"
         lease_phase=active
         audio_write_lease || start_failed "could not commit active lease"
+        if [ -n "${HK_AP2_BT:-}" ] && [ -n "$bt_pa_key" ]; then
+            [ "$(read_file "$BT_PCM_OWNER")" = "$bt_pa_key" ] || start_failed 'Bluetooth PCM changed during startup'
+            printf '%s\n' "$bt_pa_key" >"$BT_PA_READY.tmp" && mv "$BT_PA_READY.tmp" "$BT_PA_READY" ||
+                start_failed 'Bluetooth warm state publication failed'
+        fi
         if [ "$lease_source" != voice ]; then printf '%s\n' "$lease_source" >"$RUN/media-source"; fi
         hook_log "speaker enabled"
         exit 0
@@ -538,6 +642,7 @@ case "${1:-}" in
         hook_log "${1:-stop} requested"
         hard_mute
         if [ "$USE_STOCK_PA" = "1" ] && [ -z "${HK_AP2_BT:-}" ]; then stock_pa_mute 1 || true; fi
+        restore_cold_global_mute || true
         clear_play_lease
         if [ "$(audio_source)" = airplay ] || [ "$1" = mute ]; then rm -f "$DEFERRED" "$CLAIM"; fi
         mixer_set "Auto Mute" on || true

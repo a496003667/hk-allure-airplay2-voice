@@ -2,6 +2,18 @@
 
 本记录接续 [11 月 14 日部署记录](DEVICE-VALIDATION-2026-11-14.md)。结论只适用于作者这台音箱及本轮 Mac“音乐”AirPlay 测试。
 
+## 2026-11-17：重连首播与 AirPlay 接管暂停
+
+用户随后确认短暂爆音仅发生在重新连接手机后的第一次蓝牙播放，普通暂停/恢复正常；AirPlay 接管时手机蓝牙进度仍在前进。日志显示硬件已经释放并切换到 AirPlay 租约和 DSP 时钟，旧实现只停本地输出，没有发送手机暂停。
+
+新修正按实际 PCM 持有者/FD 代次记录功放准备状态。新代次在数字为零、Ext Spk 关闭、时钟与租约有效时，通过原厂 GNOTIFY 将全局与 PA 静音同时确认为 1，然后才修改模拟基线和 I2S；时钟稳定后解除并回读，再开输出。普通暂停恢复保留快速路径；AirPlay client3、音量与 DSP 配置不变。
+
+失败或取消先关闭物理输出，再清理本轮临时全局静音。恢复标记位于 `/tmp/hk-ap2/bt-cold-global-mute`，不随 run 目录重建丢失；如果清理未确认则保留标记，下一来源在受保护的静音时钟下恢复后才允许开声。AirPlay 接管先让蓝牙释放硬件，再发送 `setPlayerCmd:onepause` 并回读 stop/pause；通知成功但未确认暂停时保持关闭，不安排蓝牙自动续播。
+
+**191 项完整 Linux/BusyBox 回归及最终 38 项复核通过。** 覆盖新/旧 PCM 代次、功放预静音不确认、启动失败清理、遗留全局状态恢复、真实 hook 的 park→手机暂停→开声顺序及暂停未确认拒绝输出。实机硬静音、声卡空闲的官方接口检查得到全局/PA 0→1→0，未写音频采样。两文件事务已提交、返回 0、pending 清除，哈希和运行时精确核验通过；AirPlay 配置逐字节保留。**本版重连首播是否无爆音、手机实际暂停、反向切换、语音与长测仍待验收。**
+
+English: The user narrowed the pop to the first Bluetooth play after reconnect; ordinary pause/resume remained normal. AirPlay had acquired the hardware and lease, but the phone timeline continued because the old handoff only stopped local output. A fresh descriptor generation now requires a guarded zero-DAC baseline and acknowledged global/PA mute before analogue/I2S setup; warm resumes retain the fast path and client3/volume/DSP configuration are unchanged. Failed or cancelled starts close physical output before clearing their temporary override. The recovery marker lives outside the disposable run directory; an unconfirmed cleanup is recovered under the next source's guarded silent clock. AirPlay parks hardware, sends real phone pause and requires acknowledgement before opening, with no automatic Bluetooth resume. All 191 tests plus a final 38-test check pass, including full-hook takeover ordering, unacknowledged pause and mute, generation reuse, failed-start cleanup and orphan recovery. A no-audio stock-interface probe verified global/PA 0→1→0 under maintenance mute. The two-file transaction committed with return code 0, no pending journal, matching hashes and exact runtime verification; AirPlay configuration is preserved byte for byte. First-play listening, actual phone pause, reverse handoff, voice and sustained acceptance remain pending on this revision.
+
 ## 最新结果：蓝牙全局静音修复与启动加速（2026-11-17）
 
 后续新蓝牙后端的多轮试听曾完全无声；下文早期通过记录不能替代该版本验收。最终只读诊断确认音乐已经进入实际 PCM 缓冲区，而原厂全局 `force_mute` 与 PA mute 仍为 1。播放器自身重复 `mute:0` 会去重，不重新通知 IOGuard。有效蓝牙租约和时钟下，DAC 数字级先降到零，通过共享 guard，再使用官方 `GNOTIFY=AUDIOMUTE:0` 并回读全局/PA 均解除后恢复原电平；没有增大手机或软件音量。用户确认音乐清楚、无爆音或音量突增。173 项回归的固化版安装后，用户又确认开始播放、暂停约三秒及恢复都正常，无异常声音。
@@ -203,3 +215,5 @@ English: The live holder-identity revision was audible but buzzed and popped. St
 维护静音下还比较了只打开、设置参数、关闭且完全不写采样的 DSP 调用：S16/48 kHz 在有无原厂 client11 标记时均成功，硬件 period64/buffer24000；直接 S32 设置参数返回 −22。此结果只能排除 client11 单独改变本次硬件 period 的猜测，不能代替经 plug 的 AirPlay 路径，也不能证明 S16 音频处理正常。
 
 English: Live diagnostics found nonzero music at both entry and post-Master: peaks around 12,000 and 100 initially, rising to roughly 200–250 after the user gradually increased phone volume. The user still heard nothing; the maintenance tool did not raise gain. External read-only DMA observation failed and produced no output-level evidence. A gated `levels` query now reads only the backend's own mapped PCM data and returns aggregate peaks/nonzero counts without changing samples, gains or registers. Native tests verify refusal when disabled/unmapped and correct, nonmutating reads of a real shared mapping. All 163 tests pass. The six-file output-diagnostic transaction committed with return code 0, matching hashes, no pending transaction and exact verification. It remains under maintenance mute pending a new user-started stream; silence is unresolved. Separate no-sample parameter-only probes accepted S16/48 kHz with and without client11 and identical hardware periods; direct S32 parameters failed. These results neither test the plug-based AirPlay route nor establish audible fidelity.
+
+本轮完整回归日志 SHA-256：`457f4550b527ead5f6a9abb833b7bc7ccc58a3128124cd8c6234925c66b5644a`；恢复标记最终位置复核 SHA-256：`b6c2754cca8ff18b79c5de6f2abea536be70db024b2a455627b8a53ba48ec95e`。

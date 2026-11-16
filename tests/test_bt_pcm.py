@@ -1,6 +1,7 @@
 """Real ALSA PCM/Unix control tests; the slave writes a file over null audio."""
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import socket
@@ -29,12 +30,16 @@ class BluetoothPcmTest(unittest.TestCase):
 #include <stdio.h>
 #include <stdlib.h>
 #include <poll.h>
+#include <time.h>
+#include <string.h>
 int main(void) {
     snd_pcm_t *pcm;
+    int mmap = getenv("HK_TEST_MMAP") != NULL;
     int rc = snd_pcm_open(&pcm, "test_bt", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
     if (rc < 0) { fprintf(stderr, "open: %s\n", snd_strerror(rc)); return 2; }
-    rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                            2, 48000, 0, 500000);
+    rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
+                            mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED,
+                            2, getenv("HK_TEST_RATE") ? (unsigned)atoi(getenv("HK_TEST_RATE")) : 48000, 1, 500000);
     if (rc < 0) { fprintf(stderr, "params: %s\n", snd_strerror(rc)); return 3; }
     puts("ready"); fflush(stdout);
     char line[40];
@@ -51,7 +56,23 @@ int main(void) {
         }
         short samples[512];
         for (int i = 0; i < 512; ++i) samples[i] = (short)atoi(line);
-        long n = snd_pcm_writei(pcm, samples, 256);
+        char *size = strchr(line, ' ');
+        unsigned frames = size ? (unsigned)atoi(size + 1) : 256;
+        if (!frames || frames > 256) return 4;
+        long n = mmap ? snd_pcm_mmap_writei(pcm, samples, frames) : snd_pcm_writei(pcm, samples, frames);
+        if (getenv("HK_TEST_RETRY")) {
+            long total = n > 0 ? n : 0;
+            for (int tries = 0; total < frames && tries < 200 && (n >= 0 || n == -EAGAIN); ++tries) {
+                if (n <= 0) {
+                    snd_pcm_wait(pcm, 10);
+                    struct timespec retry = {0, 1000000};
+                    nanosleep(&retry, NULL);
+                }
+                n = snd_pcm_writei(pcm, samples + total * 2, frames - total);
+                if (n > 0) total += n;
+            }
+            n = total;
+        }
         printf("wrote %ld\n", n); fflush(stdout);
     }
     snd_pcm_close(pcm);
@@ -82,6 +103,10 @@ int snd_pcm_open(snd_pcm_t **p, const char *name, snd_pcm_stream_t stream, int m
         cls.delayed = cls.build / 'delayed.so'
         subprocess.run(['cc', '-shared', '-fPIC', str(delayed), '-ldl',
                         '-o', str(cls.delayed)], check=True, capture_output=True)
+        cls.clock = cls.build / 'libasound_module_pcm_hkclock.so'
+        subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-DPIC', '-shared', '-fPIC',
+                        str(REPO / 'tests/alsa-clock-sink.c'), '-lasound', '-o', str(cls.clock)],
+                       check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -133,9 +158,9 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
             self.fail(proc.stderr.read())
         return line
 
-    def write(self, proc, sample=1111):
-        proc.stdin.write(f'{sample}\n'); proc.stdin.flush()
-        self.assertEqual(self.line(proc), 'wrote 256')
+    def write(self, proc, sample=1111, frames=256):
+        proc.stdin.write(f'{sample} {frames}\n'); proc.stdin.flush()
+        self.assertEqual(self.line(proc), f'wrote {frames}')
 
     def holds_capture(self, proc):
         for fd in (Path('/proc') / str(proc.pid) / 'fd').iterdir():
@@ -264,6 +289,102 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
         self.assertFalse(self.opening.exists())
         self.assertFalse(self.holds_capture(proc), 'late open must back out after a new claim')
         self.assertEqual(self.park(), b'parked\n')
+
+    def test_mmap_client_parks_and_reopens_without_replaying_samples(self):
+        self.env['HK_TEST_MMAP'] = '1'
+        self.test_retained_handle_parks_and_reopens_only_on_new_allowed_samples()
+
+    def test_alsa_software_layer_can_negotiate_mmap_slave(self):
+        text = self.config.read_text().replace('pcm.test_bt { type hkbtpark', 'pcm.virtual_bt { type hkbtpark')
+        text += '''pcm.test_bt {
+ type route
+ slave.pcm "virtual_bt"
+ slave.channels 2
+ ttable.0.0 1
+ ttable.1.1 1
+}\n'''
+        self.config.write_text(text)
+        self.test_retained_handle_parks_and_reopens_only_on_new_allowed_samples()
+
+    def use_shipped_adapter(self):
+        shipped = (REPO / 'airplay2/hk-bt-alsa.conf').read_text()
+        adapter = re.search(r'pcm\.hk_bt_dsp_client\s*\{[^}]+\}', shipped)
+        parking = re.search(r'pcm\.hk_bt_parking\s*\{[^}]+\}', shipped)
+        self.assertIsNotNone(adapter)
+        self.assertIsNotNone(parking)
+        text = re.sub(r'pcm\.test_bt\s*\{[^}]+\}', '''pcm.test_bt {
+ type route
+ slave.pcm "hk_bt_dsp_client"
+ slave.channels 2
+ ttable.0.0 1
+ ttable.1.1 1
+}''', self.config.read_text())
+        self.config.write_text(text + adapter.group() + '\n' +
+                               parking.group().replace('slave "hk_bt_dsp"', 'slave "capture"') + '\n')
+        self.env['HK_TEST_RATE'] = '44100'
+        self.env['HK_TEST_RETRY'] = '1'
+
+    def test_shipped_dsp_adapter_resamples_phone_input_before_parking(self):
+        # Use the actual shipped adapter with a file/null sink in place of
+        # proprietary Harman DSP. Count output frames to prove resampling;
+        # a permissive null open alone cannot catch the target-only failure.
+        self.use_shipped_adapter()
+        proc = self.launch()
+        blocks = 1000
+        for _ in range(blocks):
+            self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+        proc.stdin.write('q\n'); proc.stdin.flush(); proc.wait(timeout=2)
+        output_frames = self.capture.stat().st_size // 4
+        input_frames = blocks * 256
+        self.assertGreater(output_frames, input_frames * 1.05)
+        self.assertLess(output_frames, input_frames * 1.10)
+        log = (self.run / 'bt-pcm.log').read_text()
+        self.assertIn('virtual params: rate=48000 ', log,
+                      'the retained PCM must count frames at the DSP hardware rate')
+
+    def test_shipped_rate_adapter_streams_across_paced_hardware_buffers(self):
+        self.use_shipped_adapter()
+        text = self.config.read_text().replace('slave.pcm "null"', 'slave.pcm "paced"')
+        self.config.write_text(text + f'\npcm_type.hkclock {{ lib "{self.clock}" }}\npcm.paced {{ type hkclock }}\n')
+        proc = self.launch()
+        # Cross more than two 0.5-second buffers at actual playback speed,
+        # not just the instant consumption provided by an ALSA null sink.
+        for _ in range(220):
+            self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+        (self.run / 'ap2-claim').touch()
+        self.assertEqual(self.park(), b'parked\n')
+        self.assertFalse(self.holds_capture(proc))
+        for _ in range(220):
+            self.write(proc, 2222)
+        self.assertFalse(self.holds_capture(proc))
+        (self.run / 'ap2-claim').unlink()
+        for _ in range(220):
+            self.write(proc, 3333)
+        self.assertTrue(self.holds_capture(proc))
+
+    def test_parking_exactly_full_ring_still_allows_discard_and_reopen(self):
+        hold = self.root / 'freeze-clock'
+        hold.touch()
+        self.env.update({'HK_TEST_CLOCK_HOLD': str(hold), 'HK_TEST_RETRY': '1'})
+        self.config.write_text(self.config.read_text().replace('slave.pcm "null"', 'slave.pcm "paced"') +
+                               f'\npcm_type.hkclock {{ lib "{self.clock}" }}\npcm.paced {{ type hkclock }}\n')
+        proc = self.launch()
+        for _ in range(93):
+            self.write(proc)
+        self.write(proc, frames=192)  # exactly the 24,000-frame ring
+        (self.run / 'ap2-claim').touch()
+        self.assertEqual(self.park(), b'parked\n')
+        self.assertFalse(self.holds_capture(proc))
+        for _ in range(120):
+            self.write(proc, 2222)
+        self.assertFalse(self.holds_capture(proc))
+        hold.unlink()
+        (self.run / 'ap2-claim').unlink()
+        for _ in range(220):
+            self.write(proc, 3333)
+        self.assertTrue(self.holds_capture(proc))
 
 
 if __name__ == '__main__':

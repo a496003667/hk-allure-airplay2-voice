@@ -31,9 +31,10 @@ struct bt_pcm {
     pthread_mutex_t mutex;
     pthread_t thread;
     int server, timer, threaded, stopped;
+    int transfer_logged;
     dev_t socket_dev;
     ino_t socket_ino;
-    snd_pcm_uframes_t written;
+    uint64_t written, reported;
     uint64_t retry_after_ns;
 };
 
@@ -146,7 +147,28 @@ static int open_slave(struct bt_pcm *p)
     rc = snd_pcm_set_params(p->slave, p->io.format,
                            SND_PCM_ACCESS_RW_INTERLEAVED,
                            p->io.channels, p->io.rate, 1, 500000);
+    if (rc >= 0) {
+        /* A fresh slave must start before filling all the retained
+         * virtual ring: the outer software/rate layers can already have
+         * pending frames. Keep a half-buffer prefill, at least a period. */
+        snd_pcm_uframes_t buffer = 0, period = 0;
+        snd_pcm_sw_params_t *sw;
+        snd_pcm_sw_params_alloca(&sw);
+        rc = snd_pcm_get_params(p->slave, &buffer, &period);
+        if (rc >= 0 && (!buffer || !period || period > buffer)) rc = -EINVAL;
+        snd_pcm_uframes_t threshold = buffer / 2;
+        if (threshold < period) threshold = period;
+        if (rc >= 0) rc = snd_pcm_sw_params_current(p->slave, sw);
+        if (rc >= 0) rc = snd_pcm_sw_params_set_start_threshold(p->slave, sw, threshold);
+        if (rc >= 0) rc = snd_pcm_sw_params(p->slave, sw);
+    }
     if (rc < 0 || !open_allowed(p)) {
+        if (rc < 0) {
+            char message[192];
+            snprintf(message, sizeof(message), "Bluetooth DSP slave parameters failed: %d (%s)",
+                     rc, snd_strerror(rc));
+            log_event(p, message);
+        }
         close_slave(p); unlink(p->opening_path);
         return rc < 0 ? rc : -EAGAIN;
     }
@@ -163,6 +185,14 @@ static snd_pcm_sframes_t transfer(snd_pcm_ioplug_t *io,
 {
     struct bt_pcm *p = io->private_data;
     unsigned width = (unsigned)snd_pcm_format_physical_width(io->format);
+    if (!p->transfer_logged) {
+        char message[192];
+        snprintf(message, sizeof(message), "first transfer: rate=%u channels=%u format=%d first=%u step=%u frames=%lu",
+                 io->rate, io->channels, (int)io->format, areas[0].first,
+                 areas[0].step, (unsigned long)frames);
+        log_event(p, message);
+        p->transfer_logged = 1;
+    }
     if (areas[0].step != width * io->channels || areas[0].first != 0)
         return -EINVAL;
     const char *data = (const char *)areas[0].addr + offset * areas[0].step / 8;
@@ -194,8 +224,19 @@ static snd_pcm_sframes_t pointer_pos(snd_pcm_ioplug_t *io)
     snd_pcm_sframes_t delay = 0;
     pthread_mutex_lock(&p->mutex);
     if (p->slave && snd_pcm_delay(p->slave, &delay) < 0) delay = 0;
-    snd_pcm_uframes_t pos = p->written;
-    if (delay > 0 && (snd_pcm_uframes_t)delay <= pos) pos -= (snd_pcm_uframes_t)delay;
+    uint64_t pos = p->written;
+    if (delay > 0 && (uint64_t)delay <= pos) pos -= (uint64_t)delay;
+    /* The stock ioplug ABI accepts a buffer-modulo pointer. Parking a
+     * full slave advances by exactly one ring, which would look like no
+     * progress and deadlock future writes. Report that jump over multiple
+     * polls, each strictly shorter than a ring. Never move backwards when
+     * a reopened slave begins accumulating its own delay. */
+    if (io->buffer_size > 1 && pos > p->reported) {
+        uint64_t advance = pos - p->reported;
+        if (advance >= io->buffer_size) advance = io->buffer_size - 1;
+        p->reported += advance;
+    }
+    pos = p->reported;
     pthread_mutex_unlock(&p->mutex);
     return (snd_pcm_sframes_t)(io->buffer_size ? pos % io->buffer_size : 0);
 }
@@ -205,9 +246,21 @@ static int prepare(snd_pcm_ioplug_t *io)
     struct bt_pcm *p = io->private_data;
     pthread_mutex_lock(&p->mutex);
     p->written = 0;
+    p->reported = 0;
     int rc = p->slave ? snd_pcm_prepare(p->slave) : 0;
     pthread_mutex_unlock(&p->mutex);
     return rc;
+}
+static int hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
+{
+    (void)params;
+    struct bt_pcm *p = io->private_data;
+    char message[192];
+    snprintf(message, sizeof(message), "virtual params: rate=%u channels=%u format=%d period=%lu buffer=%lu",
+             io->rate, io->channels, (int)io->format,
+             (unsigned long)io->period_size, (unsigned long)io->buffer_size);
+    log_event(p, message);
+    return 0;
 }
 static int start(snd_pcm_ioplug_t *io) { (void)io; return 0; }
 static int stop(snd_pcm_ioplug_t *io) { (void)io; return 0; }
@@ -283,6 +336,7 @@ static int close_pcm(snd_pcm_ioplug_t *io)
 static const snd_pcm_ioplug_callback_t callbacks = {
     .start = start, .stop = stop, .pointer = pointer_pos, .transfer = transfer,
     .prepare = prepare, .close = close_pcm,
+    .hw_params = hw_params,
     .poll_revents = poll_revents,
 };
 
@@ -382,13 +436,17 @@ SND_PCM_PLUGIN_DEFINE_FUNC(hkbtpark)
     }
     p->io.poll_fd = p->timer;
     p->io.poll_events = POLLIN;
+    /* softvol/route negotiate an mmap slave. Advertise that access below,
+     * while ordinary writei must still invoke transfer directly: setting
+     * mmap_rw would make RW commits advance without forwarding samples. */
+    p->io.mmap_rw = 0;
     p->io.flags = SND_PCM_IOPLUG_FLAG_MONOTONIC;
     rc = snd_pcm_ioplug_create(&p->io, name, stream, mode);
     if (rc < 0) { close_pcm(&p->io); return rc; }
-    const unsigned access[] = {SND_PCM_ACCESS_RW_INTERLEAVED};
+    const unsigned access[] = {SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_ACCESS_MMAP_INTERLEAVED};
     const unsigned formats[] = {SND_PCM_FORMAT_S16_LE};
     const unsigned rates[] = {44100, 48000};
-    if ((rc = snd_pcm_ioplug_set_param_list(&p->io, SND_PCM_IOPLUG_HW_ACCESS, 1, access)) < 0 ||
+    if ((rc = snd_pcm_ioplug_set_param_list(&p->io, SND_PCM_IOPLUG_HW_ACCESS, 2, access)) < 0 ||
         (rc = snd_pcm_ioplug_set_param_list(&p->io, SND_PCM_IOPLUG_HW_FORMAT, 1, formats)) < 0 ||
         (rc = snd_pcm_ioplug_set_param_list(&p->io, SND_PCM_IOPLUG_HW_RATE, 2, rates)) < 0 ||
         (rc = snd_pcm_ioplug_set_param_minmax(&p->io, SND_PCM_IOPLUG_HW_CHANNELS, 2, 2)) < 0 ||
@@ -401,6 +459,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(hkbtpark)
         return rc;
     }
     *pcmp = p->io.pcm;
+    log_event(p, "virtual Bluetooth PCM created");
     return 0;
 }
 SND_PCM_PLUGIN_SYMBOL(hkbtpark);

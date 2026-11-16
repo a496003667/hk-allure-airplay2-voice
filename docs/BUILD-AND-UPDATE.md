@@ -130,3 +130,13 @@ Disabling AirPlay retains shared Bluetooth/voice protection. Other modules have 
 
 
 The releasable Bluetooth PCM also needs ALSA development headers (`HK_ALSA_HEADERS`) and the stock hard-float libasound. It uses ioplug protocol 1.0.1; do not raise the protocol to match newer build headers without checking the stock library. Linux native tests require a C compiler and `libasound2-dev`, and use file/null output. Backend, private route, wrapper and boot pins form one transaction with the verified dependent reload helper; a library replacement alone does not update an already running player. Keep maintenance mute until user-present listening on the new backend.
+
+
+蓝牙 ioplug 必须同时声明 `RW_INTERLEAVED` 与 `MMAP_INTERLEAVED`，以供原厂 softvol 协商；`mmap_rw` 保持 0，使两种访问都进入 transfer。仅用直接 writei/null 的测试不能代替外层软件音量链验证。
+
+The Bluetooth ioplug must advertise interleaved RW and mmap access for the stock softvol slave negotiation. Keep mmap_rw=0 so both paths forward samples through transfer. Test an outer software layer as well as direct writes.
+
+
+蓝牙的采样率适配必须位于虚拟 PCM 之前：Master softvol → plug（slave.rate=48000）→ hkbtpark → harmandsp → hw。只向 null 写短片段不能验证原厂 DSP；需在维护静音下，以全零数据检查两种输入采样率的持续写入、精确满缓冲 park、占用期间丢弃、重新打开及实际硬件状态。测试专用的 `tests/alsa-clock-sink.c` 不进入发布包。
+
+Place Bluetooth rate conversion before the retained virtual PCM: Master softvol → plug (48 kHz slave) → hkbtpark → harmandsp → hardware. Short null writes do not validate stock DSP compatibility. Under maintenance mute, verify both input rates with sustained zero-data writes, full-buffer park, blocked discard, reopen and physical PCM state. The clock-paced test sink is not shipped.

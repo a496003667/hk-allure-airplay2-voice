@@ -24,7 +24,7 @@ Allure 的 PCM5121 两个输出通道不是一个普通立体声对：
 这能说明软件分频路径存在差异，不能单凭它排除低音功放、接线或单元故障。当前未找到可独立启用低音单元的已验证控制接口。蓝牙路径应为：
 
 ```text
-a01controller -> Master softvol -> hkbtpark -> harmandsp -> hw:0,0
+a01controller -> Master softvol -> plug (48 kHz) -> hkbtpark -> harmandsp -> hw:0,0
 ```
 
 本次离线修复分支的 AirPlay 使用 Shairport 软件音量与新增的 24 dB flat 范围，
@@ -188,3 +188,27 @@ The user also heard every 500/200/120/80/60 Hz segment and felt low-frequency vi
 完整 **136 项 Linux/BusyBox 测试通过**；九文件受控更新返回 0、事务提交、pending 清除、全部文件哈希及运行时精确验证通过。播放器在保护静音下受控重载，rootApp 保持运行，硬件 PCM 已 closed，维护 hold 仍保留。AirPlay 配置逐字节保留，软件范围仍为 −30…−6 dB。**新后端的真实蓝牙播放、来源双向切换、语音回归及长测仍待完成**；上文蓝牙与低频通过记录属于加入本后端之前的版本。
 
 English: The retained stock hardware handle reproduced a silent Bluetooth-to-AirPlay handoff. Stop and Wi-Fi source commands returned successfully but did not close PCM on this speaker. The new private ALSA ioplug keeps the stock virtual handle while returning its DSP/hardware slave through the guarded hook before a new lease. It discards blocked phone samples and reopens only for new allowed samples, retaining pre-DSP Master volume and the stock Bluetooth client tag. Source intent and an in-flight-open marker protect concurrent takeover; control survives run-directory reconstruction. Native tests cover actual file-descriptor release/reopen, discarded samples, guards, socket lifecycle and source races. The stock-ALSA null-only cycle and all 136 Linux/BusyBox tests passed. The nine-file deployment committed with exact hashes and runtime verification; maintenance mute remains. AirPlay configuration and its −30…−6 dB range are preserved. Audible Bluetooth, bidirectional handoff, voice regression and sustained testing on this backend remain pending.
+
+
+## 原厂软件音量层的 MMAP 兼容修正
+
+新后端首轮真实蓝牙播放无声，设备没有故障锁存，但硬件 PCM 一直 closed。空输出进一步复现：直接虚拟 PCM 可写入，外面加上原厂 Master softvol 后，open 返回 0，参数协商返回 −22。原厂 softvol 要求底层提供 MMAP access；第一版后端只有 RW_INTERLEAVED，软件层无法完成初始化。
+
+修正版同时提供 RW_INTERLEAVED 和 MMAP_INTERLEAVED，仍保持 `mmap_rw=0`，保证普通 writei 和 MMAP commit 都真正调用 transfer。回归先复现软件层协商失败，再验证修正；另覆盖直接 MMAP 客户端的音频数据、park/重新打开和禁止补播。初始化参数和第一包格式只做一次元数据记录，不记录音频内容。
+
+完整 **138 项 Linux/BusyBox 测试通过**。原厂实际的 Master softvol → 新后端 → null 整链完成 OPEN/PARAMS/WRITE/PARK/占用期间写入/REOPEN/CLOSE，全部返回预期成功，检查期间真实声卡保持 closed。五文件受控更新已提交并通过精确核验，维护静音保留；**修正版真实蓝牙、双向来源切换、语音及长测仍待试听**。
+
+English: The first live backend test was silent with no fault latch and no hardware PCM. The complete stock Master-softvol/virtual/null probe reproduced successful open followed by −22 during parameter negotiation: softvol requires an mmap slave, while the first backend exposed only interleaved RW. The fix offers both access modes while retaining mmap_rw=0 so neither ordinary writes nor mmap commits bypass sample transfer. Two new regressions verify software-layer negotiation and actual mmap park/reopen data flow. All 138 Linux/BusyBox tests and the full stock software-volume/null cycle passed. The five-file fix is installed and exactly verified under maintenance mute; audible Bluetooth, handoff, voice and sustained testing remain pending.
+
+
+## 44.1 kHz DSP 适配与整圈缓冲恢复
+
+MMAP 修正版实机仍无声：手机输入已到达 transfer，但 DSP slave 参数设置返回 −22，硬件 PCM 随即关闭。全程维护静音、仅写全零的实际 DSP 对比确认：当前参数调用在 44.1 kHz 下拒绝 period time，48 kHz 成功；未限定采样率的 plug 不能解决它。最终配置在 Master 之后、虚拟 PCM 之前以 plug 固定 slave.rate=48000，使虚拟帧计数与实际 DSP 同速。把转换器放在虚拟后端内部虽可协商，实际持续写入仍会停住。
+
+完整缓冲的 park/重新打开检查还复现了两处死锁：释放满缓冲使 modulo 指针整圈跳回原值，旧 ALSA 误认为没有前进；重新打开又可能在外层仍有待处理帧时等待整缓冲启动。修正用 64 位计数分次报告小于一圈的进度，并以不少于一个 period 的半缓冲预填启动新 slave。独立对照分别移除两项修正，均能使同一满缓冲回归失败。
+
+完整 **141 项 Linux/BusyBox 测试通过**，包含真实采样数据的 44.1→48 kHz 转换、按时钟消耗的测试声卡、精确满缓冲释放后继续丢弃和重新打开。实机使用原厂 Master softvol、原厂 ALSA 和真实 Harman DSP，对 44.1/48 kHz 输入分别完成持续写入 61,440 帧 → park 后硬件 closed → 占用期间继续接受并丢弃 61,440 帧 → 重新打开并写入 61,440 帧 → 关闭。两个循环都返回 0，播放阶段实际 PCM 为 RUNNING；保护 hold/manual mute 全程有效，仅有零数据。
+
+六文件静音更新已提交：返回 0、pending 清除、六文件哈希相符、运行时精确验证 0。维护 hold/manual mute 保留，硬件 PCM closed。AirPlay 配置与 −30…−6 dB 范围保持原样；真实蓝牙、双向来源交接、语音与长测仍待用户试听，前述历史通过不能替代本后端验收。
+
+English: The mmap fix remained silent in the live test. Phone samples reached transfer, but the real DSP rejected the 44.1 kHz period parameters with −22 and the hardware PCM closed. Muted zero-only probes accepted 48 kHz. The final plug adapter converts before the retained virtual handle, keeping its frame counter at the DSP rate; a converter inside the backend negotiated but stalled under sustained stock-ALSA writes. Parking a full ring also aliased modulo progress to zero, and a reopened slave could wait for more prefill than the retained pipeline could supply. Bounded pointer advances with 64-bit counters and half-buffer slave startup fix these separate deadlocks; removing either fix makes the full-ring regression fail. All 141 Linux/BusyBox tests pass, including real resampling and a clock-paced sink. Full stock Master/virtual/DSP zero-data cycles at both input rates passed continuous write, park, blocked discard, reopen and close, with RUNNING playback and closed hardware while parked. The six-file muted update committed with return code 0, matching hashes, no pending transaction and exact verification 0; maintenance mute and an idle closed PCM remain. AirPlay configuration and volume behavior are preserved; actual listening and bidirectional handoff are still pending.

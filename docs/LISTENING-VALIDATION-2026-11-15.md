@@ -124,3 +124,31 @@ Familiar-music comparison: the user subsequently reported that Bluetooth bass wa
 **本次尚未对新后端进行真实蓝牙、双向来源切换、语音或长时间听测。** 此前参考音、低频与熟悉音乐通过的结果属于上一版通路，不能替代本次回归。
 
 English: The subsequent user-present Bluetooth-paused/still-connected → Mac AirPlay test was silent: the stock player retained the exclusive PCM, preventing the new AirPlay lease from establishing its DSP clock. Supported stop/source-switch commands did not close the handle on this device. The new private ALSA ioplug keeps the stock virtual handle while releasing its DSP/hardware slave through a mute-first guarded handoff. It preserves the existing volume/DSP/mixing path, discards blocked samples, and uses source intent plus an in-flight-open marker to avoid races. Control survives runtime-directory reconstruction. All 136 Linux/BusyBox tests and the stock-ALSA null-only open/park/reopen cycle passed. The nine-file update committed with return code 0, no pending transaction, exact hashes and runtime verification. The player was reloaded under maintenance mute; rootApp stayed running, and AP2/bridge/watchdog/voice were healthy with PCM closed. AirPlay configuration was preserved byte-for-byte. Audible Bluetooth, bidirectional handoff, voice and sustained tests on this backend remain pending; earlier bass/music acceptance does not substitute for them.
+
+
+## 2026-11-16：MMAP 协商失败复现与修正版
+
+首版可释放后端的真实蓝牙试听未通过，用户反馈无声。设备没有故障锁存，播放器显示 play，但始终没有硬件 PCM。恢复维护静音后，在原厂库上复现 Master softvol → 虚拟后端 → null：OPEN=0，PARAMS=−22（Broken configuration）。同样的软件层访问方式在主机真实 ALSA route/null 回归中复现；直接 writei/null 的早期成功未覆盖外层软件音量层。
+
+原因是 softvol 要求 MMAP slave，而后端只提供了 RW_INTERLEAVED。修正版提供 RW_INTERLEAVED + MMAP_INTERLEAVED，保持 mmap_rw=0，使普通写入与 MMAP commit 均转交采样。新增两个实际数据流回归，覆盖软件层协商、MMAP 采样及 park/重新打开后无补播。
+
+完整 **138 项 Linux/BusyBox 测试通过**，日志 SHA-256：`01e746b34aa1e3938605d350927829f39d2ea701f165cdccb4068a57e73bbe6b`。一次整套测试仅在收尾时遭遇孤立的模拟 mixer 子进程重建临时文件；调整为移除 armed 后等待 watchdog 正常结束，并提供进程组超时退出，未改变生产逻辑。
+
+原厂完整软件音量链空输出复测返回 0：48 kHz/双声道/S16、period=6000、buffer=24000，首包 first=0、step=32；同一 PCM 完成写入、park、占用期间丢弃、重新打开与关闭。实际硬件 PCM 始终 closed，没有主动出声。修正版后端 SHA-256：`600f62501c79f33ecb4be9171eae03d81704a42a5dd32337d620d8890a5afd78`。五文件更新事务已提交，返回 0、无 pending、全部哈希匹配，运行时精确验证 0。维护 hold/manual mute 继续保留，声卡 closed；rootApp 保持运行，AirPlay 5.6、蓝牙桥、独立保护、语音监督与主循环正常。
+
+**尚未进行 MMAP 修正版的真实蓝牙、双向来源切换、语音与长测；不得将首版无声或先前版本的听测改写为本版通过。**
+
+English: The first live Bluetooth test on the releasable backend was silent with no fault latch and no hardware PCM. The complete stock Master-softvol/virtual/null path then reproduced OPEN=0 and PARAMS=−22; an outer software-layer regression reproduced it on native ALSA. Softvol requires an mmap slave, which the first version did not advertise. The fix supports interleaved RW and mmap, leaving mmap_rw=0 so samples reach transfer in both paths. All 138 Linux/BusyBox tests and the complete stock software-volume/null park/reopen cycle now pass. The test cleanup also waits for foreground mixer children rather than leaving writers behind after terminating their shell. The five-file update committed with exact hashes and runtime verification, retaining maintenance mute and an idle closed PCM. RootApp and the audio/voice protection stack are healthy. Audible Bluetooth, bidirectional source switching, voice and sustained checks on this mmap fix remain pending.
+
+
+## 2026-11-16：真实 DSP 参数与 park/重新打开恢复
+
+MMAP 修正版的下一次用户试听仍无声。现场显示原厂 status=play、手机采样已进入后端，但硬件 PCM closed、无租约或故障锁存；后端只记录释放，不记录成功打开。用户暂停后保持维护 hold/manual mute，用全零数据检查真实 DSP，复现 44.1 kHz period 参数 −22，48 kHz 正常。固定 DSP 48 kHz 的 plug 必须放在虚拟后端之前；放在内部会出现持续写入卡住。
+
+完整零数据循环还复现满缓冲整圈指针别名与重新打开预填死锁，分别通过分段报告 modulo 进度和半缓冲启动修正。两项独立故障对照均能使新增精确满缓冲回归失败；修正后 **141 项 Linux/BusyBox 全套通过**，日志 SHA-256：`5c034f5983c22612fcbfe728cb65cbbd7f02df36ef51c80b69ff9d1db09035fc`。按真实时钟推进的测试 sink 与重采样样本计数共同覆盖了短 null 检查遗漏的情况。
+
+原厂完整 Master softvol → plug(48 kHz) → 虚拟后端 → Harman DSP → 硬件，在 44.1/48 kHz 输入下各完成：61,440 帧零数据、实际 RUNNING、park 返回 0 且硬件 closed、占用期间接受并丢弃 61,440 帧、解除私有测试占用后再次写入 61,440 帧并 RUNNING、close 返回 0 且硬件 closed。两个循环均返回 0；全程没有解除真实维护静音。后端 SHA-256 为 `256250eeccb8986c9c87406f7e3a7d0fca351c42c404c3db5e7fac6a549be02c`，最大 GLIBC 需求仍为 2.17。
+
+六文件静音更新事务 `20261116T051402-19482` 已提交，返回 0、无 pending、六文件哈希相符、精确验证返回 0。AirPlay 配置 SHA-1 保持 `1a4b6e188135e61ae99e32c3ed4578d5c7404bc1`，范围仍为 −30…−6 dB。rootApp 始终为 PID 139；AirPlay 5.6、独立保护、蓝牙桥及各一个语音监督/主循环正常，安装 hold/manual mute 保留、硬件 PCM closed。真实蓝牙、双向来源切换、语音及长测仍待本版试听；本节不将零数据验证描述为听觉验收。
+
+English: The next user-present mmap-version test was still silent. Samples reached the backend, but real DSP parameter setup failed at 44.1 kHz; no output lease or fault latch existed. Muted probes reproduced −22 and verified 48 kHz. Moving conversion before the virtual PCM keeps its accounting at the hardware rate. Full-ring park/reopen probes then exposed separate modulo-pointer and startup-prefill deadlocks. Both negative controls fail the new regression; all 141 Linux/BusyBox tests pass with the fixes. The full stock Master/plug/virtual/Harman-DSP/hardware chain passed zero-only write, park, blocked discard, reopen and close at both input rates, with actual RUNNING and closed states verified. The six-file muted transaction committed with return code 0, no pending transaction, matching hashes and exact verification 0. The AirPlay configuration is byte-for-byte preserved; rootApp remains unchanged, and the playback/voice/protection stack is healthy under maintenance mute. Audible Bluetooth, bidirectional handoff, voice regression and sustained operation still await this version's listening tests.

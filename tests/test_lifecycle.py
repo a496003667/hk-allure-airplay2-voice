@@ -1,6 +1,7 @@
 """Integration regressions for real shell transitions with fake audio hardware."""
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -329,7 +330,8 @@ fi
             'ANALOG_READ': str(analog_read),
         }
         watchdog = subprocess.Popen(['sh', str(REPO / 'airplay2/runtime/hk-ap2-safe-test'), '__watchdog'],
-                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
         stop = threading.Event()
         def advance_clock():
             while not stop.wait(.01):
@@ -379,8 +381,16 @@ fi
         finally:
             stop.set()
             thread.join(2)
-            watchdog.terminate()
-            watchdog.wait(4)
+            # Let the loop finish its synchronous mixer writes before
+            # removing the fixture. Killing only the shell can orphan a
+            # mixer child which recreates files during TemporaryDirectory
+            # cleanup. Keep a separate process group for bounded fallback.
+            (self.safe / 'armed').unlink(missing_ok=True)
+            try:
+                watchdog.wait(4)
+            except subprocess.TimeoutExpired:
+                os.killpg(watchdog.pid, signal.SIGKILL)
+                watchdog.wait(4)
 
     def test_bluetooth_priming_accepts_airplay_step_only_before_muted_transition(self):
         self.check_analog_handoff('bluetooth')

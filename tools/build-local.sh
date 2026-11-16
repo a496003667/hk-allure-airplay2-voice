@@ -16,6 +16,8 @@ export PATH
 mkdir -p "$OUT"
 cd "$REPO"
 "${HARD}gcc" -Os -o "$OUT/hk-voice" voice/hk-voice.c -ldl -static-libgcc
+"${HARD}gcc" -Os -Wall -Wextra -Werror -o "$OUT/hk-stock-audio-state" \
+    airplay2/hk-stock-audio-state.c -static-libgcc
 "${HARD}gcc" -Os -fomit-frame-pointer -fno-builtin -fno-stack-protector -nostdlib -static -Wl,-e,_start \
     tools/hk-unix-request-raw.c -o "$OUT/hk-unix-request-raw"
 for pair in 'hk-mqtt-pub tools/hk-mqtt-pub.c' 'hk-shm-play lights/hk-shm-play.c'; do

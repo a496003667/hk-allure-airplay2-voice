@@ -200,7 +200,7 @@ bt_stream_live() {
     [ "$(sed -n '1p' "$PCM_STATUS" 2>/dev/null)" = "state: RUNNING" ] || return 1
     owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM_STATUS" 2>/dev/null)
     case "$owner" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$(cat "/proc/$owner/comm" 2>/dev/null)" = a01controller ]
+    audio_bt_pcm_owned "$owner"
 }
 
 bt_inject_stop_feeder() {

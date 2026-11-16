@@ -42,6 +42,7 @@ class BluetoothBridgeTest(unittest.TestCase):
         self.state('stop')
         (self.safe / 'armed').touch()
         self.executable(self.root / 'bin/hk-unix-request-raw', '''#!/bin/sh
+if [ -n "${MOCK_QUERY_LOG:-}" ] && [ "$2" = getPlayerStatus ]; then echo query >>"$MOCK_QUERY_LOG"; fi
 if [ "$2" = setPlayerCmd:vol:30 ]; then
   echo clamp >>"$MOCK_LOG"
   sed 's/"vol":"52"/"vol":"30"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
@@ -152,6 +153,30 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
         self.assertEqual(self.events().count('start'), 2, 'AirPlay claim blocks reacquisition')
         self.assertIsNone(bridge.poll())
 
+    def test_dead_pcm_opener_uses_verified_holder_for_acquire_and_watchdog(self):
+        pid = self.dummy_watchdog.pid
+        holder = self.proc / str(pid)
+        (holder / 'fd').mkdir(parents=True)
+        (holder / 'comm').write_text('a01controller\n')
+        (holder / 'fd/26').symlink_to('/dev/snd/pcmC0D0p')
+        result = subprocess.run(['sh', '-c', '. "$HK_AUDIO_COMMON"; audio_pid_start "$1"',
+                                 'sh', str(pid)], env=self.env, capture_output=True, text=True, check=True)
+        (self.base / 'bt-pcm-owner').write_text(f'{pid} {result.stdout.strip()} 26 12345\n')
+        (self.proc / '42/comm').unlink()  # The recorded opener thread is gone.
+        self.state('play')
+        bridge = self.launch(['sh', str(BRIDGE), '__run'])
+        eventually(lambda: 'start' in self.events())
+        eventually(lambda: (self.safe / 'lease').exists())
+        self.assertFalse((self.safe / 'tripped').exists())
+        self.assertIsNone(bridge.poll())
+        # Shared checks are also used by the real watchdog and hook.
+        result = subprocess.run(['sh', '-c', '. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; '
+                                 'SAFE=$RUN/safe; audio_bt_valid'], env=self.env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (holder / 'fd/26').unlink()
+        eventually(lambda: 'stop' in self.events())
+
     def test_play_without_pcm_rebuilds_a2dp_transport(self):
         self.pcm.write_text('state: closed\n')
         self.state('play')
@@ -259,12 +284,32 @@ esac
                    and (self.run / 'bt-wait-pcm').exists())
         self.pcm.write_text('closed\n')
         self.status.write_text('{"mode":"-1","status":"","vol":"12","mute":"0"}')
+        (self.base / 'clock').write_text('1.00 0.00\n')
+        (self.safe / 'watchdog.heartbeat').write_text('1\n')
         eventually(lambda: not (self.run / 'bt-wait-pcm').exists())
         self.state('play')
+        (self.base / 'clock').write_text('2.00 0.00\n')
+        (self.safe / 'watchdog.heartbeat').write_text('2\n')
         eventually(lambda: self.events().count('start') == 2, timeout=15)
         self.assertIn('onepause', self.events())
         self.assertIn('resume', self.events())
         self.assertFalse((self.safe / 'tripped').exists())
+
+    def test_fast_idle_poll_keeps_paused_source_rpc_at_one_per_second(self):
+        (self.run / 'bt-wait-pcm').write_text('paused\n')
+        self.pcm.write_text('state: XRUN\nowner_pid   : 42\n')
+        queries = self.base / 'queries'
+        env = self.env | {'MOCK_QUERY_LOG': str(queries)}
+        definitions = BRIDGE.read_text().split('trap cleanup EXIT', 1)[0]
+        batch = 'for n in 1 2 3 4 5 6 7 8 9 10; do refresh_paused_source; repair_stalled_bluetooth || true; done\n'
+        check = definitions + '\n' + batch + '''
+[ "$(wc -l <"$MOCK_QUERY_LOG")" -eq 1 ] || exit 1
+printf '1.00 0.00\\n' >"$HK_AUDIO_UPTIME_FILE"
+printf '1\\n' >"$HK_AP2_RUN/safe/watchdog.heartbeat"
+''' + batch
+        subprocess.run(['sh', '-c', check], env=env, check=True, timeout=4)
+        self.assertEqual(queries.read_text().splitlines(), ['query', 'query'])
+        self.assertNotIn('resume', self.events())
 
     def test_voice_mixer_keeps_the_bluetooth_lease(self):
         self.state('play')

@@ -10,6 +10,7 @@ parser.add_argument('--binaries',type=Path,default=REPO/'build/bin')
 args=parser.parse_args()
 # Keep the small previously shipped bridge artifacts reproducible and testable.
 for name,target in [('hk-ap2-dsp-bridge','airplay2/hk-ap2-dsp-bridge'),
+                    ('hk-stock-audio-state','airplay2/hk-stock-audio-state'),
                     ('libasound_module_pcm_hkbtpark.so','airplay2/libasound_module_pcm_hkbtpark.so'),
                     ('hk-bt-open-redirect.so','airplay2/hk-bt-open-redirect.so'),
                     ('hk-unix-request-raw','airplay2/hk-unix-request-raw'),

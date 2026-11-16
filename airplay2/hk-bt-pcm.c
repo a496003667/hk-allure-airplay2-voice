@@ -8,8 +8,10 @@
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
 #include <errno.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -28,10 +30,13 @@ struct bt_pcm {
     char *slave_name;
     char run[192], socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     char opening_path[256];
+    char owner_path[256], owner_value[128];
     pthread_mutex_t mutex;
     pthread_t thread;
     int server, timer, threaded, stopped;
     int transfer_logged;
+    int signal_started;
+    unsigned signal_frames, signal_nonzero, signal_peak[2];
     dev_t socket_dev;
     ino_t socket_ino;
     uint64_t written, reported;
@@ -80,10 +85,87 @@ static void log_event(struct bt_pcm *p, const char *event)
     close(fd);
 }
 
+static void clear_owner(struct bt_pcm *p)
+{
+    if (!*p->owner_value) return;
+    char value[128] = {0};
+    int fd = open(p->owner_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+        ssize_t n = read(fd, value, sizeof(value) - 1);
+        close(fd);
+        if (n > 0 && !strcmp(value, p->owner_value)) unlink(p->owner_path);
+    }
+    *p->owner_value = 0;
+}
+
+/* Kernel owner_pid can name a thread which exits while the process retains
+ * this PCM. Publish the actual holder's process identity and descriptor.
+ * Consumers still verify both against /proc before trusting this record. */
+static int publish_owner(struct bt_pcm *p, uint64_t generation)
+{
+    char statbuf[1024];
+    int statfd = open("/proc/self/stat", O_RDONLY | O_CLOEXEC);
+    if (statfd < 0) return -errno;
+    ssize_t n = read(statfd, statbuf, sizeof(statbuf) - 1);
+    close(statfd);
+    if (n <= 0) return -EIO;
+    statbuf[n] = 0;
+    char *field = strrchr(statbuf, ')');
+    if (!field || field[1] != ' ') return -EINVAL;
+    field += 2;
+    for (int i = 1; i < 20; ++i) {
+        field = strchr(field, ' ');
+        if (!field) return -EINVAL;
+        ++field;
+    }
+    char *end;
+    errno = 0;
+    unsigned long long started = strtoull(field, &end, 10);
+    if (errno || !started || end == field || (*end && *end != ' ')) return -EINVAL;
+
+    const char *device = getenv("HK_BT_PCM_DEVICE");
+    if (!device || !*device) device = "/dev/snd/pcmC0D0p";
+    struct stat node;
+    if (stat(device, &node) < 0) return -errno;
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) return -errno;
+    int pcmfd = -1;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        unsigned long candidate = strtoul(entry->d_name, &end, 10);
+        struct stat held;
+        if (!*entry->d_name || *end || candidate > INT_MAX ||
+            fstat((int)candidate, &held) < 0) continue;
+        if ((S_ISCHR(node.st_mode) && S_ISCHR(held.st_mode) && held.st_rdev == node.st_rdev) ||
+            (S_ISREG(node.st_mode) && S_ISREG(held.st_mode) &&
+             held.st_dev == node.st_dev && held.st_ino == node.st_ino)) {
+            pcmfd = (int)candidate;
+            break;
+        }
+    }
+    closedir(dir);
+    if (pcmfd < 0) return -ENODEV;
+    char value[128], temp[320];
+    snprintf(value, sizeof(value), "%ld %llu %d %llu\n", (long)getpid(), started,
+             pcmfd, (unsigned long long)generation);
+    snprintf(temp, sizeof(temp), "%s.tmp.%ld.%llu", p->owner_path, (long)getpid(),
+             (unsigned long long)generation);
+    int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -errno;
+    size_t length = strlen(value);
+    int rc = write(fd, value, length) == (ssize_t)length ? 0 : -EIO;
+    close(fd);
+    if (!rc && rename(temp, p->owner_path) < 0) rc = -errno;
+    if (rc) { unlink(temp); return rc; }
+    strcpy(p->owner_value, value);
+    return 0;
+}
+
 /* mutex held: never close another player's PCM or change amplifier state. */
 static void close_slave(struct bt_pcm *p)
 {
     if (!p->slave) return;
+    clear_owner(p);
     snd_pcm_drop(p->slave);
     snd_pcm_close(p->slave);
     p->slave = NULL;
@@ -172,10 +254,97 @@ static int open_slave(struct bt_pcm *p)
         close_slave(p); unlink(p->opening_path);
         return rc < 0 ? rc : -EAGAIN;
     }
+    rc = publish_owner(p, ns);
+    if (rc < 0) {
+        log_event(p, "Bluetooth DSP holder identity failed; output remains closed");
+        close_slave(p); unlink(p->opening_path);
+        return rc;
+    }
     p->retry_after_ns = 0;
     log_event(p, "Bluetooth DSP slave opened");
     unlink(p->opening_path);
     return 0;
+}
+
+static int transfer_blocked(struct bt_pcm *p)
+{
+    char hold[256];
+    snprintf(hold, sizeof(hold), "%.*s-hold-mute", (int)strlen(p->run) - 4, p->run);
+    return !exists(p, "safe/armed") || exists(p, "safe/tripped") ||
+           exists(p, "ap2-claim") || exists(p, "bt-release") ||
+           access(hold, F_OK) == 0 ||
+           (voice_pending(p) && !exists(p, "bt-owner.pid"));
+}
+
+static void request_pcm_resync(struct bt_pcm *p, const char *reason)
+{
+    char path[256], temp[288];
+    if (!path_for(p, "bt-wait-pcm", path)) return;
+    snprintf(temp, sizeof(temp), "%s.tmp.%ld", path, (long)getpid());
+    int fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    size_t length = strlen(reason);
+    int ok = write(fd, reason, length) == (ssize_t)length;
+    close(fd);
+    if (!ok || rename(temp, path) < 0) unlink(temp);
+}
+
+/* Stock rate/softvol layers can consume input despite a short mmap commit
+ * to their slave. Finish this callback before reporting acceptance. A new
+ * source/hold cancels pending samples, so the control thread can park the
+ * device promptly; a real fault requests the existing muted resync path. */
+static snd_pcm_sframes_t write_slave_packet(struct bt_pcm *p, const char *data,
+                                           snd_pcm_uframes_t frames, unsigned frame_bytes)
+{
+    struct timespec started;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) < 0) return -EIO;
+    uint64_t began = (uint64_t)started.tv_sec * 1000000000 + (uint64_t)started.tv_nsec;
+    uint64_t budget_ms = 500 + (uint64_t)frames * 1000 / p->io.rate;
+    if (budget_ms > 2000) budget_ms = 2000;
+    snd_pcm_uframes_t done = 0;
+    unsigned calls = 0;
+    while (done < frames) {
+        if (transfer_blocked(p)) return (snd_pcm_sframes_t)frames;
+        snd_pcm_sframes_t n = snd_pcm_writei(p->slave, data + done * frame_bytes, frames - done);
+        ++calls;
+        if (n > 0 && (snd_pcm_uframes_t)n <= frames - done) {
+            done += (snd_pcm_uframes_t)n;
+        } else if (n == -EPIPE || n == -ESTRPIPE) {
+            /* Never reset a clock while an output lease may still have
+             * the amplifier open. The bridge mutes before clearing it. */
+            if (exists(p, "safe/lease") || exists(p, "bt-owner.pid")) {
+                request_pcm_resync(p, "backend-clock-stopped\n");
+                return (snd_pcm_sframes_t)frames;
+            }
+            int recovered = snd_pcm_recover(p->slave, (int)n, 1);
+            if (recovered < 0) {
+                request_pcm_resync(p, "backend-recovery-failed\n");
+                close_slave(p);
+                return (snd_pcm_sframes_t)frames;
+            }
+        } else if (n != 0 && n != -EAGAIN && n != -EINTR) {
+            request_pcm_resync(p, "backend-write-failed\n");
+            if (!exists(p, "safe/lease") && !exists(p, "bt-owner.pid")) close_slave(p);
+            return (snd_pcm_sframes_t)frames;
+        }
+        if (done == frames) break;
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            request_pcm_resync(p, "backend-clock-read-failed\n");
+            return (snd_pcm_sframes_t)frames;
+        }
+        uint64_t stamp = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+        if (stamp - began >= budget_ms * 1000000 || calls >= 4096) {
+            log_event(p, "Bluetooth DSP write stalled; requesting muted resynchronization");
+            request_pcm_resync(p, "backend-write-stalled\n");
+            return (snd_pcm_sframes_t)frames;
+        }
+        if (n <= 0) {
+            (void)snd_pcm_wait(p->slave, 10);
+            usleep(1000);
+        }
+    }
+    return (snd_pcm_sframes_t)frames;
 }
 
 static snd_pcm_sframes_t transfer(snd_pcm_ioplug_t *io,
@@ -197,6 +366,29 @@ static snd_pcm_sframes_t transfer(snd_pcm_ioplug_t *io,
         return -EINVAL;
     const char *data = (const char *)areas[0].addr + offset * areas[0].step / 8;
     pthread_mutex_lock(&p->mutex);
+    if (exists(p, "bt-pcm-diagnostics")) {
+        const int16_t *samples = (const int16_t *)data;
+        for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
+            for (unsigned channel = 0; channel < 2; ++channel) {
+                int value = samples[i * 2 + channel];
+                unsigned magnitude = (unsigned)(value < 0 ? -value : value);
+                if (magnitude) ++p->signal_nonzero;
+                if (magnitude > p->signal_peak[channel]) p->signal_peak[channel] = magnitude;
+            }
+        }
+        p->signal_frames += (unsigned)frames;
+        if (!p->signal_started || p->signal_frames >= io->rate) {
+            char message[192];
+            snprintf(message, sizeof(message), "signal stage=post-master frames=%u nonzero=%u peak=%u,%u",
+                     p->signal_frames, p->signal_nonzero, p->signal_peak[0], p->signal_peak[1]);
+            log_event(p, message);
+            p->signal_started = 1;
+            p->signal_frames = p->signal_nonzero = p->signal_peak[0] = p->signal_peak[1] = 0;
+        }
+    } else {
+        p->signal_started = 0;
+        p->signal_frames = p->signal_nonzero = p->signal_peak[0] = p->signal_peak[1] = 0;
+    }
     snd_pcm_sframes_t rc;
     if (!p->slave && !open_allowed(p)) {
         /* Preserve the retained virtual handle while another source owns
@@ -207,11 +399,7 @@ static snd_pcm_sframes_t transfer(snd_pcm_ioplug_t *io,
          * new phone samples arrive. The bridge cannot acquire without PCM. */
         rc = (snd_pcm_sframes_t)frames;
     } else {
-        rc = snd_pcm_writei(p->slave, data, frames);
-        if (rc == -EPIPE || rc == -ESTRPIPE) {
-            int recovery = snd_pcm_recover(p->slave, (int)rc, 1);
-            if (recovery >= 0) rc = snd_pcm_writei(p->slave, data, frames);
-        }
+        rc = write_slave_packet(p, data, frames, width * io->channels / 8);
     }
     if (rc > 0) p->written += (snd_pcm_uframes_t)rc;
     pthread_mutex_unlock(&p->mutex);
@@ -292,6 +480,63 @@ static int park(struct bt_pcm *p, const char *token)
     return allowed;
 }
 
+/* Inspect only this process's already mapped PCM data, never registers or
+ * another process's memory. Explicit diagnostics do not reconfigure audio. */
+static int output_levels(struct bt_pcm *p, char reply[192])
+{
+    int ok = 0;
+    pthread_mutex_lock(&p->mutex);
+    if (!p->slave || !exists(p, "bt-pcm-diagnostics")) goto done;
+    snd_pcm_hw_params_t *params;
+    snd_pcm_hw_params_alloca(&params);
+    snd_pcm_format_t format;
+    unsigned channels;
+    snd_pcm_uframes_t frames;
+    if (snd_pcm_hw_params_current(p->slave, params) < 0 ||
+        snd_pcm_hw_params_get_format(params, &format) < 0 || format != SND_PCM_FORMAT_S16_LE ||
+        snd_pcm_hw_params_get_channels(params, &channels) < 0 || channels != 2 ||
+        snd_pcm_hw_params_get_buffer_size(params, &frames) < 0 || !frames || frames > 65536)
+        goto done;
+    const char *device = getenv("HK_BT_PCM_DEVICE");
+    if (!device || !*device) device = "/dev/snd/pcmC0D0p";
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) goto done;
+    char line[PATH_MAX + 192], permissions[8];
+    unsigned long first, last, offset;
+    uintptr_t address = 0;
+    unsigned matches = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        int path_at = 0;
+        if (sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*u %n",
+                   &first, &last, permissions, &offset, &path_at) != 4 ||
+            !path_at || offset || strcmp(permissions, "rw-s")) continue;
+        char *path = line + path_at;
+        path[strcspn(path, "\r\n")] = 0;
+        if (strcmp(path, device) || last <= first || last-first < (uint64_t)frames*4)
+            continue;
+        address = (uintptr_t)first;
+        ++matches;
+    }
+    fclose(maps);
+    if (matches != 1) goto done;
+    const volatile int16_t *samples = (const volatile int16_t *)address;
+    unsigned peak[2] = {0}, nonzero[2] = {0};
+    for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            int value = samples[i*2+channel];
+            unsigned magnitude = (unsigned)(value < 0 ? -value : value);
+            if (magnitude) ++nonzero[channel];
+            if (magnitude > peak[channel]) peak[channel] = magnitude;
+        }
+    }
+    snprintf(reply, 192, "signal stage=pcm-output frames=%lu nonzero=%u,%u peak=%u,%u\n",
+             (unsigned long)frames, nonzero[0], nonzero[1], peak[0], peak[1]);
+    ok = 1;
+done:
+    pthread_mutex_unlock(&p->mutex);
+    return ok;
+}
+
 static void *control_loop(void *arg)
 {
     struct bt_pcm *p = arg;
@@ -305,9 +550,11 @@ static void *control_loop(void *arg)
         ssize_t n = -1;
         if (poll(&input, 1, 200) > 0) n = recv(client, request, sizeof(request) - 1, 0);
         const char *reply = "refused\n";
+        char levels[192];
         if (n > 0) {
             request[n] = 0;
             if (!strncmp(request, "park:", 5) && park(p, request + 5)) reply = "parked\n";
+            else if (!strcmp(request, "levels") && output_levels(p, levels)) reply = levels;
         }
         (void)send(client, reply, strlen(reply), MSG_NOSIGNAL | MSG_DONTWAIT);
         close(client);
@@ -372,6 +619,11 @@ static int start_control(struct bt_pcm *p)
     n = snprintf(p->opening_path, sizeof(p->opening_path), "%.*s/bt-pcm-opening",
                  (int)strlen(p->run) - 4, p->run);
     if (n <= 0 || n >= (int)sizeof(p->opening_path)) return -ENAMETOOLONG;
+    n = snprintf(p->owner_path, sizeof(p->owner_path), "%.*s/bt-pcm-owner",
+                 (int)strlen(p->run) - 4, p->run);
+    if (n <= 0 || n >= (int)sizeof(p->owner_path)) return -ENAMETOOLONG;
+    if (lstat(p->owner_path, &st) == 0 &&
+        (!S_ISREG(st.st_mode) || st.st_uid != geteuid())) return -EEXIST;
     /* A successfully bound exclusive server excludes a live instance.
      * A prior process death may have left its in-flight marker behind. */
     if (lstat(p->opening_path, &st) == 0) {

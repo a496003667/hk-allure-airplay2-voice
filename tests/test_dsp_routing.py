@@ -51,6 +51,7 @@ class DspRoutingTest(unittest.TestCase):
             "DSP_ALSA_CONF_SHA1": sha1(AIRPLAY / "hk-dsp-alsa.conf"),
             "DSP_BRIDGE_SHA1": sha1(AIRPLAY / "hk-ap2-dsp-bridge"),
             "BT_PARK_SHA1": sha1(AIRPLAY / "libasound_module_pcm_hkbtpark.so"),
+            "STOCK_AUDIO_STATE_SHA1": sha1(AIRPLAY / "hk-stock-audio-state"),
             "COMMON_SHA1": sha1(AIRPLAY / "hk-audio-common.sh"),
             "REQUEST_OVERRIDE_SHA1": sha1(AIRPLAY / "hk-unix-request-raw"),
             "GUARD_OVERRIDE_SHA1": sha1(AIRPLAY / "runtime/hk-ap2-guard.sh"),

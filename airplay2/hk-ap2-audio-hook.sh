@@ -36,6 +36,11 @@ HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
 BT_PCM_CONTROL=${HK_BT_PCM_CONTROL:-${RUN%/run}/bt-pcm-control}
 BT_PCM_OPENING=${HK_BT_PCM_OPENING:-${RUN%/run}/bt-pcm-opening}
 REQUEST=${HK_AP2_REQUEST:-$ROOT/bin/hk-unix-request-raw}
+STOCK_AUDIO_STATE=${HK_AP2_STOCK_AUDIO_STATE:-/vendor/airplay2/hk-stock-audio-state}
+STOCK_AUDIO_LIB=${HK_AP2_STOCK_AUDIO_LIB:-/system/workdir/lib/libmvmsg.so}
+STOCK_AUDIO_LIB_SHA256=${HK_AP2_STOCK_AUDIO_LIB_SHA256:-7614d522b8c42e7934aed707e3d27460df2a39765402c600aa5ce35333d373ab}
+BT_PLAYER_SOCKET=${HK_BT_PLAYER_SOCKET:-/tmp/Requesta01controller}
+IOGUARD_SOCKET=${HK_AP2_IOGUARD_SOCKET:-/tmp/RequestIOGuard}
 COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
 [ -r "$COMMON" ] || COMMON=$(dirname "$0")/hk-audio-common.sh
 [ -r "$COMMON" ] || exit 1
@@ -45,7 +50,12 @@ COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
 unset LD_LIBRARY_PATH
 
 hook_log() {
-    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
+    _hl_uptime=
+    if [ -n "${HK_AP2_BT:-}" ]; then
+        IFS=' ' read -r _hl_stamp _hl_rest <"$AUDIO_UPTIME" 2>/dev/null &&
+            _hl_uptime="uptime=$_hl_stamp "
+    fi
+    printf '%s %s%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$_hl_uptime" "$*" \
         >>"$HOOK_LOG" 2>/dev/null || true
     audio_trim_log "$HOOK_LOG" 65536
 }
@@ -137,6 +147,42 @@ stock_pa_mute() {
         grep -q "Snd_Ctrl airplay to mute $level"
 }
 
+bt_sync_global_mute() {
+    # A source can be unmuted while the stock global override still holds
+    # the amplifier closed. Synchronize only an explicitly unmuted Bluetooth
+    # source, after establishing the clock and before restoring DAC gain.
+    [ "$(mixer_values 1)" = '0,0' ] &&
+        [ "$(switch_state 'Ext Spk')" = off ] && pcm_clock_live && output_guard_ok || return 1
+    [ -x "$STOCK_AUDIO_STATE" ] && [ -x "$REQUEST" ] || return 1
+    [ "$(sha256sum "$STOCK_AUDIO_LIB" 2>/dev/null | awk '{print $1}')" = "$STOCK_AUDIO_LIB_SHA256" ] || return 1
+    _bg_player=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+    printf '%s' "$_bg_player" | grep -q '"mode":"41"' &&
+        printf '%s' "$_bg_player" | grep -q '"status":"play"' &&
+        printf '%s' "$_bg_player" | grep -q '"mute":"0"' || return 1
+    _bg_rc=0
+    _bg_state=$(env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted) || _bg_rc=$?
+    case "$_bg_rc" in
+        0) return 0 ;;
+        3) ;;
+        *) return 1 ;;
+    esac
+    hook_log "Bluetooth amplifier mute mismatch; synchronizing through stock IOGuard"
+    # IPC delivery is not an acknowledgement of the hardware state. Read
+    # back the global flag and recheck ownership/protection before opening.
+    "$REQUEST" "$IOGUARD_SOCKET" GNOTIFY=AUDIOMUTE:0 1200 >/dev/null 2>&1 || true
+    _bg_try=0
+    while [ "$_bg_try" -lt 10 ]; do
+        output_guard_ok && pcm_clock_live && [ "$(mixer_values 1)" = '0,0' ] || return 1
+        if env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted >/dev/null 2>&1; then
+            hook_log "Bluetooth stock global and amplifier mute cleared and verified"
+            return 0
+        fi
+        _bg_try=$((_bg_try + 1))
+        usleep 100000 2>/dev/null || sleep 1
+    done
+    return 1
+}
+
 hard_mute() {
     # Fade out with the DAC's ramped digital volume first, so the amplifier is
     # switched off on silence; only then stop the I2S data.  Cutting the data
@@ -171,7 +217,7 @@ park_bluetooth_pcm() {
     _park_pcm=${HK_AP2_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
     _park_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_park_pcm" 2>/dev/null)
     case "$_park_owner" in ''|*[!0-9]*) return 0;; esac
-    [ "$(cat "$AUDIO_PROC/$_park_owner/comm" 2>/dev/null)" = a01controller ] || return 0
+    audio_bt_pcm_owned "$_park_owner" || return 0
     [ ! -e "$BT_OWNER" ] && [ ! -s "$SAFE/play.started" ] && [ ! -e "$SAFE/lease" ] || return 1
     [ -S "$BT_PCM_CONTROL" ] && [ -x "$REQUEST" ] || {
         hook_log 'Bluetooth PCM cannot be released: private backend unavailable'
@@ -229,7 +275,7 @@ pcm_clock_live() {
     esac
     pcm_comm=$(cat "$PROC_ROOT/$pcm_owner/comm" 2>/dev/null)
     if [ -n "${HK_AP2_BT:-}" ]; then
-        [ "$pcm_comm" = a01controller ]
+        audio_bt_pcm_owned "$pcm_owner"
     elif [ -n "${HK_AP2_VOICE:-}" ]; then
         [ "$pcm_comm" = aplay ]
     else
@@ -263,7 +309,7 @@ start_failed() {
     reason=$1
     hook_log "start failed: $reason"
     hard_mute
-    [ "$USE_STOCK_PA" != "1" ] || stock_pa_mute 1 || true
+    if [ "$USE_STOCK_PA" = "1" ] && [ -z "${HK_AP2_BT:-}" ]; then stock_pa_mute 1 || true; fi
     clear_play_lease
     mixer_set "Auto Mute" on || true
     exit 1
@@ -383,6 +429,13 @@ case "${1:-}" in
             ''|*[!0-9]*) start_failed "invalid watchdog heartbeat" ;;
         esac
         publish_play_lease || start_failed "could not publish playback lease"
+        if [ -n "${HK_AP2_BT:-}" ]; then
+            # Only closing output may overlap acknowledgement: the watchdog
+            # can still be finishing its preceding no-lease hard mute. Keep
+            # baseline writes and every enable operation after its ack.
+            mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
+            usleep 300000 2>/dev/null || sleep 1
+        fi
         wait_for_lease_ack "$previous_heartbeat" ||
             start_failed "watchdog did not acknowledge playback lease"
 
@@ -391,9 +444,11 @@ case "${1:-}" in
         # digitally silent; the clock is then allowed to run before that gain
         # returns. Repeatedly muting/unmuting the amplifier across clock and
         # I2S transitions is the click heard on AirPlay reconnects.
-        mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
-        usleep 300000 2>/dev/null || sleep 1
-        if [ "$USE_STOCK_PA" = "1" ]; then
+        if [ -z "${HK_AP2_BT:-}" ]; then
+            mixer_cset 1 0,0 || start_failed "digital pre-mute failed"
+            usleep 300000 2>/dev/null || sleep 1
+        fi
+        if [ "$USE_STOCK_PA" = "1" ] && [ -z "${HK_AP2_BT:-}" ]; then
             stock_pa_mute 1 || start_failed "stock PA pre-mute failed"
         fi
         mixer_set "Ext Spk" off || true
@@ -428,8 +483,13 @@ case "${1:-}" in
         output_guard_ok || start_failed "output guard lost during baseline"
         wait_for_pcm_clock || start_failed "audio clock unavailable"
         if [ "$USE_STOCK_PA" = "1" ]; then
-            stock_pa_mute 0 || start_failed "stock PA unmute failed"
-            hook_log "stock PA unmuted"
+            if [ -n "${HK_AP2_BT:-}" ]; then
+                bt_sync_global_mute || start_failed "Bluetooth global mute synchronization failed"
+                hook_log "Bluetooth native amplifier acknowledged"
+            else
+                stock_pa_mute 0 || start_failed "stock PA unmute failed"
+                hook_log "stock PA unmuted"
+            fi
         fi
         mixer_set "Ext Spk" on || start_failed "external speaker enable failed"
         [ "$(switch_state 'Ext Spk')" = "on" ] ||
@@ -440,6 +500,10 @@ case "${1:-}" in
         wait_for_pcm_clock 5 || start_failed "audio clock lost during amplifier warm-up"
         [ "$(mixer_values 2)" = "$PLAYBACK,$PLAYBACK" ] ||
             start_failed "Playback Volume changed during amplifier warm-up"
+        if [ "$USE_STOCK_PA" = "1" ] && [ -n "${HK_AP2_BT:-}" ]; then
+            env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted >/dev/null 2>&1 ||
+                start_failed "Bluetooth stock amplifier is still muted"
+        fi
         mixer_cset 1 "$DIGITAL,$DIGITAL" || start_failed "digital fade-in failed"
         [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] ||
             start_failed "digital fade-in verification failed"
@@ -473,7 +537,7 @@ case "${1:-}" in
         if audio_read_lease; then lease_phase=draining; audio_write_lease || exit 1; fi
         hook_log "${1:-stop} requested"
         hard_mute
-        [ "$USE_STOCK_PA" != "1" ] || stock_pa_mute 1 || true
+        if [ "$USE_STOCK_PA" = "1" ] && [ -z "${HK_AP2_BT:-}" ]; then stock_pa_mute 1 || true; fi
         clear_play_lease
         if [ "$(audio_source)" = airplay ] || [ "$1" = mute ]; then rm -f "$DEFERRED" "$CLAIM"; fi
         mixer_set "Auto Mute" on || true

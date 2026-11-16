@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise handoff decisions without opening ALSA or a real speaker."""
 import os
+import hashlib
 import json
 import pathlib
 import socket
@@ -52,7 +53,7 @@ class HandoffTest(unittest.TestCase):
         self.assertTrue((self.run / 'ap2-claim').exists())
         self.assertEqual(result.returncode, 1, 'unarmed output must fail closed')
 
-    def test_bluetooth_enables_pa_once_after_silent_clock_baseline(self):
+    def bluetooth_start_fixture(self):
         safe = self.run / 'safe'
         (safe / 'armed').touch()
         (safe / 'watchdog.pid').write_text(str(os.getpid()))
@@ -85,12 +86,50 @@ else: print('Front Left: Playback [' + state[key] + ']')
 ''')
         mixer.chmod(0o755)
         remote = self.root / 'apple_remote'
-        remote.write_text('''#!/bin/sh
-case "$LD_PRELOAD" in */unmute.so) level=0;; *) level=1;; esac
-echo "pa $level" >>"$MOCK_EVENTS"
-echo "Snd_Ctrl airplay to mute $level"
+        remote.write_text('''#!/usr/bin/env python3
+import json, os
+level = 0 if os.environ['LD_PRELOAD'].endswith('/unmute.so') else 1
+path = os.environ['MOCK_PA_STATE']
+s = json.load(open(path))
+s['pa'] = int(bool(level or s['force']))
+json.dump(s, open(path, 'w'))
+with open(os.environ['MOCK_EVENTS'], 'a') as f: print('pa', level, file=f)
+print('Snd_Ctrl airplay to mute', level)
 ''')
         remote.chmod(0o755)
+        audio_lib = self.root / 'libmvmsg.so'
+        audio_lib.write_bytes(b'verified stock layout')
+        pa_state = self.root / 'pa-state.json'
+        pa_state.write_text(json.dumps({'pa': 1, 'force': 1, 'gate': 1}))
+        reader = self.root / 'audio-state'
+        reader.write_text('''#!/usr/bin/env python3
+import json, os, sys
+s = json.load(open(os.environ['MOCK_PA_STATE']))
+print('PA mute=%s force_mute=%s gate=%s' % (s['pa'], s['force'], s['gate']))
+blocked = s['force'] if sys.argv[1] == '--global-unmuted' else s['force'] or s['pa'] or not s['gate']
+sys.exit(3 if blocked else 0)
+''')
+        reader.chmod(0o755)
+        request = self.root / 'request'
+        request.write_text('''#!/usr/bin/env python3
+import json, os, sys
+command = sys.argv[2]
+if command == 'getPlayerStatus':
+    print(json.dumps({'mode':'41', 'status':'play', 'mute':os.environ.get('MOCK_PLAYER_MUTE','0')}, separators=(',',':')))
+elif command == 'GNOTIFY=AUDIOMUTE:0':
+    mixer = json.load(open(os.environ['MOCK_MIXER_STATE']))
+    assert mixer['1'] == '0,0' and mixer['Ext Spk'] == 'off' and mixer['aml audio i2s mute'] == 'off'
+    with open(os.environ['MOCK_EVENTS'], 'a') as f: print('global unmute with silent clock', file=f)
+    if not os.environ.get('MOCK_NO_UNMUTE_ACK'):
+        path = os.environ['MOCK_PA_STATE']; s = json.load(open(path)); s['force'] = 0
+        s['pa'] = 1 if os.environ.get('MOCK_PA_STAYS_MUTED') else 0
+        json.dump(s, open(path, 'w'))
+    if os.environ.get('MOCK_HOLD_DURING_UNMUTE'):
+        open(os.environ['HK_AP2_HOLD_MUTE_FILE'], 'w').close()
+else:
+    sys.exit(2)
+''')
+        request.chmod(0o755)
         delay = self.root / 'usleep'
         delay.write_text('#!/bin/sh\nsleep 0.01\n')
         delay.chmod(0o755)
@@ -108,6 +147,10 @@ echo "Snd_Ctrl airplay to mute $level"
             'HK_AP2_PCM_STATUS': str(pcm), 'HK_AP2_PROC_ROOT': str(self.root / 'proc'),
             'PATH': str(self.root) + ':' + os.environ['PATH'],
             'MOCK_MIXER_STATE': str(state), 'MOCK_EVENTS': str(events),
+            'HK_AP2_STOCK_AUDIO_STATE': str(reader), 'HK_AP2_STOCK_AUDIO_LIB': str(audio_lib),
+            'HK_AP2_STOCK_AUDIO_LIB_SHA256': hashlib.sha256(audio_lib.read_bytes()).hexdigest(),
+            'MOCK_PA_STATE': str(pa_state), 'HK_AP2_REQUEST': str(request),
+            'HK_AP2_HOLD_MUTE_FILE': str(self.root / 'hold-mute'),
         }
         (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
         def acknowledge():
@@ -115,24 +158,33 @@ echo "Snd_Ctrl airplay to mute $level"
             while not (safe / 'play.started').exists() and time.monotonic() < deadline:
                 time.sleep(.02)
             if not safe.exists(): return
+            if env.get('MOCK_DELAY_ACK_UNTIL_DIGITAL_MUTE'):
+                while time.monotonic() < deadline:
+                    if events.exists() and 'mixer 1 0,0' in events.read_text(): break
+                    time.sleep(.01)
+            with events.open('a') as f: print('watchdog ack', file=f)
             (self.root / 'clock').write_text('1.00 0.00\n')
             (safe / 'watchdog.heartbeat').write_text('1')
+        return env, pcm, events, acknowledge
+
+    def test_bluetooth_uses_official_amplifier_ack_after_silent_clock_baseline(self):
+        env, pcm, events, acknowledge = self.bluetooth_start_fixture()
+        safe = self.run / 'safe'
         thread = threading.Thread(target=acknowledge)
         thread.start()
         result = subprocess.run(['sh', str(HOOK), 'start'], env=env, capture_output=True, text=True, timeout=25)
         thread.join(timeout=2)
         self.assertEqual(result.returncode, 0, result.stderr + '\n' + (self.run / 'hook.log').read_text() + '\n' + events.read_text())
         log = events.read_text().splitlines()
-        self.assertLess(log.index('mixer 1 0,0'), log.index('pa 1'))
-        self.assertLess(log.index('pa 1'),
+        self.assertLess(log.index('mixer 1 0,0'),
                         log.index('mixer aml audio i2s mute off'))
         self.assertLess(log.index('mixer aml audio i2s mute off'),
-                        log.index('pa 0'))
-        self.assertLess(log.index('pa 0'), log.index('mixer Ext Spk on'))
+                        log.index('global unmute with silent clock'))
+        self.assertLess(log.index('global unmute with silent clock'), log.index('mixer Ext Spk on'))
         self.assertLess(log.index('mixer Ext Spk on'),
                         log.index('mixer 1 100,100'))
-        self.assertEqual(log.count('pa 0'), 1)
-        self.assertEqual(log.count('pa 1'), 1)
+        self.assertNotIn('pa 0', log)
+        self.assertNotIn('pa 1', log)
         self.assertEqual(log.count('mixer Ext Spk on'), 1)
         self.assertEqual(log.count('mixer aml audio i2s mute off'), 1)
         self.assertEqual(log.count('mixer 1 0,0'), 2)
@@ -167,6 +219,88 @@ echo "Snd_Ctrl airplay to mute $level"
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('mixer 1 100,100', events.read_text())
         self.assertIn('Playback Volume changed during amplifier warm-up', (self.run / 'hook.log').read_text())
+
+    def run_bluetooth_start_case(self, extra=None):
+        env, pcm, events, acknowledge = self.bluetooth_start_fixture()
+        env.update(extra or {})
+        if env.get('MOCK_ALREADY_UNMUTED'):
+            (self.root / 'pa-state.json').write_text(json.dumps({'pa': 0, 'force': 0, 'gate': 1}))
+        if env.get('MOCK_ONLY_PA_MUTED'):
+            (self.root / 'pa-state.json').write_text(json.dumps({'pa': 1, 'force': 0, 'gate': 1}))
+        thread = threading.Thread(target=acknowledge); thread.start()
+        result = subprocess.run(['sh', str(HOOK), 'start'], env=env, capture_output=True, text=True, timeout=25)
+        thread.join(timeout=2)
+        return result, events.read_text(), json.loads((self.root / 'mixer.json').read_text())
+
+    def test_global_unmute_requires_readback_not_just_successful_ipc_delivery(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_NO_UNMUTE_ACK': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('global unmute with silent clock', events)
+        self.assertNotIn('mixer Ext Spk on', events)
+        self.assertEqual(state['1'], '0,0')
+
+    def test_global_unmute_respects_factory_source_mute(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_PLAYER_MUTE': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('global unmute with silent clock', events)
+        self.assertNotIn('mixer Ext Spk on', events)
+
+    def test_new_hold_during_global_unmute_prevents_gain_restoration(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_HOLD_DURING_UNMUTE': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('mixer Ext Spk on', events)
+        self.assertEqual(state['1'], '0,0')
+
+    def test_wrong_stock_layout_never_sends_global_unmute(self):
+        result, events, state = self.run_bluetooth_start_case({'HK_AP2_STOCK_AUDIO_LIB_SHA256': '0' * 64})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('global unmute with silent clock', events)
+
+    def test_bluetooth_pre_mute_can_overlap_a_delayed_watchdog_ack(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_DELAY_ACK_UNTIL_DIGITAL_MUTE': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = events.splitlines()
+        self.assertLess(lines.index('mixer 1 0,0'), lines.index('watchdog ack'))
+        self.assertLess(lines.index('watchdog ack'), lines.index('mixer aml audio i2s mute off'))
+
+    def test_bluetooth_does_not_launch_temporary_airplay_helper(self):
+        result, events, state = self.run_bluetooth_start_case({'HK_AP2_APPLE_REMOTE': str(self.root / 'absent-apple-remote')})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('pa 0', events)
+        self.assertNotIn('pa 1', events)
+
+    def test_already_unmuted_bluetooth_skips_redundant_notification(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_ALREADY_UNMUTED': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('global unmute with silent clock', events)
+
+    def test_pa_only_mute_is_synchronized_even_if_global_flag_is_clear(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_ONLY_PA_MUTED': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('global unmute with silent clock', events)
+
+    def test_global_ack_without_amplifier_ack_never_restores_gain(self):
+        result, events, state = self.run_bluetooth_start_case({'MOCK_PA_STAYS_MUTED': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('mixer Ext Spk on', events)
+        self.assertEqual(state['1'], '0,0')
+
+    def test_airplay_does_not_use_bluetooth_global_mute_synchronization(self):
+        env, pcm, events, acknowledge = self.bluetooth_start_fixture()
+        env.pop('HK_AP2_BT')
+        env['HK_AP2_STOCK_AUDIO_STATE'] = str(self.root / 'missing-reader')
+        (self.run / 'bt-owner.pid').unlink()
+        (self.run / 'shairport.pid').write_text(str(os.getpid()))
+        (self.run / 'dsp-bridge.pid').write_text('42\n')
+        (self.root / 'proc/42/comm').write_text('hk-ap2-dsp-bri\n')
+        (self.root / 'pa-state.json').write_text(json.dumps({'pa': 1, 'force': 0, 'gate': 1}))
+        thread = threading.Thread(target=acknowledge); thread.start()
+        result = subprocess.run(['sh', str(HOOK), 'start'], env=env, capture_output=True, text=True, timeout=25)
+        thread.join(timeout=2)
+        self.assertEqual(result.returncode, 0, result.stderr + '\n' + (self.run / 'hook.log').read_text())
+        self.assertNotIn('global unmute with silent clock', events.read_text())
+        self.assertEqual(events.read_text().splitlines().count('pa 1'), 1)
+        self.assertEqual(events.read_text().splitlines().count('pa 0'), 1)
 
     def test_shared_guard_never_enables_output_and_rejects_unsafe_paths(self):
         safe = self.run / 'safe'

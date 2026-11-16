@@ -1,6 +1,6 @@
 # 审计修复状态 / Audit repair status
 
-基线：`741ce58`。修复分支：`fix/audit-20261114`。**已完成实机安装与静音核验，尚未完成本轮听测或长测。** 运行版本、回退记录及剩余验收见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。
+基线：`741ce58`。修复分支：`fix/audit-20261114`。截至 2026-11-17，完整 **179 项回归通过**，已完成多轮实机安装和部分用户试听。AirPlay 早期音量/按键/语音续播测试通过；蓝牙固化版播放及暂停恢复也已确认正常、无爆音或音量突增。启动优化版已部署，用户确认明显更快且声音正常，三次 hook 开声耗时为 3.00、2.53、2.79 秒。双向来源切换、最新版本语音与长测仍待验收。最新范围以[试听记录](LISTENING-VALIDATION-2026-11-15.md)为准；初次部署与回退见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。
 
 原审计 12 项（5 P1、7 P2）的代码与回归对应：
 
@@ -39,6 +39,8 @@
 
 ## English summary
 
-All twelve findings have corresponding repairs and regression evidence above. The offline suite passed 99 Linux/BusyBox tests plus six ARM IPC cases; 12 ARM artifacts passed compatibility checks, a 30-file generic package was verified, and runtime repacking was reproducible. Device preparation added regressions for stock permission tools, failed-start recovery, legacy rollback, staging release and conservative memory admission: the full suite now passes 111 tests. The 31-file private package passed muted deployment checks, including exact 5.6 bindings and dependent reloads. Two startup refusals were reported as failures and rolled back; their first recovery exposed and resolved a missing-runtime-directory issue. Audible and sustained acceptance remains pending.
+As of 2026-11-17, all 179 current regressions pass. Earlier AirPlay volume, controls and voice resume passed user-present tests. Persistent Bluetooth playback and pause/resume now also pass without reported pops or a volume jump after fixing residual stock global mute. The deployed startup optimization passed user listening: starts and resumes were noticeably faster with normal sound. Three opening-hook intervals were 3.00, 2.53 and 2.79 seconds. Bidirectional source handoff, voice on the latest stack and sustained acceptance remain pending; the listening record is authoritative for current scope.
+
+All twelve findings have corresponding repairs and regression evidence above. The initial offline suite passed 99 Linux/BusyBox tests plus six ARM IPC cases; 12 ARM artifacts passed compatibility checks, a 30-file generic package was verified, and runtime repacking was reproducible. Device preparation extended that stage to 111 tests. The initial 31-file private package passed muted deployment checks, including exact 5.6 bindings and dependent reloads. Two startup refusals were reported as failures and rolled back; their first recovery exposed and resolved a missing-runtime-directory issue.
 
 The AirPlay candidate maps software attenuation from −30 to −6 dB. Bluetooth voice defaults to in-place PCM mixing with music ducked to silence; an explicit pause really pauses and cancels automatic resume. Physical loudness calibration, complete source/voice handoff, audible pops, bass hardware, dependent stock-process reloads, fresh installation and sustained runtime remain device acceptance work. The Shairport `-X` simulator crash also affects the old baseline and is recorded as a validation limit.

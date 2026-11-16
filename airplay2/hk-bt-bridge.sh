@@ -19,13 +19,14 @@ LOCK=$RUN/speaker.lock
 LOG=$RUN/bt-bridge.log
 PCM=${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}
 PLAYER_SOCKET=${HK_BT_PLAYER_SOCKET:-/tmp/Requesta01controller}
-PROC_ROOT=${HK_BT_PROC_ROOT:-/proc}
 COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
 [ -r "$COMMON" ] || COMMON=$(dirname "$0")/hk-audio-common.sh
 [ -r "$COMMON" ] || exit 1
 . "$COMMON"
 active=0
 child=
+HOOK_POLL_LIMIT=12
+command -v usleep >/dev/null 2>&1 && HOOK_POLL_LIMIT=60
 
 now() { audio_now; }
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; audio_trim_log "$LOG"; }
@@ -41,8 +42,8 @@ watchdog_live() {
 }
 
 bt_playing() {
-    bt_source_playing || return 1
-    bt_pcm_live
+    bt_pcm_live || return 1
+    bt_source_playing
 }
 
 bt_source_playing() {
@@ -67,11 +68,23 @@ bt_pcm_live() {
     grep -q '^state: RUNNING' "$PCM" || return 1
     owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM")
     case "$owner" in ''|*[!0-9]*) return 1;; esac
-    [ "$(cat "$PROC_ROOT/$owner/comm" 2>/dev/null)" = a01controller ]
+    audio_bt_pcm_owned "$owner"
 }
 
 stall_since=
 last_stall_repair=0
+last_stall_check=-1
+last_pause_check=-1
+
+refresh_paused_source() {
+    [ -f "$WAIT_PCM" ] || return 0
+    _rp_now=$(now)
+    [ "$_rp_now" -gt "$last_pause_check" ] || return 0
+    last_pause_check=$_rp_now
+    # Keep the existing source-generation/disconnect observation even when
+    # the fast playback probe rejects a stopped PCM before querying stock.
+    bt_source_playing || true
+}
 
 repair_stalled_bluetooth() {
     # a01controller can keep reporting "play" after the A2DP stream stalls:
@@ -87,6 +100,10 @@ repair_stalled_bluetooth() {
         *) return 1;;
     esac
     current=$(now)
+    # Fast idle wakeups must not multiply stock-player RPC traffic while
+    # disconnected. Transport repair still samples metadata at most once/s.
+    [ "$current" -gt "$last_stall_check" ] || return 1
+    last_stall_check=$current
     bt_source_playing || { stall_since=; return 1; }
     bt_pcm_live && { stall_since=; return 1; }
     [ -n "$stall_since" ] || stall_since=$current
@@ -137,6 +154,7 @@ run_hook() {
         HK_AP2_DIGITAL_SAFE=207 HK_AP2_PLAYBACK_SAFE=0 "$HOOK" "$action" &
     child=$!
     count=0
+    hook_deadline=$(($(now) + 12))
     while kill -0 "$child" 2>/dev/null; do
         heartbeat || return 1
         if [ "$action" = start ]; then
@@ -158,8 +176,8 @@ run_hook() {
             fi
         fi
         count=$((count + 1))
-        [ "$count" -lt 12 ] || { kill -KILL "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; child=; return 1; }
-        sleep 1
+        [ "$count" -lt "$HOOK_POLL_LIMIT" ] && [ "$(now)" -lt "$hook_deadline" ] || { kill -KILL "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; child=; return 1; }
+        audio_delay 200000
     done
     wait "$child"; rc=$?
     child=
@@ -207,6 +225,7 @@ while [ -f "$SAFE/armed" ]; do
        [ ! -f "$RELEASE" ] && ! audio_voice_pending &&
        [ ! -s "$SAFE/play.started" ] && ! ap2_recent_claim &&
        watchdog_live; then
+        refresh_paused_source
         repair_stalled_bluetooth || true
     fi
     if [ "$active" = 1 ]; then
@@ -246,5 +265,5 @@ while [ -f "$SAFE/armed" ]; do
             fi
         fi
     fi
-    sleep 1
+    if [ "$active" = 0 ]; then audio_delay 200000; else sleep 1; fi
 done

@@ -2,6 +2,18 @@
 
 本记录接续 [11 月 14 日部署记录](DEVICE-VALIDATION-2026-11-14.md)。结论只适用于作者这台音箱及本轮 Mac“音乐”AirPlay 测试。
 
+## 最新结果：蓝牙全局静音修复与启动加速（2026-11-17）
+
+后续新蓝牙后端的多轮试听曾完全无声；下文早期通过记录不能替代该版本验收。最终只读诊断确认音乐已经进入实际 PCM 缓冲区，而原厂全局 `force_mute` 与 PA mute 仍为 1。播放器自身重复 `mute:0` 会去重，不重新通知 IOGuard。有效蓝牙租约和时钟下，DAC 数字级先降到零，通过共享 guard，再使用官方 `GNOTIFY=AUDIOMUTE:0` 并回读全局/PA 均解除后恢复原电平；没有增大手机或软件音量。用户确认音乐清楚、无爆音或音量突增。173 项回归的固化版安装后，用户又确认开始播放、暂停约三秒及恢复都正常，无异常声音。
+
+用户接着指出点击播放/恢复后等待很久。旧 hook 流程约四秒。179 项完整 Linux/BusyBox 回归通过的启动优化版已安装并精确核验：蓝牙不再启动临时 AirPlay 功放助手，数字静音准备与 watchdog 确认重叠，空闲检测加快；模拟基线与输出开启仍等待确认，300 ms 静音斜坡及 200 ms 功放稳定等待保留。未修改 DSP、音量曲线、C 后端或缓冲区，也未重载原厂播放器。
+
+用户反馈：**“明显更快，声音正常。”** 三次日志记录的 `start requested` 至 `speaker enabled` 间隔为 3.00、2.53、2.79 秒；它们不包含手机点击到接收端开始请求之间的时间。首轮自动清除了维护时为复现故障而设置的全局静音，随后回读 `force_mute=0`；播放结束没有故障锁存，正常暂停保留的 XRUN 处于无租约、物理静音状态。179 项测试日志 SHA-256 为 `46a5b365d4fda62a94277b3a40eb4203bba3fc9c9a6c9ecd1f78a53f3857f6db`。
+
+当前继续验证双向蓝牙/AirPlay 来源切换、最新堆栈语音和持续运行；这些项目尚未验收。AirPlay 配置仍为 flat、24 dB 范围、软件输出 −30…−6 dB；本轮未调整其音量曲线。
+
+English: Later live tests on the new Bluetooth backend were silent despite nonzero samples in the actual PCM buffer. Read-only stock state showed global force-mute and PA mute still set; a duplicate source mute=0 request did not notify IOGuard. The guarded zero-DAC sequence now uses the official notification, verifies both states and restores the same gain. The user confirmed clear music without pops or a gain jump, then normal startup and pause/resume on the persistent 173-test repair. The 179-test startup optimization is deployed and exactly verified without changing DSP, volume, backend buffers or the stock player process. It removes temporary AirPlay amplifier helpers from Bluetooth, overlaps digital closing with watchdog acknowledgement and probes idle playback more promptly while preserving output checks and ramp/warm-up delays. The user confirmed noticeably faster starts and resumes with normal sound. Three hook intervals were 3.00, 2.53 and 2.79 seconds, not phone-to-speaker measurements. The deliberately reproduced global mute cleared and no fault remained after playback. Bidirectional handoff, current-stack voice and sustained operation still need acceptance; the AirPlay −30…−6 dB configuration is preserved.
+
 ## 已完成的用户试听
 
 | 项目 | 结果 |
@@ -152,3 +164,42 @@ MMAP 修正版的下一次用户试听仍无声。现场显示原厂 status=play
 六文件静音更新事务 `20261116T051402-19482` 已提交，返回 0、无 pending、六文件哈希相符、精确验证返回 0。AirPlay 配置 SHA-1 保持 `1a4b6e188135e61ae99e32c3ed4578d5c7404bc1`，范围仍为 −30…−6 dB。rootApp 始终为 PID 139；AirPlay 5.6、独立保护、蓝牙桥及各一个语音监督/主循环正常，安装 hold/manual mute 保留、硬件 PCM closed。真实蓝牙、双向来源切换、语音及长测仍待本版试听；本节不将零数据验证描述为听觉验收。
 
 English: The next user-present mmap-version test was still silent. Samples reached the backend, but real DSP parameter setup failed at 44.1 kHz; no output lease or fault latch existed. Muted probes reproduced −22 and verified 48 kHz. Moving conversion before the virtual PCM keeps its accounting at the hardware rate. Full-ring park/reopen probes then exposed separate modulo-pointer and startup-prefill deadlocks. Both negative controls fail the new regression; all 141 Linux/BusyBox tests pass with the fixes. The full stock Master/plug/virtual/Harman-DSP/hardware chain passed zero-only write, park, blocked discard, reopen and close at both input rates, with actual RUNNING and closed states verified. The six-file muted transaction committed with return code 0, no pending transaction, matching hashes and exact verification 0. The AirPlay configuration is byte-for-byte preserved; rootApp remains unchanged, and the playback/voice/protection stack is healthy under maintenance mute. Audible Bluetooth, bidirectional handoff, voice regression and sustained operation still await this version's listening tests.
+
+
+## 2026-11-16：实际播放无租约与 FD 持有者修正
+
+用户再次确认完全无声。与之前参数失败不同，这次 PCM 已持续 RUNNING，48 kHz/S16、DMA 指针前进，但输出硬静音、无租约也无故障锁存。记录的打开线程已经退出；原厂播放器仍持有真实播放设备 FD，已加载正确的后端和 Harman DSP。旧归属检查只读取打开线程的 comm，导致桥接拒绝申请输出。恢复维护静音、用户暂停后，在锁内通过已有后端控制接口 park，确认实际声卡 closed。
+
+新后端原子发布并撤销实际持有者身份/启动时间/FD/代次；共享消费者复核真实设备句柄，不再依赖过期或被复用的 TID。实际 stock-ALSA/Master/48 kHz 适配/虚拟后端/Harman DSP 的 44.1、48 kHz 全零播放 → park → 占用期间丢弃 → 重新打开 → close 均返回 0，证明记录在关闭后撤销，全程维护静音。
+
+完整 **150 项 Linux/BusyBox 测试通过**，日志 SHA-256：`4bd16d06e751fd24503a287fe64f3e2e28e1ca7309dba24e6035471995f5209c`。后端 SHA-256：`003513ff5222822d91db97dcf06fadbd458fd181f5a5f83bd7eb9fd0da093b72`，最大 GLIBC 需求仍为 2.17。九文件事务 `20261116T054126-31180` 已提交，返回 0、无 pending、九文件哈希一致、运行时精确验证返回 0。原厂播放器和语音依赖已重载，rootApp 保持 PID 139，各一个语音监督/主循环正常；AirPlay 配置逐字节保持原样。安装核验时声卡 closed、维护静音保留，随后在用户在场时解除安装 hold 等待手动播放。本版本的实际蓝牙出声、双向交接、语音和长测尚未验收。
+
+English: The user again heard no Bluetooth music. This time real DSP playback and DMA were healthy, but no output lease existed: the recorded opener thread had died while the stock process retained the PCM FD. The obsolete thread-name checks rejected it. Under maintenance mute after the user paused, the existing guarded IPC parked and released the hardware. The fix publishes actual process/start-time/FD/generation proof and shares strict revalidation across Bluetooth consumers. All 150 tests and both complete real-DSP zero-only park/discard/reopen cycles pass; the proof is removed on close. The nine-file muted update committed with return code 0, matching hashes, no pending transaction and exact verification. Bluetooth and voice dependents reloaded; rootApp is unchanged, one voice supervisor/loop is healthy, and AirPlay configuration is byte-for-byte preserved. Installation hold was then released for user-initiated listening. Audible Bluetooth and subsequent handoff/voice/sustained checks remain pending.
+
+
+## 2026-11-16：短写入保真修正与仍然无声的实机结果
+
+FD 归属修正后，用户能听到蓝牙，但报告持续吱声和爆音；该次试听未通过。用户暂停并断开后，恢复维护 hold/manual mute，guarded park 确认声卡关闭。
+
+原厂 ARM ALSA 文件输出探针按真实调用地址模拟原厂单次非阻塞写入，旧版在 180,000 帧中丢弃 90,000 帧。入口补写只解决 48 kHz；44.1 kHz 的 rate/softvol 还会在下游短 MMAP commit 后消耗输入。因此入口和 backend callback 都补齐整包；语音只混一次，永久背压有界且可被新来源取消，活动 XRUN 先请求静音与租约释放。
+
+160 项完整回归通过，测试日志 SHA-256 为 `a2e63ae5e0c81948d445cd622eacaa0fc694763661f324c346b4abd043571bf4`。最终 ARM file/null 对照在相同非 drain 关闭下逐字节匹配直接 ALSA：48 kHz 为 720,000 字节，44.1 kHz 为 768,000 字节。后续真实 Harman DSP 全零 write/park/discard/reopen/close 两种输入采样率均通过，维护静音始终有效。这些结果没有证明实际音乐已正常播放。
+
+六文件事务 `20261116T111155-11146` 提交成功，返回 0、pending 清除、哈希和精确版本核验均通过。解除维护静音并由用户手动播放后，用户反馈**完全无声**。现场手机音量 20/100、Master=6、Digital Playback Volume=207,207，Ext Spk/Digital 打开、I2S mute 关闭；active 蓝牙租约有效，PCM 持续 RUNNING 且 DMA 前进，无故障锁存。保留现场后恢复维护静音，用户暂停；没有自动增大增益，也没有把它当成 watchdog 误静音。
+
+新增按需诊断以 `bt-pcm-diagnostics` 标记启用，分别记录播放器输入与 Master 后的帧数、非零采样数和峰值，默认关闭，不保存音乐内容。162 项完整 Linux/BusyBox 测试通过，日志 SHA-256 为 `4879484b259dedfa5554df90774e986d8809c7ae261380f7e36557e109baa591`；新诊断版本的 ARM 文件对照继续匹配。事务 `20261116T141746-11520` 已提交，返回 0、无 pending、六文件哈希与精确核验一致。rootApp 保持 PID 139，AirPlay 配置逐字节保留。安装后开启诊断标记，仍保持维护静音，等待用户重新连接并手动开始新一轮播放。无声原因、双向来源切换、语音回归和长测仍未验收。
+
+English: The live holder-identity revision was audible but buzzed and popped. Stock ARM ALSA file-only probes reproduced 90,000 dropped frames out of 180,000. Both the verified player entry and backend callback now complete short writes; outer-only completion still lost 44.1 kHz rate output. Voice mixes once, backpressure is bounded/cancellable, and an active XRUN requests muted lease release before recovery. All 160 tests passed, both input rates matched direct ALSA file references with the same non-draining close, and muted full Harman DSP zero-only park/reopen cycles passed. The six-file update committed and exactly verified, yet the next user-initiated test was completely silent with a valid Bluetooth lease, running DMA and enabled output switches at phone volume 20/100 and Master=6. Maintenance mute was restored without increasing gain or blaming the watchdog. Opt-in pre/post-Master peak and frame diagnostics were then added without storing audio. All 162 tests and final ARM file references pass. The diagnostic transaction committed with matching hashes, no pending journal and exact verification; rootApp and AirPlay configuration are preserved. Diagnostics are enabled under maintenance mute while waiting for a new user-initiated stream. Silence and subsequent handoff/voice/sustained acceptance remain unresolved.
+
+
+### 补充：实际音乐电平及 DSP 后段测量
+
+按需诊断读到播放器入口峰值约 12,000，Master 后峰值约 100（约 −50 dBFS）；用户在手机上缓慢调高后，后者约 200–250，仍反馈完全无声。输入和 Master 后均持续非零，不能再归因于没有输入数据或仅凭 PCM RUNNING 判为成功。没有由维护程序自动增加增益。
+
+外部只读映射探针未能取得 DMA 缓冲区数据，不能将读取失败解释为零信号。后端增加受诊断标记控制的 `levels` 查询，只扫描自身已映射的 PCM 数据页，返回峰值和非零计数；不读取寄存器、不修改缓冲区或音量。原生回归验证关闭诊断和缺少数据映射时拒绝查询，实际共享映射的电平正确，且读取后采样不变。
+
+163 项完整 Linux/BusyBox 回归通过，日志 SHA-256 为 `c95655ba7eb52cf91459af5d680521c8fb3683a74c58a3cad8fcd91e10e26757`。六文件后段诊断事务 `20261116T143418-14865` 已提交，返回 0、无 pending、所有哈希匹配、精确版本验证 0。维护静音保留，待手机重新连接后手动播放并查询 DSP 后段；目前没有取得真实音乐的后段电平，也没有完成无声修复。
+
+维护静音下还比较了只打开、设置参数、关闭且完全不写采样的 DSP 调用：S16/48 kHz 在有无原厂 client11 标记时均成功，硬件 period64/buffer24000；直接 S32 设置参数返回 −22。此结果只能排除 client11 单独改变本次硬件 period 的猜测，不能代替经 plug 的 AirPlay 路径，也不能证明 S16 音频处理正常。
+
+English: Live diagnostics found nonzero music at both entry and post-Master: peaks around 12,000 and 100 initially, rising to roughly 200–250 after the user gradually increased phone volume. The user still heard nothing; the maintenance tool did not raise gain. External read-only DMA observation failed and produced no output-level evidence. A gated `levels` query now reads only the backend's own mapped PCM data and returns aggregate peaks/nonzero counts without changing samples, gains or registers. Native tests verify refusal when disabled/unmapped and correct, nonmutating reads of a real shared mapping. All 163 tests pass. The six-file output-diagnostic transaction committed with return code 0, matching hashes, no pending transaction and exact verification. It remains under maintenance mute pending a new user-started stream; silence is unresolved. Separate no-sample parameter-only probes accepted S16/48 kHz with and without client11 and identical hardware periods; direct S32 parameters failed. These results neither test the plug-based AirPlay route nor establish audible fidelity.

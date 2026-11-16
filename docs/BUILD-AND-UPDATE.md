@@ -140,3 +140,20 @@ The Bluetooth ioplug must advertise interleaved RW and mmap access for the stock
 蓝牙的采样率适配必须位于虚拟 PCM 之前：Master softvol → plug（slave.rate=48000）→ hkbtpark → harmandsp → hw。只向 null 写短片段不能验证原厂 DSP；需在维护静音下，以全零数据检查两种输入采样率的持续写入、精确满缓冲 park、占用期间丢弃、重新打开及实际硬件状态。测试专用的 `tests/alsa-clock-sink.c` 不进入发布包。
 
 Place Bluetooth rate conversion before the retained virtual PCM: Master softvol → plug (48 kHz slave) → hkbtpark → harmandsp → hardware. Short null writes do not validate stock DSP compatibility. Under maintenance mute, verify both input rates with sustained zero-data writes, full-buffer park, blocked discard, reopen and physical PCM state. The clock-paced test sink is not shipped.
+
+
+蓝牙 slave 成功打开后还必须发布并验证实际进程/启动时间/设备 FD 证明；`owner_pid` 可能是已退出的线程，不能单独作为完整归属判断。新库、共享检查、桥接、hook、语音消费者与 pin 必须整批更新，并在维护静音下重载依赖。测试须覆盖无效证明仍拒绝输出。
+
+A retained Bluetooth PCM can outlive its recorded opener TID. Deploy holder-proof publication, shared process/start-time/descriptor validation, Bluetooth bridge/hook/voice consumers and their pins as one muted transaction. Test rejection of invalid proof as well as recovery with a dead opener.
+
+蓝牙完整包补写必须同时覆盖播放器入口和后端 transfer。原厂调用方不会补齐短写入，原厂 rate/softvol 也可能在 slave MMAP commit 短写入时消耗输入；只验证返回帧数或零数据不足以排除失真。回归需比较非恒定双声道数据在 44.1/48 kHz 的实际文件输出与直接 ALSA 参考，并注入短写入、EAGAIN 和永久背压。背压等待必须有界且可被新来源取消；活动播放时钟异常先请求静音/撤销租约，不能直接重置时钟。两个库及 wrapper、boot、controller pin 应与已验证依赖重载器整批更新。
+
+Complete Bluetooth packets at both the player entry point and backend transfer. The stock caller discards short-write remainders, and stock rate/softvol can consume input after a partial slave mmap commit. Test nonconstant stereo output against direct ALSA references at 44.1/48 kHz with short writes, EAGAIN and permanent backpressure; accepted-frame counts and zero-only probes are insufficient. Waits must be bounded and cancellable by source takeover. An active clock failure requests muted lease release before reset. Deploy both libraries, wrapper/boot/controller pins and the verified dependent reload helper in one transaction.
+
+构建还会生成 `hk-stock-audio-state`，随控制器 pin 和蓝牙开声 hook 一起发布。此工具仅以 SHM_RDONLY 读取已验证固件的全局/PA 声音标志；hook 先核验原厂 libmvmsg 的 SHA-256。移植时必须重新核对布局，不能只更改 hash。回读器不会解除静音，蓝牙 hook 通过原厂 IOGuard 通知同步状态并在数字增益恢复前核验。只替换 hook、controller 和该工具时，不需要重载原厂蓝牙播放器；完整更新仍遵循维护静音和事务验证。
+
+Builds also produce `hk-stock-audio-state`, released with its controller pin and Bluetooth hook. It uses SHM_RDONLY for the verified firmware's global/PA flags; the hook pins stock libmvmsg before trusting the layout. A firmware port requires layout validation as well as a new hash. The helper never unmutes audio. Bluetooth uses the official IOGuard notification and verifies state before restoring digital gain. A transaction limited to the hook, controller and reader does not reload the stock Bluetooth player; maintenance mute and exact transaction validation still apply.
+
+蓝牙最新开声分支不启动临时 `apple_remote` 功放辅助进程，也不写 AirPlay client3 的静音状态；通过原厂蓝牙来源意图与全局/PA 回读确认开启条件。只有关闭输出的数字静音准备可以与 watchdog 确认重叠，模拟基线和任何开启操作仍在确认之后。AirPlay 和独立语音保留原有辅助进程顺序。若在维护中人为复现原厂全局静音，结束时须在已静音且声卡空闲的条件下通过官方接口恢复并回读，不能把测试状态留给其他来源。
+
+The current Bluetooth opening path does not launch temporary `apple_remote` amplifier helpers or change AirPlay client3 mute. It validates native Bluetooth intent and reads back global/PA state. Only digital output closing may overlap watchdog acknowledgement; baseline writes and every enable operation still follow it. AirPlay and standalone voice retain their helper sequence. Any global-mute state deliberately introduced during maintenance must be restored through the official interface and checked with output muted and the PCM idle before leaving it for another source.

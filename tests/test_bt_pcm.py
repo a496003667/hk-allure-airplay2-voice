@@ -32,19 +32,38 @@ class BluetoothPcmTest(unittest.TestCase):
 #include <poll.h>
 #include <time.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 int main(void) {
     snd_pcm_t *pcm;
-    int mmap = getenv("HK_TEST_MMAP") != NULL;
+    int use_mmap = getenv("HK_TEST_MMAP") != NULL;
     int rc = snd_pcm_open(&pcm, "test_bt", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
     if (rc < 0) { fprintf(stderr, "open: %s\n", snd_strerror(rc)); return 2; }
     rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
-                            mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED,
+                            use_mmap ? SND_PCM_ACCESS_MMAP_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED,
                             2, getenv("HK_TEST_RATE") ? (unsigned)atoi(getenv("HK_TEST_RATE")) : 48000, 1, 500000);
     if (rc < 0) { fprintf(stderr, "params: %s\n", snd_strerror(rc)); return 3; }
     puts("ready"); fflush(stdout);
     char line[40];
+    void *mapping = MAP_FAILED;
+    size_t mapping_bytes = 0;
+    int mapping_fd = -1;
     while (fgets(line, sizeof(line), stdin)) {
         if (line[0] == 'q') break;
+        if (line[0] == 'm') {
+            snd_pcm_uframes_t buffer = 0, period = 0;
+            if (snd_pcm_get_params(pcm, &buffer, &period) < 0 || mapping != MAP_FAILED) return 7;
+            mapping_bytes = buffer * 4;
+            mapping_fd = open(getenv("HK_BT_PCM_DEVICE"), O_RDWR);
+            if (mapping_fd < 0 || ftruncate(mapping_fd, (off_t)mapping_bytes)) return 7;
+            mapping = mmap(NULL, mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mapping_fd, 0);
+            if (mapping == MAP_FAILED) return 7;
+            short *area = mapping;
+            for (unsigned i = 0; i < buffer; ++i) { area[2*i] = 1111; area[2*i+1] = -2222; }
+            printf("mapped %lu\n", (unsigned long)buffer); fflush(stdout);
+            continue;
+        }
         if (line[0] == 'p') {
             struct pollfd fd;
             unsigned short events = 0;
@@ -59,7 +78,7 @@ int main(void) {
         char *size = strchr(line, ' ');
         unsigned frames = size ? (unsigned)atoi(size + 1) : 256;
         if (!frames || frames > 256) return 4;
-        long n = mmap ? snd_pcm_mmap_writei(pcm, samples, frames) : snd_pcm_writei(pcm, samples, frames);
+        long n = use_mmap ? snd_pcm_mmap_writei(pcm, samples, frames) : snd_pcm_writei(pcm, samples, frames);
         if (getenv("HK_TEST_RETRY")) {
             long total = n > 0 ? n : 0;
             for (int tries = 0; total < frames && tries < 200 && (n >= 0 || n == -EAGAIN); ++tries) {
@@ -76,6 +95,8 @@ int main(void) {
         printf("wrote %ld\n", n); fflush(stdout);
     }
     snd_pcm_close(pcm);
+    if (mapping != MAP_FAILED) munmap(mapping, mapping_bytes);
+    if (mapping_fd >= 0) close(mapping_fd);
     return 0;
 }
 ''')
@@ -107,6 +128,95 @@ int snd_pcm_open(snd_pcm_t **p, const char *name, snd_pcm_stream_t stream, int m
         subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-DPIC', '-shared', '-fPIC',
                         str(REPO / 'tests/alsa-clock-sink.c'), '-lasound', '-o', str(cls.clock)],
                        check=True, capture_output=True)
+        faults = cls.build / 'write-faults.c'
+        faults.write_text(r'''
+#define _GNU_SOURCE
+#include <alsa/asoundlib.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+static unsigned calls;
+static __thread int fail_clock;
+int clock_gettime(clockid_t id, struct timespec *stamp) {
+    int (*next)(clockid_t, struct timespec *) = dlsym(RTLD_NEXT, "clock_gettime");
+    if (fail_clock && id == CLOCK_MONOTONIC) {
+        fail_clock = 0; errno = EIO; return -1;
+    }
+    return next(id, stamp);
+}
+snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *data, snd_pcm_uframes_t frames) {
+    snd_pcm_sframes_t (*next)(snd_pcm_t *, const void *, snd_pcm_uframes_t) =
+        dlsym(RTLD_NEXT, "snd_pcm_writei");
+    if (strcmp(snd_pcm_name(pcm), "capture")) return next(pcm, data, frames);
+    const char *fault = getenv("HK_TEST_SINK_FAULT");
+    if (!fault || access(fault, F_OK)) return next(pcm, data, frames);
+    char kind[32] = {0};
+    int fd = open(fault, O_RDONLY);
+    if (fd >= 0) { (void)read(fd, kind, sizeof(kind) - 1); close(fd); }
+    const char *seen = getenv("HK_TEST_SINK_SEEN");
+    if (seen) { fd = open(seen, O_WRONLY | O_CREAT, 0600); if (fd >= 0) close(fd); }
+    if (!strncmp(kind, "xrun", 4)) return -EPIPE;
+    if (!strncmp(kind, "stall", 5)) return -EAGAIN;
+    ++calls;
+    if (!strncmp(kind, "again", 5) && calls % 7 == 0) return -EAGAIN;
+    if (frames > 127) frames = 127;
+    snd_pcm_sframes_t n = next(pcm, data, frames);
+    if (!strncmp(kind, "clock", 5)) fail_clock = 1;
+    return n;
+}
+int snd_pcm_recover(snd_pcm_t *pcm, int error, int silent) {
+    int (*next)(snd_pcm_t *, int, int) = dlsym(RTLD_NEXT, "snd_pcm_recover");
+    const char *path = getenv("HK_TEST_RECOVER_LOG");
+    if (path) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) { (void)write(fd, "recover\n", 8); close(fd); }
+    }
+    return next(pcm, error, silent);
+}
+''')
+        cls.write_faults = cls.build / 'write-faults.so'
+        subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC',
+                        str(faults), '-ldl', '-o', str(cls.write_faults)],
+                       check=True, capture_output=True)
+        packets = cls.build / 'packets.c'
+        packets.write_text(r'''
+#include <alsa/asoundlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    unsigned rate = (unsigned)atoi(argv[1]);
+    snd_pcm_t *pcm;
+    int rc = snd_pcm_open(&pcm, "test_bt", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+    if (rc < 0) return 2;
+    rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+                            2, rate, 1, 1000000);
+    if (rc < 0) { snd_pcm_close(pcm); return 3; }
+    short samples[12000];
+    for (unsigned block = 0; block < 30; ++block) {
+        for (unsigned i = 0; i < 6000; ++i) {
+            samples[i*2] = (short)(((block*6000+i)*109+17)%20001-10000);
+            samples[i*2+1] = (short)(((block*6000+i)*73+311)%18001-9000);
+        }
+        unsigned done = 0;
+        for (unsigned calls = 0; done < 6000 && calls < 1000; ++calls) {
+            long n = snd_pcm_writei(pcm, samples + done*2, 6000-done);
+            if (n == -EAGAIN || !n) { snd_pcm_wait(pcm, 10); continue; }
+            if (n < 0 || (unsigned)n > 6000-done) { snd_pcm_close(pcm); return 4; }
+            done += (unsigned)n;
+        }
+        if (done != 6000) { snd_pcm_close(pcm); return 5; }
+    }
+    return snd_pcm_close(pcm) < 0 ? 6 : 0;
+}
+''')
+        cls.packets = cls.build / 'packets'
+        subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(packets),
+                        '-lasound', '-o', str(cls.packets)], check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -127,7 +237,8 @@ pcm_type.hkbtpark {{ lib "{self.plugin}" }}
 pcm.capture {{ type file slave.pcm "null" file "{self.capture}" format "raw" }}
 pcm.test_bt {{ type hkbtpark slave "capture" }}
 ''')
-        self.env = os.environ | {'ALSA_CONFIG_PATH': str(self.config), 'HK_BT_PCM_RUN': str(self.run)}
+        self.env = os.environ | {'ALSA_CONFIG_PATH': str(self.config), 'HK_BT_PCM_RUN': str(self.run),
+                                 'HK_BT_PCM_DEVICE': str(self.capture)}
         self.env.pop('LD_PRELOAD', None)
         self.children = []
 
@@ -385,6 +496,135 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
         for _ in range(220):
             self.write(proc, 3333)
         self.assertTrue(self.holds_capture(proc))
+
+    def test_holder_record_tracks_real_descriptor_and_park_reopen(self):
+        proc = self.launch(); self.write(proc)
+        owner = self.run.parent / 'bt-pcm-owner'
+        first = owner.read_text()
+        pid, started, fd, generation = first.split()
+        self.assertEqual(int(pid), proc.pid)
+        fields = (Path('/proc') / pid / 'stat').read_text().rsplit(')', 1)[1].split()
+        self.assertEqual(started, fields[19])
+        self.assertEqual((Path('/proc') / pid / 'fd' / fd).resolve(), self.capture)
+        self.assertEqual(owner.stat().st_mode & 0o777, 0o600)
+        (self.run / 'ap2-claim').touch()
+        self.assertEqual(self.park(), b'parked\n')
+        self.assertFalse(owner.exists())
+        self.write(proc, 2222)
+        self.assertFalse(owner.exists())
+        (self.run / 'ap2-claim').unlink()
+        self.write(proc, 3333)
+        self.assertNotEqual(owner.read_text(), first)
+        proc.stdin.write('q\n'); proc.stdin.flush(); proc.wait(timeout=2)
+        self.assertFalse(owner.exists())
+
+    def test_missing_descriptor_identity_closes_slave_without_publishing_proof(self):
+        self.env['HK_BT_PCM_DEVICE'] = str(self.root / 'missing-device')
+        proc = self.launch(); self.write(proc)
+        self.assertFalse(self.holds_capture(proc))
+        self.assertFalse((self.run.parent / 'bt-pcm-owner').exists())
+        self.assertIn('holder identity failed', (self.run / 'bt-pcm.log').read_text())
+
+    def enable_write_faults(self, kind=None):
+        fault = self.root / 'sink-fault'
+        self.env.update({'LD_PRELOAD': str(self.write_faults),
+                         'HK_TEST_SINK_FAULT': str(fault),
+                         'HK_TEST_SINK_SEEN': str(self.root / 'sink-seen'),
+                         'HK_TEST_RECOVER_LOG': str(self.root / 'recover.log')})
+        if kind: fault.write_text(kind)
+        return fault
+
+    def test_partial_backend_commits_preserve_samples_through_rate_adapter(self):
+        self.use_shipped_adapter()
+        config = self.config.read_text()
+        self.enable_write_faults()
+        # Compare against direct ALSA rate->file, including a nonconstant
+        # stereo pattern. A successful outer write can hide lost rate output.
+        for rate in (48000, 44100):
+            with self.subTest(rate=rate):
+                direct = config.replace('slave.pcm "hk_bt_parking"', 'slave.pcm "capture"')
+                self.config.write_text(direct)
+                subprocess.run([str(self.packets), str(rate)], env=self.env,
+                               check=True, capture_output=True, timeout=5)
+                reference = self.capture.read_bytes()
+                self.assertGreaterEqual(len(reference), 180000 * 4)
+                self.config.write_text(config)
+                for kind in ('partial', 'again'):
+                    (self.root / 'sink-fault').write_text(kind)
+                    subprocess.run([str(self.packets), str(rate)], env=self.env,
+                                   check=True, capture_output=True, timeout=5)
+                    self.assertEqual(self.capture.read_bytes(), reference, kind)
+                    self.assertFalse((self.run / 'bt-wait-pcm').exists())
+                (self.root / 'sink-fault').unlink()
+
+    def test_active_xrun_requests_muted_resync_without_resetting_clock(self):
+        fault = self.enable_write_faults()
+        proc = self.launch(); self.write(proc)
+        lease = self.run / 'safe/lease'
+        owner = self.run / 'bt-owner.pid'
+        lease.write_text('bluetooth 42 1 token 0 active\n')
+        owner.write_text('42\n')
+        fault.write_text('xrun')
+        self.write(proc, 2222)
+        self.assertEqual((self.run / 'bt-wait-pcm').read_text(), 'backend-clock-stopped\n')
+        self.assertFalse((self.root / 'recover.log').exists(), 'live output must mute before recovery')
+        self.assertTrue(self.holds_capture(proc), 'active slave cannot close before output is muted')
+        lease.unlink(); owner.unlink()
+        (self.run / 'ap2-claim').touch()
+        self.assertEqual(self.park(), b'parked\n')
+
+    def test_slave_backpressure_is_bounded_and_requests_muted_resync(self):
+        self.enable_write_faults('stall')
+        proc = self.launch()
+        before = time.monotonic()
+        self.write(proc)
+        self.assertLess(time.monotonic() - before, 1.5)
+        self.assertEqual((self.run / 'bt-wait-pcm').read_text(), 'backend-write-stalled\n')
+
+    def test_new_source_cancels_pending_packet_and_allows_prompt_park(self):
+        self.enable_write_faults('stall')
+        proc = self.launch()
+        proc.stdin.write('1111\n'); proc.stdin.flush()
+        deadline = time.monotonic() + 2
+        while not (self.root / 'sink-seen').exists() and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertTrue((self.root / 'sink-seen').exists())
+        before = time.monotonic()
+        (self.run / 'ap2-claim').touch()
+        self.assertEqual(self.line(proc), 'wrote 256')
+        self.assertEqual(self.park(), b'parked\n')
+        self.assertLess(time.monotonic() - before, .5)
+        self.assertFalse(self.holds_capture(proc))
+
+    def test_failed_clock_read_requests_muted_resync(self):
+        self.enable_write_faults('clock')
+        proc = self.launch(); self.write(proc)
+        self.assertEqual((self.run / 'bt-wait-pcm').read_text(), 'backend-clock-read-failed\n')
+
+    def test_opt_in_backend_levels_preserve_samples_and_do_not_store_audio(self):
+        (self.run / 'bt-pcm-diagnostics').touch()
+        proc = self.launch(); self.write(proc, 1111)
+        proc.stdin.write('q\n'); proc.stdin.flush(); proc.wait(timeout=2)
+        self.assertEqual(self.capture.read_bytes(), (1111).to_bytes(2, 'little', signed=True) * 512)
+        log = (self.run / 'bt-pcm.log').read_text()
+        self.assertIn('signal stage=post-master frames=256 nonzero=512 peak=1111,1111\n', log)
+
+    def test_output_levels_require_opt_in_and_read_only_the_mapped_audio_buffer(self):
+        proc = self.launch(); self.write(proc)
+        def levels():
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(2)
+                client.connect(str(self.control))
+                client.sendall(b'levels\0')
+                return client.recv(192).decode()
+        self.assertEqual(levels(), 'refused\n')
+        (self.run / 'bt-pcm-diagnostics').touch()
+        self.assertEqual(levels(), 'refused\n', 'a descriptor without a PCM data mapping is insufficient')
+        proc.stdin.write('m\n'); proc.stdin.flush()
+        mapped = int(self.line(proc).split()[1])
+        before = self.capture.read_bytes()
+        self.assertEqual(levels(), f'signal stage=pcm-output frames={mapped} nonzero={mapped},{mapped} peak=1111,2222\n')
+        self.assertEqual(self.capture.read_bytes(), before, 'output observation must not modify samples')
 
 
 if __name__ == '__main__':

@@ -36,13 +36,15 @@ SPS56_SHA1=ca936a0d88197258aa251f698811e49adf7e6313
 NQPTP56_SHA1=ea5785e47f215cc9d89192a653aa616e3fb0e4f1
 CONF56_SHA1=c6922924190f4a8cb7f0d37c888da6c53c0519f2
 DEVICE_PINS=${HK_AP2_DEVICE_PINS:-$BASE/ap2-device.env}
-AUDIO_HOOK_OVERRIDE_SHA1=93b6cbc36ed2d432953de46bd0519cf783e0bebb
+AUDIO_HOOK_OVERRIDE_SHA1=1ad3bdadd785bd97f744197635693026c814eb90
 SAFE_TEST_OVERRIDE="$BASE/hk-ap2-safe-test.bt"
 SAFE_TEST_OVERRIDE_SHA1=64917b26427d4ec86c1e2a309c39da3e2868fcaa
 BT_BRIDGE="$BASE/hk-bt-bridge.sh"
-BT_BRIDGE_SHA1=38aa6de7dc6e03104770f984a0c9147e3d01edd4
+BT_BRIDGE_SHA1=9b8e7286688b78a82bffa36ac51db1f73d7a36ef
 BT_PARK="$BASE/libasound_module_pcm_hkbtpark.so"
-BT_PARK_SHA1=3299c74f572aa129b4a4f2468a39a380f2e243ec
+BT_PARK_SHA1=f52a4db8b4ef088b370d278283ec04f79a050e22
+STOCK_AUDIO_STATE="$BASE/hk-stock-audio-state"
+STOCK_AUDIO_STATE_SHA1=764a35a14a312d63080ff368e12ec50086c475de
 DSP_ALSA_CONF="$BASE/hk-dsp-alsa.conf"
 DSP_ALSA_CONF_SHA1=47af209cbaf6432a1d81e14c8bc1e204bd618890
 DSP_BRIDGE="$BASE/hk-ap2-dsp-bridge"
@@ -55,9 +57,9 @@ GUARD_OVERRIDE="$BASE/hk-ap2-guard.sh"
 GUARD_OVERRIDE_SHA1=3495b059131cb236ae9b822c315abee3e5dacaa5
 VOLUME_OVERRIDE="$BASE/hk-ap2-volume-log"
 VOLUME_OVERRIDE_SHA1=101d967969d614059b426bdd93512e739c1b7b84
-COMMON_SHA1=542e57fcb4774d8ef4dbd7d7d9bd238cb1e6dcd8
+COMMON_SHA1=6a7a2613ec9f8a61d283dfba35a337417f35ce3b
 VOICE_SCRIPT="$BASE/../hk-voice/hk-voice.sh"
-VOICE_SCRIPT_SHA1=1adda56b7ae83d62196486c14fd0d3184cc5a469
+VOICE_SCRIPT_SHA1=65f3b4d248dc0339a489087c66b28495c2ed41ae
 VOICE_RUN=/tmp/hk-voice
 MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-8192}
 MIN_START_AVAILABLE_KIB=${HK_AP2_MIN_START_AVAILABLE_KIB:-49152}
@@ -318,6 +320,10 @@ ensure_runtime_override() {
     }
     [ -r "$BT_PARK" ] && [ "$(sha1sum "$BT_PARK" | awk '{print $1}')" = "$BT_PARK_SHA1" ] || {
         log "Bluetooth PCM backend missing or checksum mismatch"
+        return 1
+    }
+    [ -x "$STOCK_AUDIO_STATE" ] && [ "$(sha1sum "$STOCK_AUDIO_STATE" | awk '{print $1}')" = "$STOCK_AUDIO_STATE_SHA1" ] || {
+        log "stock audio state reader missing or checksum mismatch"
         return 1
     }
     use_ap256 || return 0
@@ -790,6 +796,7 @@ verify_active() {
     [ "$(cat "$RUN/mode" 2>/dev/null)" = real ] || return 1
     [ -f "$SAFE/armed" ] || return 1
     [ "$(sha1sum "$BT_PARK" 2>/dev/null | awk '{print $1}')" = "$BT_PARK_SHA1" ] || return 1
+    [ -x "$STOCK_AUDIO_STATE" ] && [ "$(sha1sum "$STOCK_AUDIO_STATE" | awk '{print $1}')" = "$STOCK_AUDIO_STATE_SHA1" ] || return 1
     [ "$(sha1sum "$COMMON" 2>/dev/null | awk '{print $1}')" = "$COMMON_SHA1" ] || return 1
     for entry in \
         "$OPT/bin/shairport-sync:$SPS56_SHA1" \

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Shared lightweight primitives. Sourcing this file never changes audio.
-AUDIO_PROC=${HK_AP2_PROC_ROOT:-/proc}
+AUDIO_PROC=${HK_AP2_PROC_ROOT:-${HK_BT_PROC_ROOT:-/proc}}
 AUDIO_UPTIME=${HK_AUDIO_UPTIME_FILE:-/proc/uptime}
 AUDIO_ID_PROC=${HK_AUDIO_ID_PROC_ROOT:-/proc}
 audio_now() {
@@ -168,13 +168,35 @@ audio_bt_bridge_live() {
     case "$_ab_beat:$_ab_now" in *[!0-9:]*|:*|*:) return 1;; esac
     [ "$_ab_beat" -le "$_ab_now" ] && [ $((_ab_now - _ab_beat)) -le 4 ]
 }
+audio_bt_pcm_owned() {
+    case "${1:-}" in ''|*[!0-9]*) return 1;; esac
+    _abo_run=${HK_AP2_RUN:-${SAFE%/safe}}
+    _abo_file=${HK_BT_PCM_OWNER:-${_abo_run%/run}/bt-pcm-owner}
+    if [ -e "$_abo_file" ] || [ -L "$_abo_file" ]; then
+        [ -f "$_abo_file" ] && [ ! -L "$_abo_file" ] || return 1
+        read -r _abo_pid _abo_start _abo_fd _abo_generation _abo_extra <"$_abo_file" || return 1
+        [ -z "$_abo_extra" ] || return 1
+        case "$_abo_pid:$_abo_start:$_abo_fd:$_abo_generation" in
+            *[!0-9:]*|:*|*:|*::* ) return 1;;
+        esac
+        audio_pid_live "$_abo_pid" "$_abo_start" || return 1
+        [ "$(cat "$AUDIO_PROC/$_abo_pid/comm" 2>/dev/null)" = a01controller ] || return 1
+        [ "$(readlink "$AUDIO_PROC/$_abo_pid/fd/$_abo_fd" 2>/dev/null)" = "${HK_BT_PCM_DEVICE:-/dev/snd/pcmC0D0p}" ] || return 1
+        [ "$(cat "$_abo_file" 2>/dev/null)" = "$_abo_pid $_abo_start $_abo_fd $_abo_generation" ] &&
+            audio_pid_live "$_abo_pid" "$_abo_start"
+        return $?
+    fi
+    # Compatibility with the previous backend or stock route. A dead
+    # opener alone is never accepted without the descriptor proof above.
+    [ "$(cat "$AUDIO_PROC/$1/comm" 2>/dev/null)" = a01controller ]
+}
 audio_bt_valid() {
     audio_bt_bridge_live || return 1
     _ab_pcm=${HK_AP2_PCM_STATUS:-${HK_BT_PCM_STATUS:-/proc/asound/card0/pcm0p/sub0/status}}
     grep -q '^state: RUNNING' "$_ab_pcm" 2>/dev/null || return 1
     _ab_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_ab_pcm")
     case "$_ab_owner" in ''|*[!0-9]*) return 1;; esac
-    [ "$(cat "$AUDIO_PROC/$_ab_owner/comm" 2>/dev/null)" = a01controller ]
+    audio_bt_pcm_owned "$_ab_owner"
 }
 
 # A stock Bluetooth pause can retain its PCM in XRUN instead of closing it.
@@ -190,5 +212,5 @@ audio_bt_clock_stopped() {
     esac
     _abc_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_abc_pcm" 2>/dev/null)
     case "$_abc_owner" in ''|*[!0-9]*) return 1;; esac
-    [ "$(cat "$AUDIO_PROC/$_abc_owner/comm" 2>/dev/null)" = a01controller ]
+    audio_bt_pcm_owned "$_abc_owner"
 }

@@ -41,6 +41,7 @@ struct bt_pcm {
     ino_t socket_ino;
     uint64_t written, reported;
     uint64_t retry_after_ns;
+    uint64_t activity_instance, activity_frames, activity_last_second;
 };
 
 static int path_for(struct bt_pcm *p, const char *leaf, char path[256])
@@ -366,6 +367,20 @@ static snd_pcm_sframes_t transfer(snd_pcm_ioplug_t *io,
         return -EINVAL;
     const char *data = (const char *)areas[0].addr + offset * areas[0].step / 8;
     pthread_mutex_lock(&p->mutex);
+    /* Count input even when AirPlay owns the hardware and these frames are
+     * discarded. No PCM samples or levels are retained. This lets source
+     * arbitration distinguish fresh phone audio from stale play metadata. */
+    if (frames) {
+        if (UINT64_MAX - p->activity_frames < frames)
+            p->activity_frames = UINT64_MAX;
+        else
+            p->activity_frames += frames;
+        struct timespec stamp;
+        if (clock_gettime(CLOCK_BOOTTIME, &stamp) == 0 && stamp.tv_sec >= 0)
+            p->activity_last_second = (uint64_t)stamp.tv_sec;
+        else
+            p->activity_last_second = 0; /* Do not reuse a stale timestamp. */
+    }
     if (exists(p, "bt-pcm-diagnostics")) {
         const int16_t *samples = (const int16_t *)data;
         for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
@@ -537,6 +552,16 @@ done:
     return ok;
 }
 
+static void activity(struct bt_pcm *p, char reply[192])
+{
+    pthread_mutex_lock(&p->mutex);
+    snprintf(reply, 192, "activity %ld %llu %llu %llu\n", (long)getpid(),
+             (unsigned long long)p->activity_instance,
+             (unsigned long long)p->activity_frames,
+             (unsigned long long)p->activity_last_second);
+    pthread_mutex_unlock(&p->mutex);
+}
+
 static void *control_loop(void *arg)
 {
     struct bt_pcm *p = arg;
@@ -555,6 +580,7 @@ static void *control_loop(void *arg)
             request[n] = 0;
             if (!strncmp(request, "park:", 5) && park(p, request + 5)) reply = "parked\n";
             else if (!strcmp(request, "levels") && output_levels(p, levels)) reply = levels;
+            else if (!strcmp(request, "activity")) { activity(p, levels); reply = levels; }
         }
         (void)send(client, reply, strlen(reply), MSG_NOSIGNAL | MSG_DONTWAIT);
         close(client);
@@ -662,6 +688,13 @@ SND_PCM_PLUGIN_DEFINE_FUNC(hkbtpark)
     if (!slave) return -EINVAL;
     struct bt_pcm *p = calloc(1, sizeof(*p));
     if (!p) return -ENOMEM;
+    struct timespec instance;
+    if (clock_gettime(CLOCK_BOOTTIME, &instance) < 0 || instance.tv_sec < 0 ||
+        (uint64_t)instance.tv_sec > UINT64_MAX / 1000000000ULL) {
+        free(p);
+        return -EIO;
+    }
+    p->activity_instance = (uint64_t)instance.tv_sec * 1000000000ULL + (uint64_t)instance.tv_nsec;
     p->server = -1;
     p->timer = -1;
     p->slave_name = strdup(slave);

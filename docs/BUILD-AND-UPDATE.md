@@ -162,3 +162,7 @@ The current Bluetooth opening path does not launch temporary `apple_remote` ampl
 首次蓝牙开声的临时全局静音标记保存在 `/tmp/hk-ap2/bt-cold-global-mute`；重建 run 目录不会清除恢复依据。维护清理前需先确认临时全局静音已解除，不能只删标记。正常失败/取消先物理静音再清理；SIGKILL 等遗留状态由下一来源在静音时钟、租约和 watchdog 都有效时恢复后才开输出。
 
 The Bluetooth cold-clock mute recovery marker is outside the disposable run directory. Maintenance must verify the temporary global override has cleared before removing it. Normal failure/cancellation closes output before cleanup; a marker left by SIGKILL is recovered by the next source under a guarded silent clock before enabling output.
+
+反向来源交接的本地候选为蓝牙 PCM 控制 socket 增加只读 `activity`。桥接器只信任经过存活身份检查的原厂播放器和同一 PCM 代次，在暂停/断开形成稳定基线后，还要求新帧和新的播放状态；控制接口只返回计数与时间，不保存音频。更新该候选必须把 PCM 模块、包装器和启动器 pin、hook、桥接器、控制器与经验证的依赖重载脚本作为同一事务，并在维护静音下重载原厂播放器。MQTT 发布成功只是本地代理接受，不能代替实际发送端的暂停验收。该候选尚未安装，按用户要求等方便时再测试。
+
+The local reverse-handoff candidate adds a read-only `activity` query to the Bluetooth PCM control socket. The bridge verifies the stock player identity and PCM generation, establishes a quiet paused/disconnected baseline, then requires fresh frames and phone-play status. The query exposes only counters and time, not audio. Deploy the PCM module, wrapper/boot pins, hook, bridge, controller and verified dependent-reload helper in one maintenance-muted transaction; the stock player must reload. MQTT broker acceptance is not proof the sender paused. This candidate is not installed and testing is postponed at the user's request.

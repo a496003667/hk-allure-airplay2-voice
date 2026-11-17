@@ -51,6 +51,10 @@ int main(void) {
     int mapping_fd = -1;
     while (fgets(line, sizeof(line), stdin)) {
         if (line[0] == 'q') break;
+        if (line[0] == 'r') {
+            printf("prepared %d\n", snd_pcm_prepare(pcm)); fflush(stdout);
+            continue;
+        }
         if (line[0] == 'm') {
             snd_pcm_uframes_t buffer = 0, period = 0;
             if (snd_pcm_get_params(pcm, &buffer, &period) < 0 || mapping != MAP_FAILED) return 7;
@@ -143,6 +147,10 @@ static unsigned calls;
 static __thread int fail_clock;
 int clock_gettime(clockid_t id, struct timespec *stamp) {
     int (*next)(clockid_t, struct timespec *) = dlsym(RTLD_NEXT, "clock_gettime");
+    const char *activity_gate = getenv("HK_TEST_ACTIVITY_CLOCK_FAIL");
+    if (id == CLOCK_BOOTTIME && activity_gate && access(activity_gate, F_OK) == 0) {
+        errno = EIO; return -1;
+    }
     if (fail_clock && id == CLOCK_MONOTONIC) {
         fail_clock = 0; errno = EIO; return -1;
     }
@@ -289,6 +297,75 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
             client.sendall(('park:' + token).encode() + b'\0')
             client.shutdown(socket.SHUT_WR)
             return client.recv(100)
+
+    def activity(self):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect(str(self.control))
+            client.sendall(b'activity\0')
+            client.shutdown(socket.SHUT_WR)
+            return client.recv(192).decode().strip().split()
+
+    def test_activity_counts_discarded_phone_frames_without_recording_audio(self):
+        proc = self.launch()
+        initial = self.activity()
+        self.assertEqual(len(initial), 5)
+        self.assertEqual(initial[0], 'activity')
+        self.assertEqual(int(initial[1]), proc.pid)
+        self.assertGreater(int(initial[2]), 0)
+        self.assertEqual(int(initial[3]), 0)
+        self.write(proc, 1111)
+        opened = self.activity()
+        self.assertEqual(int(opened[3]), 256)
+        self.assertGreater(int(opened[4]), 0)
+        (self.run / 'ap2-claim').write_text('1\n')
+        self.assertEqual(self.park(), b'parked\n')
+        self.write(proc, 2222)
+        discarded = self.activity()
+        self.assertEqual(discarded[1:3], opened[1:3])
+        self.assertEqual(int(discarded[3]), 512)
+        self.assertFalse(self.holds_capture(proc))
+        self.assertEqual(len(discarded), 5)
+        self.assertTrue(all(part.isdecimal() for part in discarded[1:]))
+
+    def test_activity_survives_prepare_and_distinguishes_a_new_pcm_instance(self):
+        proc = self.launch(); self.write(proc)
+        before = self.activity()
+        proc.stdin.write('r\n'); proc.stdin.flush()
+        self.assertEqual(self.line(proc), 'prepared 0')
+        self.assertEqual(self.activity()[3], before[3])
+        self.write(proc)
+        self.assertEqual(int(self.activity()[3]), 512)
+        proc.stdin.write('q\n'); proc.stdin.flush(); proc.wait(timeout=2)
+        new = self.launch()
+        after = self.activity()
+        self.assertNotEqual(before[2], after[2])
+        self.assertEqual(int(after[1]), new.pid)
+        self.assertEqual(after[3], '0')
+
+    def test_activity_survives_disposable_runtime_directory_rebuild(self):
+        proc = self.launch(); self.write(proc)
+        before = self.activity()
+        shutil.rmtree(self.run)
+        (self.run / 'safe').mkdir(parents=True)
+        (self.run / 'safe/armed').touch()
+        after = self.activity()
+        self.assertEqual(after, before)
+        self.write(proc)
+        self.assertEqual(int(self.activity()[3]), 512)
+
+    def test_activity_clock_failure_does_not_reuse_an_old_timestamp(self):
+        self.enable_write_faults()
+        gate = self.root / 'activity-clock-fail'
+        self.env['HK_TEST_ACTIVITY_CLOCK_FAIL'] = str(gate)
+        proc = self.launch(); self.write(proc)
+        before = self.activity()
+        self.assertGreater(int(before[4]), 0)
+        gate.touch()
+        self.write(proc, 2222)
+        after = self.activity()
+        self.assertEqual(int(after[3]), 512)
+        self.assertEqual(after[4], '0')
 
     def test_retained_handle_parks_and_reopens_only_on_new_allowed_samples(self):
         proc = self.launch()

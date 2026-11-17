@@ -346,7 +346,7 @@ else:
         self.assertTrue((self.root / 'bt-cold-global-mute').exists())
         self.assertEqual(state['1'], '0,0')
 
-    def run_airplay_takeover(self, refuse_pause=False, orphaned_global=False):
+    def run_airplay_takeover(self, refuse_pause=False, orphaned_global=False, no_bt_hardware=False):
         env, pcm, events, acknowledge = self.bluetooth_start_fixture()
         env.pop('HK_AP2_BT')
         env.update({'MOCK_OWNER_PROOF': str(self.root / 'bt-pcm-owner'),
@@ -361,9 +361,16 @@ else:
         if orphaned_global: (self.root / 'bt-cold-global-mute').write_text('old-generation')
         control = socket.socket(socket.AF_UNIX)
         control.bind(str(self.root / 'bt-pcm-control'))
+        player = socket.socket(socket.AF_UNIX)
+        player.bind(str(self.root / 'player-control'))
+        env['HK_BT_PLAYER_SOCKET'] = str(self.root / 'player-control')
+        if no_bt_hardware:
+            pcm.write_text('closed\n')
+            (self.root / 'bt-pcm-owner').unlink()
+            (self.run / 'bt-owner.pid').unlink()
         def transfer():
             deadline = time.monotonic() + 8
-            while time.monotonic() < deadline:
+            while not no_bt_hardware and time.monotonic() < deadline:
                 if (self.run / 'bt-release').exists():
                     (self.run / 'bt-owner.pid').unlink(missing_ok=True)
                     break
@@ -378,7 +385,7 @@ else:
         try:
             result = subprocess.run(['sh', str(HOOK), 'start'], env=env, capture_output=True, text=True, timeout=25)
         finally:
-            thread.join(9); control.close()
+            thread.join(9); control.close(); player.close()
         return result, events.read_text().splitlines()
 
     def test_airplay_takeover_parks_then_pauses_phone_before_opening_output(self):
@@ -399,6 +406,12 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr + (self.run / 'hook.log').read_text())
         self.assertLess(events.index('global unmute with silent clock'), events.index('mixer Ext Spk on'))
         self.assertFalse((self.root / 'bt-cold-global-mute').exists())
+
+    def test_airplay_pauses_connected_phone_even_without_bluetooth_hardware(self):
+        result, events = self.run_airplay_takeover(no_bt_hardware=True)
+        self.assertEqual(result.returncode, 0, result.stderr + (self.run / 'hook.log').read_text())
+        self.assertNotIn('parked Bluetooth hardware', events)
+        self.assertLess(events.index('phone pause'), events.index('mixer Ext Spk on'))
 
     def test_already_unmuted_bluetooth_skips_redundant_notification(self):
         result, events, state = self.run_bluetooth_start_case({'MOCK_ALREADY_UNMUTED': '1'})
@@ -645,6 +658,13 @@ fi
         self.state.write_text('{"mode":"-1","status":"curpos":"0"}')
         self.assertEqual(self.run_pause().returncode, 0)
         self.assertFalse(self.calls.exists())
+
+    def test_missing_or_invalid_mode_does_not_silently_accept_unknown_phone_state(self):
+        for payload in ('{"status":"play"}', '{"mode":"unknown","status":"play"}'):
+            with self.subTest(payload=payload):
+                self.state.write_text(payload)
+                self.assertNotEqual(self.run_pause().returncode, 0)
+                self.assertFalse(self.calls.exists())
 
 
 if __name__ == '__main__':

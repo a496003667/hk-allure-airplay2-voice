@@ -53,6 +53,9 @@ elif [ "$2" = setPlayerCmd:resume ]; then
   echo resume >>"$MOCK_LOG"
   sed 's/"status":"stop"/"status":"play"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
   printf 'state: RUNNING\\nowner_pid   : 42\\n' >"$MOCK_PCM"
+elif [ "$2" = activity ]; then
+  if [ -n "${MOCK_ACTIVITY_QUERY_LOG:-}" ]; then echo activity >>"$MOCK_ACTIVITY_QUERY_LOG"; fi
+  cat "$MOCK_ACTIVITY"
 else
   cat "$MOCK_STATUS"
 fi
@@ -70,6 +73,7 @@ if [ "$1" = start ]; then
   audio_write_lease || exit 1
 else
   rm -f "$HK_AP2_RUN/safe/play.started" "$HK_AP2_RUN/safe/lease"
+  if [ -z "${HK_AP2_BT:-}" ]; then rm -f "$HK_AP2_RUN/ap2-claim"; fi
 fi
 ''')
         self.executable(self.root / 'bin/hk-ap2-safe-test', '''#!/bin/sh
@@ -109,6 +113,7 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
                     proc.kill()
                     proc.wait()
         self.socket.close()
+        if hasattr(self, 'activity_socket'): self.activity_socket.close()
         self.tmp.cleanup()
 
     def executable(self, path, text):
@@ -152,6 +157,233 @@ echo manual >"$HK_AP2_RUN/safe/tripped"
         time.sleep(2)
         self.assertEqual(self.events().count('start'), 2, 'AirPlay claim blocks reacquisition')
         self.assertIsNone(bridge.poll())
+
+    def seed_airplay(self):
+        (self.run / 'shairport.pid').write_text(str(self.dummy_watchdog.pid))
+        shell = '. "$HK_AUDIO_COMMON"; SAFE=$HK_AP2_RUN/safe; RUN=$HK_AP2_RUN; '
+        shell += 'audio_reserve && lease_phase=active && audio_write_lease'
+        subprocess.run(['sh', '-c', shell], env=self.env, check=True, capture_output=True)
+        (self.run / 'ap2-claim').write_text('0\n')
+        self.pcm.write_text('state: RUNNING\nowner_pid : 99\n')
+        publisher = self.base / 'mqtt'
+        self.executable(publisher, '''#!/bin/sh
+echo "airplay $2" >>"$MOCK_LOG"
+[ "${MOCK_MQTT_FAIL:-0}" != 1 ] || exit 1
+printf 'state: RUNNING\\nowner_pid : 42\\n' >"$MOCK_PCM"
+if [ "${MOCK_VOICE_ON_PAUSE:-0}" = 1 ]; then echo 0 >"$HK_AP2_RUN/voice-owns"; fi
+''')
+        self.env['HK_BT_MQTT'] = str(publisher)
+        self.env['HK_AP2_HOLD_MUTE_FILE'] = str(self.base / 'hold-mute')
+        self.activity_socket = socket.socket(socket.AF_UNIX)
+        self.activity_socket.bind(str(self.base / 'pcm-control.sock'))
+        self.env['HK_BT_PCM_CONTROL'] = str(self.base / 'pcm-control.sock')
+        self.env['MOCK_ACTIVITY'] = str(self.base / 'activity')
+        holder = self.proc / str(self.dummy_watchdog.pid)
+        holder.mkdir(exist_ok=True)
+        (holder / 'comm').write_text('a01controller\n')
+        self.set_activity(100, 0)
+
+    def set_activity(self, frames, tick, pid=None, instance=12345):
+        pid = pid or self.dummy_watchdog.pid
+        tmp = self.base / 'activity.tmp'
+        tmp.write_text(f'activity {pid} {instance} {frames} {tick}\n')
+        os.replace(tmp, self.base / 'activity')
+
+    def arm_reverse(self):
+        self.state('stop')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        time.sleep(.7)
+        self.advance_clock(1)
+        time.sleep(.7)
+
+    def arm_disconnected(self):
+        self.status.write_text('{"mode":"-1","status":"curpos":"0"}')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        time.sleep(.7)
+        self.advance_clock(1)
+        time.sleep(.7)
+
+    def resume_phone(self):
+        self.set_activity(356, 2)
+        self.state('play')
+        self.advance_clock(2)
+
+    def advance_clock(self, tick):
+        (self.base / 'clock').write_text(f'{tick}.00 0.00\n')
+        (self.safe / 'watchdog.heartbeat').write_text(str(tick))
+
+    def test_phone_resume_pauses_airplay_before_bluetooth_acquires(self):
+        self.seed_airplay()
+        self.arm_reverse()
+        self.resume_phone()
+        eventually(lambda: 'start' in self.events())
+        events = self.events()
+        self.assertLess(events.index('stop'), events.index('airplay pause'))
+        self.assertLess(events.index('airplay pause'), events.index('start'))
+        self.assertEqual(events.count('airplay pause'), 1)
+        self.assertFalse((self.run / 'release-dac').exists())
+        self.assertTrue((self.run / 'bt-owner.pid').exists())
+
+    def test_stale_play_without_paused_edge_does_not_steal_airplay(self):
+        self.seed_airplay(); self.state('play')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        time.sleep(.5); self.advance_clock(1); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_new_airplay_generation_discards_old_phone_pause_witness(self):
+        self.seed_airplay(); self.arm_reverse()
+        fields = (self.safe / 'lease').read_text().split(); fields[3] = 'new-airplay'
+        (self.safe / 'lease').write_text(' '.join(fields) + '\n')
+        self.resume_phone(); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+
+    def test_failed_remote_pause_keeps_bluetooth_output_closed(self):
+        self.seed_airplay(); self.state('stop')
+        env = self.env | {'MOCK_MQTT_FAIL': '1'}
+        self.launch(['sh', str(BRIDGE), '__run'], env)
+        time.sleep(.7)
+        self.advance_clock(1); time.sleep(.7)
+        self.resume_phone()
+        eventually(lambda: (self.safe / 'tripped').exists())
+        self.assertNotIn('start', self.events())
+        self.assertIn('airplay pause', self.events())
+
+    def test_maintenance_hold_blocks_reverse_takeover(self):
+        self.seed_airplay(); self.arm_reverse()
+        (self.base / 'hold-mute').touch()
+        self.resume_phone(); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_voice_ownership_blocks_reverse_takeover(self):
+        self.seed_airplay(); self.arm_reverse()
+        (self.run / 'voice-owns').write_text('0\n')
+        self.resume_phone(); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_stale_play_after_pause_without_fresh_pcm_does_not_steal_airplay(self):
+        self.seed_airplay(); self.arm_reverse()
+        self.state('play'); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_new_phone_connecting_and_playing_can_take_airplay(self):
+        self.seed_airplay(); self.arm_disconnected()
+        self.resume_phone()
+        eventually(lambda: 'start' in self.events())
+        self.assertLess(self.events().index('airplay pause'), self.events().index('start'))
+
+    def test_new_phone_connecting_paused_does_not_steal_airplay(self):
+        self.seed_airplay(); self.arm_disconnected()
+        self.state('stop'); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_reconnect_with_stale_play_but_no_fresh_pcm_does_not_steal_airplay(self):
+        self.seed_airplay(); self.arm_disconnected()
+        self.state('play'); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_pcm_while_phone_reports_paused_does_not_steal_airplay(self):
+        self.seed_airplay(); self.arm_reverse()
+        self.set_activity(356, 2); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_unreadable_activity_is_not_treated_as_a_quiet_pause(self):
+        self.seed_airplay(); self.state('stop')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        time.sleep(.7)
+        (self.base / 'activity').write_text('refused\n')
+        self.advance_clock(1); time.sleep(.7)
+        self.resume_phone(); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_unknown_activity_timestamp_cannot_trigger_takeover(self):
+        self.seed_airplay(); self.arm_reverse()
+        self.set_activity(356, 0)
+        self.state('play'); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_factory_player_restart_invalidates_old_pause_witness(self):
+        self.seed_airplay(); self.arm_reverse()
+        replacement = self.launch(['sleep', '60'])
+        (self.proc / str(replacement.pid)).mkdir()
+        (self.proc / str(replacement.pid) / 'comm').write_text('a01controller\n')
+        self.set_activity(356, 2, pid=replacement.pid, instance=54321)
+        self.state('play'); self.advance_clock(2); time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_new_pcm_after_stably_paused_phone_can_take_airplay(self):
+        self.seed_airplay()
+        self.activity_socket.close()
+        (self.base / 'pcm-control.sock').unlink()
+        self.arm_reverse()
+        self.activity_socket = socket.socket(socket.AF_UNIX)
+        self.activity_socket.bind(str(self.base / 'pcm-control.sock'))
+        self.set_activity(256, 2, instance=54321)
+        self.state('play'); self.advance_clock(2)
+        eventually(lambda: 'start' in self.events())
+        self.assertLess(self.events().index('airplay pause'), self.events().index('start'))
+
+    def test_phone_pausing_while_waiting_for_speaker_lock_cancels_takeover(self):
+        self.seed_airplay()
+        self.env['MOCK_ACTIVITY_QUERY_LOG'] = str(self.base / 'activity-queries')
+        self.arm_reverse()
+        lock = subprocess.Popen(['sh', '-c', '. "$HK_AUDIO_COMMON"; '
+                                 'audio_lock "$HK_AP2_RUN/speaker.lock" && '
+                                 'echo locked && read answer && audio_unlock "$HK_AP2_RUN/speaker.lock"'],
+                                env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        self.children.append(lock)
+        self.assertEqual(lock.stdout.readline().strip(), 'locked')
+        queries = self.base / 'activity-queries'
+        before = len(queries.read_text().splitlines())
+        self.resume_phone()
+        eventually(lambda: len(queries.read_text().splitlines()) > before)
+        self.state('stop')
+        lock.stdin.write('release\n'); lock.stdin.flush(); lock.wait(timeout=4)
+        lock.stdin.close(); lock.stdout.close()
+        time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_maintenance_hold_while_waiting_for_speaker_lock_cancels_takeover(self):
+        self.seed_airplay()
+        self.env['MOCK_ACTIVITY_QUERY_LOG'] = str(self.base / 'activity-queries')
+        self.arm_reverse()
+        lock = subprocess.Popen(['sh', '-c', '. "$HK_AUDIO_COMMON"; '
+                                 'audio_lock "$HK_AP2_RUN/speaker.lock" && '
+                                 'echo locked && read answer && audio_unlock "$HK_AP2_RUN/speaker.lock"'],
+                                env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        self.children.append(lock)
+        self.assertEqual(lock.stdout.readline().strip(), 'locked')
+        queries = self.base / 'activity-queries'
+        before = len(queries.read_text().splitlines())
+        self.resume_phone()
+        eventually(lambda: len(queries.read_text().splitlines()) > before)
+        (self.base / 'hold-mute').touch()
+        lock.stdin.write('release\n'); lock.stdin.flush(); lock.wait(timeout=4)
+        lock.stdin.close(); lock.stdout.close()
+        time.sleep(1)
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_voice_arriving_during_airplay_pause_retains_its_release_flag(self):
+        self.seed_airplay()
+        self.env['MOCK_VOICE_ON_PAUSE'] = '1'
+        self.arm_reverse(); self.resume_phone()
+        eventually(lambda: 'airplay pause' in self.events())
+        time.sleep(1)
+        self.assertTrue((self.run / 'release-dac').exists())
+        self.assertNotIn('start', self.events())
 
     def test_dead_pcm_opener_uses_verified_holder_for_acquire_and_watchdog(self):
         pid = self.dummy_watchdog.pid

@@ -155,7 +155,12 @@ pause_bluetooth_for_airplay() {
     # phone's timeline. Never send resume when AirPlay later releases it.
     _bp_data=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
     _bp_mode=$(printf '%s' "$_bp_data" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
-    [ "$_bp_mode" = 41 ] || return 0
+    case "$_bp_mode" in
+        41) ;;
+        -1) return 0;;
+        ''|*[!0-9]*) return 1;;
+        *) return 0;;
+    esac
     case "$_bp_data" in *'"status":"stop"'*|*'"status":"pause"'*) return 0;; esac
     printf '%s' "$_bp_data" | grep -q '"status":"play"' || return 1
     printf 'airplay-%s\n' "$(audio_now)" >"$RUN/bt-wait-pcm" || return 1
@@ -490,7 +495,11 @@ case "${1:-}" in
             _park_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM_STATUS" 2>/dev/null)
             if [ -z "${HK_AP2_VOICE:-}" ] && audio_bt_pcm_owned "$_park_owner"; then takeover_bt=1; fi
             park_bluetooth_pcm || start_failed 'Bluetooth hardware PCM release failed'
-            if [ -z "${HK_AP2_VOICE:-}" ] && [ "$takeover_bt" = 1 ] && [ -z "${HK_AP2_REOPEN:-}" ]; then
+            if [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_REOPEN:-}" ] &&
+               { [ "$takeover_bt" = 1 ] || [ -S "$BT_PLAYER_SOCKET" ]; }; then
+                # A parked/closed PCM can still have a connected phone.
+                # Explicitly establish its paused state for this AirPlay
+                # session so a later phone play edge can take it back.
                 pause_bluetooth_for_airplay || start_failed 'Bluetooth phone pause failed'
             fi
         fi
@@ -622,15 +631,28 @@ case "${1:-}" in
         if [ "${1:-}" = stop ] && [ -z "${HK_AP2_VOICE:-}" ] && [ -z "${HK_AP2_BT:-}" ]; then
             if [ "${1:-}" = stop ] && [ -f "$BT_OWNER" ]; then
                 hook_log "AirPlay stop ignored: Bluetooth owns the speaker"
+                [ "${HK_AP2_REVERSE_STOP:-0}" != 1 ] || exit 1
                 exit 0
             fi
             if voice_owns; then
                 hook_log "${1:-stop} ignored: the voice assistant has the speaker"
+                [ "${HK_AP2_REVERSE_STOP:-0}" != 1 ] || exit 1
                 exit 0
             fi
         fi
         speaker_lock || exit 1
         trap 'speaker_unlock' 0
+        if [ "$1" = stop ] && [ "${HK_AP2_REVERSE_STOP:-0}" = 1 ]; then
+            # Unlike an ordinary stop, a reverse-takeover request is valid
+            # only for the exact active AirPlay lease it observed. The lease
+            # can end or change while its caller waits for this lock.
+            if ! { [ -n "${HK_AUDIO_TOKEN:-}" ] && audio_read_lease &&
+                   [ "$lease_source" = airplay ] && [ "$lease_phase" = active ] &&
+                   [ "$lease_token" = "$HK_AUDIO_TOKEN" ]; }; then
+                hook_log 'reverse stop refused: AirPlay lease changed or ended'
+                exit 1
+            fi
+        fi
         if [ "$1" = stop ] && [ -f "$SAFE/lease" ] && ! audio_read_lease; then
             start_failed "invalid lease on stop"
         fi

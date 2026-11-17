@@ -136,6 +136,41 @@ else: print('Front Left: Playback ['+s[k]+']')
         self.assertEqual(self.events.read_text(),'')
         self.assertIn('new-generation',(self.safe/'lease').read_text())
 
+    def test_reverse_stop_without_its_original_lease_does_not_touch_audio(self):
+        result = self.call('stop', env=self.env | {'HK_AUDIO_TOKEN':'old-generation',
+                                                  'HK_AP2_REVERSE_STOP':'1'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events.read_text(), '')
+        self.assertFalse((self.safe/'lease').exists())
+
+    def test_reverse_stop_rejects_new_or_priming_airplay_generation(self):
+        (self.run/'shairport.pid').write_text(str(os.getpid()))
+        shell = '. "$HK_AUDIO_COMMON"; SAFE=$HK_AP2_RUN/safe; RUN=$HK_AP2_RUN; '
+        shell += 'audio_reserve && lease_phase=active && audio_write_lease'
+        subprocess.run(['sh','-c',shell],env=self.env|{'HK_AUDIO_TOKEN':'new-generation'},
+                       check=True,capture_output=True,text=True)
+        for token, phase in [('old-generation','active'),('new-generation','priming')]:
+            with self.subTest(token=token,phase=phase):
+                lease=(self.safe/'lease'); fields=lease.read_text().split(); fields[-1]=phase
+                lease.write_text(' '.join(fields)+'\n')
+                result=self.call('stop',env=self.env|{'HK_AUDIO_TOKEN':token,'HK_AP2_REVERSE_STOP':'1'})
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(self.events.read_text(),'')
+                self.assertTrue(lease.exists())
+
+    def test_reverse_stop_mutes_the_matching_active_airplay_lease(self):
+        (self.run/'shairport.pid').write_text(str(os.getpid()))
+        shell = '. "$HK_AUDIO_COMMON"; SAFE=$HK_AP2_RUN/safe; RUN=$HK_AP2_RUN; '
+        shell += 'audio_reserve && lease_phase=active && audio_write_lease'
+        env=self.env|{'HK_AUDIO_TOKEN':'current-generation','HK_AP2_REVERSE_STOP':'1'}
+        subprocess.run(['sh','-c',shell],env=env,check=True,capture_output=True,text=True)
+        result=self.call('stop',env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        events=self.events.read_text().splitlines()
+        self.assertLess(events.index('1 0,0'),events.index('Ext Spk off'))
+        self.assertLess(events.index('Ext Spk off'),events.index('aml audio i2s mute on'))
+        self.assertFalse((self.safe/'lease').exists())
+
     def test_old_generation_start_cannot_mute_current_owner(self):
         self.env['HK_AUDIO_TOKEN']='new-generation'
         self.start('voice')

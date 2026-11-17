@@ -84,6 +84,11 @@ reverse_instance=
 reverse_pid=
 reverse_start=
 reverse_frames=0
+reverse_pending_identity=
+reverse_pending_since=0
+reverse_pending_last_sample=0
+reverse_pending_frames=0
+reverse_pending_samples=0
 last_reverse_check=-1
 
 read_reverse_activity() {
@@ -110,16 +115,18 @@ observe_airplay_takeover() {
     if ! { [ ! -f "$SAFE/tripped" ] && [ ! -f "${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}" ] &&
            ! audio_voice_pending && watchdog_live && audio_read_lease &&
            [ "$lease_source" = airplay ]; }; then
-        reverse_token=; reverse_paused=0; reverse_armed=0; reverse_instance=
+        reverse_token=; reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
         return 0
     fi
     if [ "$reverse_token" != "$lease_token" ]; then
-        reverse_token=$lease_token; reverse_paused=0; reverse_armed=0; reverse_instance=
+        reverse_token=$lease_token; reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
     fi
     _rt_now=$(now)
     [ "$_rt_now" -gt "$last_reverse_check" ] || return 0
     last_reverse_check=$_rt_now
-    _rt_data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 0
+    _rt_data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || {
+        reverse_pending_identity=; return 0;
+    }
     _rt_idle=0
     if printf '%s' "$_rt_data" | grep -q '"mode":"41"'; then
         case "$_rt_data" in *'"status":"stop"'*|*'"status":"pause"'*) _rt_idle=1;; esac
@@ -129,11 +136,12 @@ observe_airplay_takeover() {
         # same quiet baseline; newly received PCM is still required.
         _rt_idle=1
     else
-        reverse_paused=0; reverse_armed=0; reverse_instance=
+        reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
         return 0
     fi
     if [ "$_rt_idle" = 1 ]; then
             reverse_paused=1
+            reverse_pending_identity=
             if read_reverse_activity; then
                 if [ "$reverse_instance:$reverse_pid:$reverse_start:$reverse_frames" = \
                      "$_ra_instance:$_ra_pid:$_ra_start:$_ra_frames" ]; then
@@ -149,24 +157,52 @@ observe_airplay_takeover() {
                 else reverse_instance=absent; reverse_armed=0; fi
             else
                 # A busy/refused socket is not evidence of a quiet source.
-                reverse_armed=0; reverse_instance=
+                reverse_paused=0; reverse_armed=0; reverse_instance=
             fi
             return 0
     fi
-    [ "$reverse_paused" = 1 ] && [ "$reverse_armed" = 1 ] && [ "$lease_phase" = active ] || return 0
+    [ "$reverse_paused" = 1 ] && [ "$lease_phase" = active ] || {
+        reverse_pending_identity=; return 0;
+    }
     printf '%s' "$_rt_data" | grep -q '"status":"play"' &&
-        printf '%s' "$_rt_data" | grep -q '"mute":"0"' || return 0
-    read_reverse_activity || return 0
+        printf '%s' "$_rt_data" | grep -q '"mute":"0"' || { reverse_pending_identity=; return 0; }
+    read_reverse_activity || { reverse_pending_identity=; return 0; }
     # If an existing process restarted, discard the old pause witness.
     if [ "$reverse_instance" != absent ] &&
        [ "$reverse_pid:$reverse_start" != "$_ra_pid:$_ra_start" ]; then
-        reverse_paused=0; reverse_armed=0; reverse_instance=
+        reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
         return 0
     fi
     [ "$_ra_frames" != 0 ] && [ "$_ra_last" != 0 ] && [ "$_ra_last" -le "$_rt_now" ] &&
-        [ $((_rt_now - _ra_last)) -le 2 ] || return 0
+        [ $((_rt_now - _ra_last)) -le 2 ] || { reverse_pending_identity=; return 0; }
     if [ "$reverse_instance" = "$_ra_instance" ] &&
-       [ "$reverse_frames" = "$_ra_frames" ]; then return 0; fi
+       [ "$reverse_frames" = "$_ra_frames" ]; then reverse_pending_identity=; return 0; fi
+    if [ "$reverse_armed" != 1 ]; then
+        # A quick phone play can arrive before the second idle sample. Do
+        # not lose it, but require continuing fresh frames over two seconds
+        # so a brief tail from the just-paused stream cannot steal AirPlay.
+        _rt_identity="$_ra_pid:$_ra_start:$_ra_instance"
+        if [ "$reverse_pending_identity" != "$_rt_identity" ]; then
+            reverse_pending_identity=$_rt_identity
+            reverse_pending_since=$_rt_now
+            reverse_pending_last_sample=$_rt_now
+            reverse_pending_frames=$_ra_frames
+            reverse_pending_samples=1
+            return 0
+        fi
+        if [ "$reverse_pending_frames" = "$_ra_frames" ] ||
+           [ $((_rt_now - reverse_pending_last_sample)) -gt 2 ]; then
+            # A stalled stream or a missed observation cannot demonstrate
+            # continuing input. Begin a new interval at the next sample.
+            reverse_pending_identity=
+            return 0
+        fi
+        reverse_pending_last_sample=$_rt_now
+        reverse_pending_frames=$_ra_frames
+        reverse_pending_samples=$((reverse_pending_samples + 1))
+        [ "$reverse_pending_samples" -ge 3 ] &&
+            [ $((_rt_now - reverse_pending_since)) -ge 2 ] || return 0
+    fi
     _yb_source_pid=$_ra_pid
     _yb_source_start=$_ra_start
     _yb_source_instance=$_ra_instance

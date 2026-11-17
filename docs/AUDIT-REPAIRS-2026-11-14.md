@@ -1,8 +1,8 @@
 # 审计修复状态 / Audit repair status
 
-基线：`741ce58`。修复分支：`fix/audit-20261114`。截至 2026-11-17，当前分支完整 **218 项回归通过**，已完成多轮实机安装和部分用户试听。AirPlay 早期音量/按键/语音续播测试通过；蓝牙固化版播放及暂停恢复也已确认正常、无爆音或音量突增。启动优化版已部署，用户确认明显更快且声音正常，三次 hook 开声耗时为 3.00、2.53、2.79 秒。双向来源切换、最新版本语音与长测仍待验收。最新范围以[试听记录](LISTENING-VALIDATION-2026-11-15.md)为准；初次部署与回退见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。
+基线：`741ce58`。修复分支：`fix/audit-20261114`。截至 2026-11-17，当前分支完整 **227 项回归通过**，已完成多轮实机安装和部分用户试听。AirPlay 早期音量/按键/语音续播测试通过；蓝牙固化版播放及暂停恢复也已确认正常、无爆音或音量突增。启动优化版已部署，用户确认明显更快且声音正常，三次 hook 开声耗时为 3.00、2.53、2.79 秒。双向来源切换、最新版本语音与长测仍待验收。最新范围以[试听记录](LISTENING-VALIDATION-2026-11-15.md)为准；初次部署与回退见[实机记录](DEVICE-VALIDATION-2026-11-14.md)。
 
-最新重连反馈暴露了首播爆音与 AirPlay 接管未暂停手机进度。191 项回归和最终 38 项复核通过的两脚本修正已静音部署，具体边界见最新试听记录；用户已确认本版重连首次出声正常、无爆音，并确认 AirPlay 接管时手机自动暂停。随后发现手机重新播放未暂停 AirPlay，反向交接修正目前仅在本地，设备实测延后。
+最新重连反馈暴露了首播爆音与 AirPlay 接管未暂停手机进度。191 项回归和最终 38 项复核通过的两脚本修正已静音部署，具体边界见最新试听记录；用户已确认本版重连首次出声正常、无爆音，并确认 AirPlay 接管时手机自动暂停。随后发现手机重新播放未暂停 AirPlay，反向交接修正已安装并通过文件及服务核验，设备试听仍待验证。
 
 原审计 12 项（5 P1、7 P2）的代码与回归对应：
 
@@ -41,7 +41,7 @@
 
 ## English summary
 
-As of 2026-11-17, all 218 regressions on the current branch pass. Earlier AirPlay volume, controls and voice resume passed user-present tests. Persistent Bluetooth playback and pause/resume now also pass without reported pops or a volume jump after fixing residual stock global mute. A subsequent reconnect exposed a first-play pop and missing phone pause on AirPlay takeover; a guarded two-script repair is deployed; the user confirmed normal first play after reconnect without a pop and automatic phone pause on AirPlay takeover. The reverse direction remains a local candidate pending deployment and listening. The earlier deployed startup optimization passed user listening: starts and resumes were noticeably faster with normal sound. Three opening-hook intervals were 3.00, 2.53 and 2.79 seconds. Bidirectional source handoff, voice on the latest stack and sustained acceptance remain pending; the listening record is authoritative for current scope.
+As of 2026-11-17, all 227 regressions on the current branch pass. Earlier AirPlay volume, controls and voice resume passed user-present tests. Persistent Bluetooth playback and pause/resume now also pass without reported pops or a volume jump after fixing residual stock global mute. A subsequent reconnect exposed a first-play pop and missing phone pause on AirPlay takeover; a guarded two-script repair is deployed; the user confirmed normal first play after reconnect without a pop and automatic phone pause on AirPlay takeover. The reverse-handoff update is installed and verified; user-present listening remains pending. The earlier deployed startup optimization passed user listening: starts and resumes were noticeably faster with normal sound. Three opening-hook intervals were 3.00, 2.53 and 2.79 seconds. Bidirectional source handoff, voice on the latest stack and sustained acceptance remain pending; the listening record is authoritative for current scope.
 
 All twelve findings have corresponding repairs and regression evidence above. The initial offline suite passed 99 Linux/BusyBox tests plus six ARM IPC cases; 12 ARM artifacts passed compatibility checks, a 30-file generic package was verified, and runtime repacking was reproducible. Device preparation extended that stage to 111 tests. The initial 31-file private package passed muted deployment checks, including exact 5.6 bindings and dependent reloads. Two startup refusals were reported as failures and rolled back; their first recovery exposed and resolved a missing-runtime-directory issue.
 

@@ -43,6 +43,7 @@ class BluetoothBridgeTest(unittest.TestCase):
         (self.safe / 'armed').touch()
         self.executable(self.root / 'bin/hk-unix-request-raw', '''#!/bin/sh
 if [ -n "${MOCK_QUERY_LOG:-}" ] && [ "$2" = getPlayerStatus ]; then echo query >>"$MOCK_QUERY_LOG"; fi
+if [ "$2" = getPlayerStatus ] && [ -n "${MOCK_STATUS_FAIL:-}" ] && [ -f "$MOCK_STATUS_FAIL" ]; then exit 1; fi
 if [ "$2" = setPlayerCmd:vol:30 ]; then
   echo clamp >>"$MOCK_LOG"
   sed 's/"vol":"52"/"vol":"30"/' "$MOCK_STATUS" >"$MOCK_STATUS.tmp" && mv "$MOCK_STATUS.tmp" "$MOCK_STATUS"
@@ -211,6 +212,124 @@ if [ "${MOCK_VOICE_ON_PAUSE:-0}" = 1 ]; then echo 0 >"$HK_AP2_RUN/voice-owns"; f
     def advance_clock(self, tick):
         (self.base / 'clock').write_text(f'{tick}.00 0.00\n')
         (self.safe / 'watchdog.heartbeat').write_text(str(tick))
+
+    def fast_reverse_start(self):
+        """Observe one quiet sample, then simulate a quick phone play."""
+        self.seed_airplay()
+        self.env['MOCK_ACTIVITY_QUERY_LOG'] = str(self.base / 'activity-queries')
+        self.env['MOCK_QUERY_LOG'] = str(self.base / 'player-queries')
+        self.state('stop')
+        self.launch(['sh', str(BRIDGE), '__run'])
+        queries = self.base / 'activity-queries'
+        eventually(lambda: queries.exists() and len(queries.read_text().splitlines()) >= 1)
+        time.sleep(.2)  # Allow the real bridge to finish recording this observation.
+        self.state('play')
+        self.fast_reverse_sample(1, 356)
+
+    def fast_reverse_sample(self, tick, frames):
+        queries = self.base / 'player-queries'
+        before = len(queries.read_text().splitlines())
+        self.set_activity(frames, tick)
+        self.advance_clock(tick)
+        eventually(lambda: len(queries.read_text().splitlines()) > before)
+        time.sleep(.2)
+
+    def assert_no_reverse_takeover(self):
+        self.assertNotIn('airplay pause', self.events())
+        self.assertNotIn('stop', self.events())
+
+    def test_quick_phone_play_takes_airplay_after_continuous_fresh_frames(self):
+        self.fast_reverse_start()
+        self.fast_reverse_sample(2, 612)
+        self.assert_no_reverse_takeover()
+        self.fast_reverse_sample(3, 868)
+        eventually(lambda: 'start' in self.events())
+        self.assertLess(self.events().index('stop'), self.events().index('airplay pause'))
+        self.assertLess(self.events().index('airplay pause'), self.events().index('start'))
+
+    def test_quick_phone_play_single_tail_cannot_take_airplay(self):
+        self.fast_reverse_start()
+        for tick in (2, 3, 4):
+            self.fast_reverse_sample(tick, 356)
+        self.assert_no_reverse_takeover()
+
+    def test_quick_phone_play_missed_samples_restart_confirmation(self):
+        self.fast_reverse_start()
+        for tick, frames in ((4, 612), (5, 868), (6, 1124)):
+            self.fast_reverse_sample(tick, frames)
+            self.assert_no_reverse_takeover()
+        self.fast_reverse_sample(7, 1380)
+        eventually(lambda: 'start' in self.events())
+
+    def test_quick_phone_play_pause_restarts_confirmation(self):
+        self.fast_reverse_start()
+        self.state('stop')
+        self.fast_reverse_sample(2, 356)
+        self.state('play')
+        for tick, frames in ((3, 612), (4, 868)):
+            self.fast_reverse_sample(tick, frames)
+            self.assert_no_reverse_takeover()
+        self.fast_reverse_sample(5, 1124)
+        eventually(lambda: 'start' in self.events())
+
+    def test_quick_phone_play_failed_status_query_restarts_confirmation(self):
+        self.env['MOCK_STATUS_FAIL'] = str(self.base / 'status-fail')
+        self.fast_reverse_start()
+        (self.base / 'status-fail').touch()
+        self.fast_reverse_sample(2, 612)
+        (self.base / 'status-fail').unlink()
+        for tick, frames in ((3, 868), (4, 1124)):
+            self.fast_reverse_sample(tick, frames)
+            self.assert_no_reverse_takeover()
+        self.fast_reverse_sample(5, 1380)
+        eventually(lambda: 'start' in self.events())
+
+    def test_quick_phone_play_inactive_airplay_lease_restarts_confirmation(self):
+        self.fast_reverse_start()
+        fields = (self.safe / 'lease').read_text().split()
+        fields[-1] = 'draining'
+        (self.safe / 'lease').write_text(' '.join(fields) + '\n')
+        self.fast_reverse_sample(2, 612)
+        fields[-1] = 'active'
+        (self.safe / 'lease').write_text(' '.join(fields) + '\n')
+        for tick, frames in ((3, 868), (4, 1124)):
+            self.fast_reverse_sample(tick, frames)
+            self.assert_no_reverse_takeover()
+        self.fast_reverse_sample(5, 1380)
+        eventually(lambda: 'start' in self.events())
+
+    def assert_quick_reverse_witness_cancelled(self, interruption):
+        self.fast_reverse_start()
+        if interruption == 'hold':
+            marker = self.base / 'hold-mute'
+            marker.touch()
+        elif interruption == 'voice':
+            marker = self.run / 'voice-owns'
+            marker.write_text('2\n')
+        elif interruption == 'lease':
+            fields = (self.safe / 'lease').read_text().split()
+            fields[3] = 'new-airplay'
+            (self.safe / 'lease').write_text(' '.join(fields) + '\n')
+            marker = None
+        else:
+            raise AssertionError(interruption)
+        self.advance_clock(2)
+        time.sleep(1.5)  # The guard is checked before the activity query;
+                          # hosts without usleep poll at one-second intervals.
+        if marker:
+            marker.unlink()
+        for tick, frames in ((3, 612), (4, 868), (5, 1124), (6, 1380)):
+            self.fast_reverse_sample(tick, frames)
+            self.assert_no_reverse_takeover()
+
+    def test_quick_phone_play_maintenance_hold_cancels_witness(self):
+        self.assert_quick_reverse_witness_cancelled('hold')
+
+    def test_quick_phone_play_voice_cancels_witness(self):
+        self.assert_quick_reverse_witness_cancelled('voice')
+
+    def test_quick_phone_play_new_airplay_lease_cancels_witness(self):
+        self.assert_quick_reverse_witness_cancelled('lease')
 
     def test_phone_resume_pauses_airplay_before_bluetooth_acquires(self):
         self.seed_airplay()

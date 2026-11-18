@@ -82,7 +82,7 @@ python3 tools/make-runtime.py \
 
 这台小内存设备需要释放上传/解包副本的 tmpfs 占用。暂存并核对全部 `.new` 后，把已校验的候选更新器和 manifest 复制到独立临时路径，再清理上传压缩包及解包目录；电脑上保留完整私有包。可用 `HK_AP2_UPDATE_RELEASE_STAGING=1 sh <已校验更新器> --manifest <manifest>`，在整批安装文件通过哈希/权限校验后、启动前释放 `.new` 副本。回退使用独立事务备份；重试须从原包重新暂存。不要清理未完成事务或唯一回滚副本。
 
-正常 AP2 启动仍要求至少 8192 KiB 原始空闲和 49152 KiB 估算可用内存。Linux 3.10 的估算只计入扣除 Shmem、Dirty、Writeback 后的文件缓存，加 Buffers 和一半 SReclaimable；字段缺失或无效时拒绝启动。维护停服后的更新事务使用有界 `HK_AP2_MIN_START_AVAILABLE_KIB=47104` 覆盖值：实测停服后的可用内存有时略低于正常门槛，而旧值会让候选和回滚都拒绝启动。更新器从不把该下限继续降低；运行期原有 4096 KiB 空闲 / 32768 KiB 可用门槛保持不变，不能把它理解为取消内存保护。
+正常 AP2 启动仍要求至少 8192 KiB 原始空闲和 49152 KiB 估算可用内存。Linux 3.10 的估算只计入扣除 Shmem、Dirty、Writeback 后的文件缓存，加 Buffers 和一半 SReclaimable；字段缺失或无效时拒绝启动。由于 110 MB 设备空闲时干净文件缓存常占 45 MB 以上、原始 `MemFree` 可能低于 8192 KiB，控制器在挂载运行时前、资源守卫在 `MemFree < 4096` 但估算可用内存仍满足 `32768 KiB` 时会先按冷却间隔回收干净页缓存，再复核门槛。维护停服后的更新事务继续使用有界 `HK_AP2_MIN_START_AVAILABLE_KIB=47104` 覆盖值；运行期原有 4096 KiB 空闲 / 32768 KiB 可用门槛保持不变，真实内存耗尽仍会按设计保护停服。
 
 失败会恢复整批文件；即使回退成功，原更新命令仍返回非零。回退失败保留 hold 与 `/vendor/airplay2/.updates/pending`，日志给出：
 

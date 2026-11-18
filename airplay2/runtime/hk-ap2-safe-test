@@ -129,13 +129,16 @@ mute_without_active_generation() {
     # publication lock and re-read both files before changing any gain. Without
     # this, a new hook could publish a lease after the sample but before the
     # mute and have its speaker path closed underneath it.
-    # An AirPlay claim is published before the hook waits for Bluetooth to
-    # release the speaker. While that live claim owns the transition, waiting
-    # for speaker.lock here can deadlock against the hook waiting for this
-    # watchdog's exact lease ACK. Defer without opening or muting anything; the
-    # claim is process-bound and bounded to 30 seconds.
+    # An AirPlay claim or in-flight lease request/voice hand-off holds or is
+    # about to hold speaker.lock while waiting for this watchdog's exact lease
+    # ACK. Use a short non-blocking lock probe so an idle mute pass never
+    # deadlocks against an incoming Bluetooth, Voice, or AirPlay startup.
     audio_claim_recent "$RUN/ap2-claim" && return 1
-    state_lock || return 2
+    audio_voice_pending && return 1
+    [ -f "$LEASE_REQUEST" ] && return 1
+    audio_read_lease && return 1
+    [ -n "$(read_file "$SAFE/play.started")" ] && return 1
+    HK_AUDIO_LOCK_TRIES=3 state_lock || return 2
     if audio_marker_present "$SAFE/tripped" ||
        audio_marker_present "$HOLD_MUTE" ||
        audio_read_lease || [ -n "$(read_file "$SAFE/play.started")" ]; then
@@ -358,7 +361,23 @@ write_lease_ack() {
     lease_ack_ready "$_wa_marker" || return 1
     [ "$lease_token" = "$_wa_token" ] &&
         [ "$lease_request_nonce" = "$_wa_nonce" ] || return 1
+    _wa_now=$(now) && write_file "$SAFE/watchdog.heartbeat" "$_wa_now" || true
     write_file "$LEASE_ACK" "$_wa_token $_wa_nonce"
+}
+
+watchdog_wait_next_tick() {
+    if ! command -v usleep >/dev/null 2>&1; then
+        sleep 1
+        return 0
+    fi
+    _ww_i=0
+    while [ "$_ww_i" -lt 5 ]; do
+        if [ -f "$LEASE_REQUEST" ] && [ ! -f "$LEASE_ACK" ]; then
+            return 0
+        fi
+        usleep 200000 2>/dev/null || { sleep 1; return 0; }
+        _ww_i=$((_ww_i + 1))
+    done
 }
 
 mixer_set() {
@@ -506,7 +525,7 @@ watchdog_loop() {
     }
     trap 'watchdog_cleanup' 0
     trap 'exit 0' HUP INT TERM
-    if ! audio_lock "$SAFE/watchdog.lock"; then
+    if ! HK_AUDIO_LOCK_TRIES=10 audio_lock "$SAFE/watchdog.lock"; then
         printf '%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date) duplicate watchdog refused pid=$$" \
             >>"$SAFE/watchdog.log" 2>/dev/null || true
         exit 1
@@ -723,7 +742,10 @@ watchdog_loop() {
                        [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
                         hard_mute
                         rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
-                            "$SAFE/lease" "$RUN/ap2-claim"
+                            "$SAFE/lease"
+                        if [ "$release_intent_source" = airplay ]; then
+                            rm -f "$RUN/ap2-claim"
+                        fi
                         log_action "source release in progress; hard mute (recoverable)"
                     else
                         log_action "source release observation superseded; no cleanup"
@@ -864,7 +886,9 @@ watchdog_loop() {
                    [ -z "$(read_file "$SAFE/play.started")" ]; then
                     hard_mute
                     rm -f "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease" "$RELEASE_INTENT"
-                    rm -f "$RUN/ap2-claim"
+                    if [ "$snapshot_source" = airplay ]; then
+                        rm -f "$RUN/ap2-claim"
+                    fi
                     log_action "source release in progress; hard mute (recoverable)"
                 else
                     log_action "source release observation superseded; no cleanup"
@@ -1515,7 +1539,7 @@ watchdog_loop() {
                 fi
             fi
         fi
-        sleep 1
+        watchdog_wait_next_tick
     done
 
     hard_mute

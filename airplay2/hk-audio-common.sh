@@ -102,6 +102,8 @@ audio_set_self() {
 }
 audio_lock() {
     _al_path=$1
+    _al_limit=${HK_AUDIO_LOCK_TRIES:-55}
+    case "$_al_limit" in ''|*[!0-9]*|0) _al_limit=55;; esac
     _al_count=0
     AUDIO_LOCK_WAITED=0
     while ! mkdir "$_al_path" 2>/dev/null; do
@@ -150,7 +152,7 @@ EOF
             rmdir "$_al_path" 2>/dev/null || true
         fi
         _al_count=$((_al_count + 1))
-        [ "$_al_count" -lt 30 ] || return 1
+        [ "$_al_count" -lt "$_al_limit" ] || return 1
         audio_delay 100000
     done
     audio_set_self || return 1
@@ -161,6 +163,9 @@ EOF
     # lock whose creator was still alive.
     audio_write_control "$_al_path/owner" "$AUDIO_SELF_PID $_al_start" ||
         { rmdir "$_al_path" 2>/dev/null || true; return 1; }
+}
+audio_try_lock() {
+    HK_AUDIO_LOCK_TRIES=${2:-3} audio_lock "$1"
 }
 audio_unlock() {
     audio_set_self || return 1
@@ -403,7 +408,8 @@ audio_watchdog_transition_live() {
         esac
     fi
     # AirPlay publishes a live claim before releasing Bluetooth and before its
-    # guard creates the priming lease. The claim's PID identity and 30-second
-    # cap prevent an abandoned file from extending the grace indefinitely.
-    audio_claim_recent "${HK_AP2_RUN:-$RUN}/ap2-claim"
+    # guard creates the priming lease. Voice similarly publishes voice-owns
+    # during source hand-off before its priming lease is established.
+    audio_claim_recent "${HK_AP2_RUN:-$RUN}/ap2-claim" ||
+        audio_voice_pending
 }

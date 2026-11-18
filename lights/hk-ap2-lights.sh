@@ -168,7 +168,8 @@ run() {
         fi
 
         volume=$(cut -d' ' -f1,2 "$RUN/volume.state" 2>/dev/null)
-        if [ -n "$volume" ] && [ "$volume" != "$last_volume" ]; then
+        if [ -n "$volume" ] && [ "$volume" != "$last_volume" ] &&
+           [ ! -f "$RUN/bt-owner.pid" ]; then
             last_volume=$volume
             notify_volume "${volume#* }"
         fi

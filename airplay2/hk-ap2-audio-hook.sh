@@ -337,7 +337,7 @@ pause_bluetooth_for_airplay() {
     fi
     "$REQUEST" "$BT_PLAYER_SOCKET" setPlayerCmd:onepause 1200 >/dev/null 2>&1 || true
     _bp_n=0
-    while [ "$_bp_n" -lt 5 ]; do
+    while [ "$_bp_n" -lt 3 ]; do
         if ! _bp_data=$("$REQUEST" "$BT_PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null); then
             audio_write_control "$BT_PAUSE_PENDING" "$_bp_marker" || return 1
             hook_log 'Bluetooth pause acknowledgement unavailable; AirPlay proceeds with retry pending'
@@ -349,7 +349,7 @@ pause_bluetooth_for_airplay() {
                 rm -f "$BT_PAUSE_PENDING"
                 return 0;;
         esac
-        usleep 200000 2>/dev/null || sleep 1
+        usleep 100000 2>/dev/null || sleep 1
         _bp_n=$((_bp_n + 1))
     done
     audio_write_control "$BT_PAUSE_PENDING" "$_bp_marker" || return 1
@@ -708,11 +708,14 @@ case "${1:-}" in
     park)
         speaker_lock || exit 1
         trap 'speaker_unlock' 0
-        audio_regular_file "$SAFE/armed" && watchdog_alive &&
-            audio_voice_generation_valid || exit 1
+        audio_regular_file "$SAFE/armed" && watchdog_alive || exit 1
         # Reserve voice intent before waiting for any in-flight Bluetooth
         # open. Its ordinary lease is still created by the existing guard.
         if [ -n "${HK_AP2_VOICE:-}" ]; then
+            if [ -n "${HK_AUDIO_TOKEN:-}" ] &&
+               [ "$(audio_control_read "$RUN/current-voice-token")" != "$HK_AUDIO_TOKEN" ]; then
+                exit 1
+            fi
             ! audio_play_marker_live && ! audio_marker_present "$SAFE/lease" &&
                 ! audio_marker_present "$BT_OWNER" || exit 1
             _park_voice_now=$(audio_now) || exit 1
@@ -781,6 +784,31 @@ case "${1:-}" in
                 hook_log "start deferred: the voice assistant has the speaker"
                 exit 0
             fi
+            if ! audio_marker_present "$HOLD_MUTE" &&
+               audio_regular_file "$SAFE/armed" &&
+               ! audio_marker_present "$SAFE/tripped" &&
+               ! audio_marker_present "$BT_OWNER" &&
+               audio_play_marker_live &&
+               audio_lease_is_caller && [ "$lease_phase" = active ] &&
+               watchdog_alive && pcm_clock_live &&
+               [ "$(switch_state 'Ext Spk')" = on ] &&
+               [ "$(switch_state 'aml audio i2s mute')" = off ] &&
+               [ "$(switch_state 'Digital')" = on ]; then
+                _ap_pa_ok=1
+                if [ "$USE_STOCK_PA" = 1 ] && [ -x "$STOCK_AUDIO_STATE" ]; then
+                    env LD_LIBRARY_PATH="$AMIXER_LIB" "$STOCK_AUDIO_STATE" --unmuted >/dev/null 2>&1 || _ap_pa_ok=0
+                fi
+                if [ "$_ap_pa_ok" = 1 ]; then
+                    [ -f "$CLAIM" ] || publish_claim || true
+                    speaker_unlock
+                    hook_log "AirPlay speaker path already active"
+                    exit 0
+                elif repair_active_airplay_stock_mute; then
+                    [ -f "$CLAIM" ] || publish_claim || true
+                    speaker_unlock
+                    exit 0
+                fi
+            fi
             publish_claim || { hook_log "could not publish AirPlay claim"; exit 1; }
             if audio_marker_present "$BT_OWNER"; then
                 takeover_bt=1
@@ -802,13 +830,13 @@ case "${1:-}" in
                 speaker_unlock
             fi
         fi
-        ! audio_marker_present "$HOLD_MUTE" || { drop_claim; exit 1; }
-        audio_regular_file "$SAFE/armed" || { drop_claim; exit 1; }
-        ! audio_marker_present "$SAFE/tripped" || { drop_claim; exit 1; }
+        ! audio_marker_present "$HOLD_MUTE" || { drop_claim; hook_log "start aborted: maintenance hold active"; exit 1; }
+        audio_regular_file "$SAFE/armed" || { drop_claim; hook_log "start aborted: watchdog disarmed"; exit 1; }
+        ! audio_marker_present "$SAFE/tripped" || { drop_claim; hook_log "start aborted: watchdog tripped ($(read_file "$SAFE/tripped"))"; exit 1; }
         watchdog_alive ||
             audio_watchdog_transition_live ||
-            { drop_claim; exit 1; }
-        speaker_lock || { drop_claim; exit 1; }
+            { drop_claim; hook_log "start aborted: watchdog heartbeat stale"; exit 1; }
+        speaker_lock || { drop_claim; hook_log "start aborted: speaker lock unavailable"; exit 1; }
         trap 'speaker_unlock' 0
         trap 'start_failed "interrupted speaker transition"' HUP INT TERM
         if [ "$claim_owned" = 1 ]; then
@@ -985,8 +1013,6 @@ case "${1:-}" in
         [ "$(mixer_values 1)" = "$DIGITAL,$DIGITAL" ] ||
             start_failed "digital fade-in verification failed"
         output_guard_ok || start_failed "guard lost after fade-in"
-        lease_phase=active
-        audio_write_lease || start_failed "could not commit active lease"
         if [ -n "${HK_AP2_BT:-}" ] && [ -n "$bt_pa_key" ]; then
             [ "$(read_file "$BT_PCM_OWNER")" = "$bt_pa_key" ] || start_failed 'Bluetooth PCM changed during startup'
             audio_write_control "$BT_PA_READY" "$bt_pa_key" ||
@@ -996,6 +1022,8 @@ case "${1:-}" in
             audio_write_control "$RUN/media-source" "$lease_source" ||
                 start_failed "media-source publication failed"
         fi
+        lease_phase=active
+        audio_write_lease || start_failed "could not commit active lease"
         hook_log "speaker enabled"
         exit 0
         ;;

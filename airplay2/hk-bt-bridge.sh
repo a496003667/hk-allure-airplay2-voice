@@ -67,6 +67,23 @@ bt_playing() {
     bt_source_playing
 }
 
+bt_active_playing() {
+    bt_pcm_live || { active_rpc_failures=0; return 1; }
+    if bt_source_playing; then
+        active_rpc_failures=0
+        return 0
+    fi
+    if [ "${bt_rpc_transient_fail:-0}" = 1 ] && watchdog_live; then
+        active_rpc_failures=$((${active_rpc_failures:-0} + 1))
+        if [ "$active_rpc_failures" -le 2 ]; then
+            trace "tolerating transient Bluetooth status RPC miss count=$active_rpc_failures"
+            return 0
+        fi
+    fi
+    active_rpc_failures=0
+    return 1
+}
+
 bt_start_source_live() {
     # AirPlay handoff briefly closes the hardware clock. The factory player
     # can retain that stopped PCM while the private virtual PCM continues to
@@ -114,9 +131,13 @@ bt_start_source_live() {
 
 bt_source_playing() {
     bt_last_disconnected=0
+    bt_rpc_transient_fail=0
     watchdog_live || return 1
     [ -x "$REQ" ] && [ -S "$PLAYER_SOCKET" ] || return 1
-    data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || return 1
+    data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || {
+        bt_rpc_transient_fail=1
+        return 1
+    }
     if printf '%s' "$data" | grep -q '"mode":"-1"'; then
         # A confirmed disconnect ends the paused stream's generation. A
         # subsequent connection may use the initial unowned-PCM repair.
@@ -150,6 +171,7 @@ last_claim_reap=-1
 last_orphan_park_check=-1
 reverse_token=
 reverse_paused=0
+reverse_saw_play=0
 reverse_require_quiet=0
 reverse_armed=0
 bridge_lock_held=0
@@ -178,6 +200,13 @@ wait_activity_last_sample=0
 wait_activity_samples=0
 wait_activity_since=0
 bt_last_disconnected=0
+bt_rpc_transient_fail=0
+active_rpc_failures=0
+stale_play_identity=
+pause_retry_marker=
+pause_retry_sent=0
+pause_retry_quiet_key=
+pause_retry_quiet_count=0
 
 read_reverse_activity() {
     # The private backend reports only a process identity, PCM instance,
@@ -205,9 +234,11 @@ observe_airplay_takeover() {
         [ -z "$reverse_token" ] || reverse_require_quiet=1
         reverse_token=
         reverse_paused=0
+        reverse_saw_play=0
         reverse_armed=0
         reverse_instance=
         reverse_pending_identity=
+        stale_play_identity=
         trace 'AirPlay takeover witness paused for pending phone pause'
         return 0
     fi
@@ -219,35 +250,70 @@ observe_airplay_takeover() {
            ! audio_voice_pending && watchdog_live && audio_read_lease &&
            [ "$lease_source" = airplay ]; }; then
         trace 'AirPlay takeover guard lost'
-        [ -z "$reverse_token" ] || reverse_require_quiet=1
-        reverse_token=; reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
+        [ "$reverse_saw_play" != 1 ] || reverse_require_quiet=1
+        reverse_token=; reverse_paused=0; reverse_saw_play=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=; stale_play_identity=
         return 0
     fi
     if [ "$reverse_token" != "$lease_token" ]; then
         trace "AirPlay lease changed old=${reverse_token:-none} new=$lease_token"
-        [ -z "$reverse_token" ] || reverse_require_quiet=1
-        reverse_token=$lease_token; reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
+        [ "$reverse_saw_play" != 1 ] || reverse_require_quiet=1
+        reverse_token=$lease_token; reverse_paused=0; reverse_saw_play=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=; stale_play_identity=
     fi
     _rt_now=$(now)
     [ "$_rt_now" -gt "$last_reverse_check" ] || return 0
     last_reverse_check=$_rt_now
     _rt_data=$("$REQ" "$PLAYER_SOCKET" getPlayerStatus 1200 2>/dev/null) || {
-        reverse_pending_identity=; return 0;
+        reverse_pending_identity=; stale_play_identity=; return 0;
     }
     _rt_idle=0
     if printf '%s' "$_rt_data" | grep -q '"mode":"41"'; then
-        case "$_rt_data" in *'"status":"stop"'*|*'"status":"pause"'*) _rt_idle=1;; esac
+        case "$_rt_data" in
+            *'"status":"stop"'*|*'"status":"pause"'*)
+                _rt_idle=1
+                stale_play_identity=
+                ;;
+            *'"status":"play"'*)
+                # Stock firmware can retain a stale "play" status when a phone
+                # connects idle or remains paused across an AirPlay lease
+                # transition. Two consecutive observations with >2s-old (or
+                # absent) PCM activity and zero frame progress prove quietness.
+                if [ ! -S "$BT_PCM_CONTROL" ]; then
+                    if [ "$stale_play_identity" = absent ]; then
+                        _rt_idle=1
+                    else
+                        stale_play_identity=absent
+                    fi
+                elif read_reverse_activity &&
+                     { [ "$_ra_last" = 0 ] ||
+                       { [ "$_ra_last" -le "$_rt_now" ] &&
+                         [ $((_rt_now - _ra_last)) -gt 2 ]; }; }; then
+                    _sp_id="$_ra_pid:$_ra_start:$_ra_instance:$_ra_frames"
+                    if [ "$stale_play_identity" = "$_sp_id" ]; then
+                        _rt_idle=1
+                    else
+                        stale_play_identity=$_sp_id
+                    fi
+                else
+                    stale_play_identity=
+                fi
+                ;;
+            *)
+                stale_play_identity=
+                ;;
+        esac
     elif printf '%s' "$_rt_data" | grep -q '"mode":"-1"'; then
         # A phone can connect and immediately start music while AirPlay is
         # playing. Two confirmed disconnected observations establish the
         # same quiet baseline; newly received PCM is still required.
         _rt_idle=1
+        stale_play_identity=
     else
-        reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=
+        reverse_paused=0; reverse_armed=0; reverse_instance=; reverse_pending_identity=; stale_play_identity=
         return 0
     fi
     if [ "$_rt_idle" = 1 ]; then
             reverse_paused=1
+            reverse_saw_play=0
             reverse_require_quiet=0
             reverse_pending_identity=
             if read_reverse_activity; then
@@ -283,6 +349,7 @@ observe_airplay_takeover() {
     fi
     printf '%s' "$_rt_data" | grep -q '"status":"play"' &&
         printf '%s' "$_rt_data" | grep -q '"mute":"0"' || { reverse_pending_identity=; return 0; }
+    reverse_saw_play=1
     read_reverse_activity || { reverse_pending_identity=; return 0; }
     # If an existing process restarted, discard the old pause witness.
     if [ -n "$reverse_instance" ] && [ "$reverse_instance" != absent ] &&
@@ -333,11 +400,23 @@ observe_airplay_takeover() {
 }
 
 retry_pending_phone_pause() {
-    audio_marker_present "$PAUSE_PENDING" || return 0
+    if ! audio_marker_present "$PAUSE_PENDING"; then
+        pause_retry_marker=
+        pause_retry_sent=0
+        pause_retry_quiet_key=
+        pause_retry_quiet_count=0
+        return 0
+    fi
     _rpp_now=$(now) || return 0
     [ "$_rpp_now" -gt "$last_pause_retry_check" ] || return 0
     last_pause_retry_check=$_rpp_now
     _rpp_marker=$(audio_control_read "$PAUSE_PENDING") || return 0
+    if [ "$_rpp_marker" != "$pause_retry_marker" ]; then
+        pause_retry_marker=$_rpp_marker
+        pause_retry_sent=0
+        pause_retry_quiet_key=
+        pause_retry_quiet_count=0
+    fi
 
     # The pause marker belongs only to an active AirPlay generation. Once that
     # generation ends, deliberately leave the phone timeline alone.
@@ -351,6 +430,10 @@ retry_pending_phone_pause() {
         [ -z "$(audio_control_read "$OWNER")" ] || return 0
         if [ "$(audio_control_read "$PAUSE_PENDING")" = "$_rpp_marker" ]; then
             rm -f "$PAUSE_PENDING"
+            pause_retry_marker=
+            pause_retry_sent=0
+            pause_retry_quiet_key=
+            pause_retry_quiet_count=0
             trace 'removed pause-retry marker after AirPlay generation ended'
         fi
         return 0
@@ -359,10 +442,11 @@ retry_pending_phone_pause() {
         ! audio_marker_present "${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}" &&
         ! audio_voice_pending && watchdog_live || return 0
 
-    lock_speaker || return 0
+    try_lock_speaker || return 0
     _rpp_remove=0
     _rpp_pause=0
     _rpp_removed_ok=0
+    _rpp_stale_quiet=0
     if [ "$(audio_control_read "$PAUSE_PENDING")" = "$_rpp_marker" ] &&
        ! audio_marker_present "$OWNER" &&
        ! audio_marker_present "$SAFE/tripped" &&
@@ -385,13 +469,60 @@ retry_pending_phone_pause() {
                 fi
                 ;;
         esac
+        if [ "$_rpp_pause" = 1 ] && [ "$pause_retry_sent" -ge 1 ]; then
+            _rpp_qkey=
+            if [ ! -S "$BT_PCM_CONTROL" ]; then
+                _rpp_qkey=absent
+            elif read_reverse_activity &&
+                 { [ "$_ra_last" = 0 ] ||
+                   { [ "$_ra_last" -le "$_rpp_now" ] &&
+                     [ $((_rpp_now - _ra_last)) -gt 2 ]; }; }; then
+                _rpp_qkey="$_ra_pid:$_ra_start:$_ra_instance:$_ra_frames"
+            fi
+            if [ -n "$_rpp_qkey" ]; then
+                if [ "$_rpp_qkey" = "$pause_retry_quiet_key" ]; then
+                    pause_retry_quiet_count=$((pause_retry_quiet_count + 1))
+                else
+                    pause_retry_quiet_key=$_rpp_qkey
+                    pause_retry_quiet_count=1
+                fi
+                if [ "$pause_retry_quiet_count" -ge 2 ]; then
+                    _rpp_remove=1
+                    _rpp_stale_quiet=1
+                fi
+            else
+                pause_retry_quiet_key=
+                pause_retry_quiet_count=0
+            fi
+        fi
         if [ "$_rpp_remove" = 1 ]; then
             if rm -f "$PAUSE_PENDING"; then
                 _rpp_removed_ok=1
+                pause_retry_marker=
+                pause_retry_sent=0
+                pause_retry_quiet_key=
+                pause_retry_quiet_count=0
+                if [ "$_rpp_stale_quiet" = 1 ]; then
+                    reverse_token=$lease_token
+                    reverse_paused=1
+                    reverse_require_quiet=0
+                    if [ -S "$BT_PCM_CONTROL" ] && [ -n "${_ra_instance:-}" ]; then
+                        reverse_instance=$_ra_instance
+                        reverse_pid=$_ra_pid
+                        reverse_start=$_ra_start
+                        reverse_frames=$_ra_frames
+                        stale_play_identity="$_ra_pid:$_ra_start:$_ra_instance:$_ra_frames"
+                    else
+                        reverse_instance=absent
+                        stale_play_identity=absent
+                    fi
+                    reverse_armed=1
+                fi
             fi
         elif [ "$_rpp_pause" = 1 ]; then
             if "$REQ" "$PLAYER_SOCKET" setPlayerCmd:onepause 1200 \
                 >/dev/null 2>&1; then
+                pause_retry_sent=$((pause_retry_sent + 1))
                 trace 'retried pending Bluetooth phone pause'
             fi
         fi
@@ -453,7 +584,7 @@ repair_active_airplay_stock_mute() {
         HK_AUDIO_LEASE_TIME="$_ras_lease_time" \
         "$HOOK" repair-stock-pa >/dev/null 2>&1; then
         log 'repaired stock amplifier mute during active AirPlay'
-        next_airplay_stock_repair=$((_ras_now + stock_repair_cooldown))
+        next_airplay_stock_repair=$((_ras_now + 1))
     else
         log 'active AirPlay stock amplifier repair failed; retrying later'
         next_airplay_stock_repair=$((_ras_now + stock_repair_cooldown))
@@ -569,6 +700,14 @@ yield_airplay_to_bluetooth() {
     fi
     audio_voice_pending && return 1
     rm -f "$RUN/release-dac"
+    reverse_token=
+    reverse_paused=0
+    reverse_saw_play=0
+    reverse_require_quiet=0
+    reverse_armed=0
+    reverse_instance=
+    reverse_pending_identity=
+    stale_play_identity=
     log 'AirPlay pause requested and clock released for new Bluetooth playback'
 }
 
@@ -609,7 +748,7 @@ reap_disconnected_bluetooth_marker() {
         bt-*|backend-*) ;;
         *) return 0;;
     esac
-    lock_speaker || return 1
+    try_lock_speaker || return 1
     _rdbm_remove=0
     if [ "$(audio_control_read "$WAIT_PCM")" = "$_rdbm_marker" ] &&
        [ -x "$REQ" ] && [ -S "$PLAYER_SOCKET" ] &&
@@ -640,7 +779,7 @@ reap_completed_airplay_release_marker() {
     # or claim is live, but remove it once the device is genuinely closed so it
     # cannot block every later AirPlay session.
     audio_marker_present "$RUN/release-dac" || return 0
-    lock_speaker || return 1
+    try_lock_speaker || return 1
     _rcar_remove=0
     if audio_marker_present "$RUN/release-dac" &&
        ! audio_read_lease && ! audio_play_marker_live &&
@@ -677,6 +816,7 @@ reap_orphaned_bluetooth_slave() {
     esac
     _robs_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$PCM" 2>/dev/null)
     audio_bt_pcm_owned "$_robs_owner" || return 0
+    [ ! -e "${HK_BT_PCM_OPENING:-$RUN/bt-pcm-opening}" ] || return 0
     ! audio_read_lease && ! audio_play_marker_live &&
         ! audio_claim_recent "$RUN/ap2-claim" &&
         ! audio_marker_present "$OWNER" &&
@@ -745,7 +885,7 @@ reap_stale_airplay_claim() {
     [ "$_rc_now" -gt "$last_claim_reap" ] || return 0
     last_claim_reap=$_rc_now
     audio_claim_recent "$RUN/ap2-claim" && return 0
-    lock_speaker || return 1
+    try_lock_speaker || return 1
     _rac_owner=$(audio_control_read "$OWNER") || _rac_owner=
     _rac_owned_lease=0
     if audio_read_lease; then
@@ -770,7 +910,7 @@ reap_stale_control_markers() {
     # An ownerless release request can survive an interrupted takeover. It
     # must not poison every later Bluetooth acquisition.
     if audio_marker_present "$RELEASE"; then
-        if lock_speaker; then
+        if try_lock_speaker; then
             if ! audio_marker_present "$OWNER" && ! audio_read_lease &&
                ! audio_play_marker_live; then
                 rm -f "$RELEASE"
@@ -788,7 +928,7 @@ reap_stale_control_markers() {
     ! audio_marker_present "$SAFE/tripped" &&
         ! audio_marker_present "${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}" &&
         watchdog_live && ! audio_voice_pending || return 0
-    lock_speaker || return 0
+    try_lock_speaker || return 0
     if ! audio_read_lease && ! audio_play_marker_live &&
        ! audio_claim_recent "$RUN/ap2-claim" &&
        ! audio_marker_present "$OWNER" &&
@@ -897,6 +1037,25 @@ ap2_recent_claim() {
 }
 
 lock_speaker() { audio_lock "$LOCK"; }
+try_lock_speaker() { audio_try_lock "$LOCK"; }
+
+active_wait_next_tick() {
+    if ! command -v usleep >/dev/null 2>&1; then
+        sleep 1
+        return 0
+    fi
+    _aw_i=0
+    while [ "$_aw_i" -lt 5 ]; do
+        if audio_marker_present "$SAFE/tripped" ||
+           audio_marker_present "$RELEASE" ||
+           audio_marker_present "$WAIT_PCM" ||
+           ! audio_play_marker_live; then
+            return 0
+        fi
+        audio_delay 200000
+        _aw_i=$((_aw_i + 1))
+    done
+}
 
 terminate_hook_child() {
     _thc_pid=${child:-}
@@ -1019,6 +1178,7 @@ start_retry_safe() {
 release_output() {
     [ "$active" = 1 ] || return 0
     release_ok=1
+    active_rpc_failures=0
     # After any established stream stops, wait for a new valid PCM rather
     # than resuming a phone that may have deliberately paused playback.
     if ! audio_write_control "$WAIT_PCM" "${BT_TOKEN:-}"; then
@@ -1027,21 +1187,35 @@ release_output() {
         release_ok=0
     fi
     if ! run_hook stop; then
-        "$TEST" mute >/dev/null 2>&1 || true
-        log 'stop hook failed; manual mute latched'
-        release_ok=0
+        audio_delay 200000
+        if ! run_hook stop; then
+            "$TEST" mute >/dev/null 2>&1 || true
+            log 'stop hook failed; manual mute latched'
+            release_ok=0
+        fi
     fi
     rm -f "$OWNER" "$RELEASE"
     # The stock player deliberately retains its virtual PCM handle. Return the
     # actual DSP device too, otherwise PREPARED/XRUN can strand the next source
     # and a long pause can force the resume path through an unrecoverable slave.
     if ! run_hook park; then
-        "$TEST" mute >/dev/null 2>&1 || true
-        log 'Bluetooth DSP release failed; manual mute latched'
-        release_ok=0
+        audio_delay 200000
+        if ! run_hook park; then
+            "$TEST" mute >/dev/null 2>&1 || true
+            log 'Bluetooth DSP release failed; manual mute latched'
+            release_ok=0
+        fi
     fi
     rm -f "$HEARTBEAT"
     active=0
+    reverse_token=
+    reverse_paused=0
+    reverse_saw_play=0
+    reverse_require_quiet=0
+    reverse_armed=0
+    reverse_instance=
+    reverse_pending_identity=
+    stale_play_identity=
     if [ "$release_ok" = 1 ]; then
         log 'Bluetooth released output and DSP slave'
     fi
@@ -1080,7 +1254,7 @@ case "$existing_bridge" in
         fi
         ;;
 esac
-if ! audio_lock "$BRIDGE_LOCK"; then
+if ! HK_AUDIO_LOCK_TRIES=10 audio_lock "$BRIDGE_LOCK"; then
     echo "$$ duplicate Bluetooth bridge refused" >>"$LOG"
     exit 1
 fi
@@ -1111,7 +1285,7 @@ while audio_regular_file "$SAFE/armed"; do
            audio_marker_present "$RELEASE" ||
            audio_marker_present "$WAIT_PCM" ||
            ! audio_play_marker_live ||
-           ! bt_playing; then
+           ! bt_active_playing; then
             release_output
         fi
     elif ! audio_marker_present "$SAFE/tripped" &&
@@ -1151,5 +1325,5 @@ while audio_regular_file "$SAFE/armed"; do
             fi
         fi
     fi
-    if [ "$active" = 0 ]; then audio_delay 200000; else sleep 1; fi
+    if [ "$active" = 0 ]; then audio_delay 200000; else active_wait_next_tick; fi
 done

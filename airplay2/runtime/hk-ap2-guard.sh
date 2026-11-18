@@ -11,6 +11,8 @@ MIN_RUN_FREE_KIB=${HK_AP2_MIN_RUN_FREE_KIB:-8192}
 MIN_AVAILABLE_KIB=${HK_AP2_MIN_AVAILABLE_RUN_KIB:-32768}
 MAX_LOG_BYTES=${HK_AP2_MAX_LOG_BYTES:-131072}
 GUARD_OOM_SCORE_ADJ=${HK_AP2_GUARD_OOM_SCORE_ADJ:-600}
+MEMINFO=${HK_AP2_MEMINFO_FILE:-/proc/meminfo}
+DROP_CACHES=${HK_AP2_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}
 
 SAFE=$RUN/safe
 COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
@@ -40,7 +42,7 @@ memory_kib() {
             available = free + buffers + cached + sreclaim - shmem
             printf "%d %d\n", free, available
         }
-    ' /proc/meminfo 2>/dev/null
+    ' "$MEMINFO" 2>/dev/null
 }
 
 read_pid() {
@@ -122,6 +124,7 @@ trip() {
 log "guard started pid=$$ min_free=${MIN_RUN_FREE_KIB}KiB min_available=${MIN_AVAILABLE_KIB}KiB"
 low_count=0
 loop=0
+last_reclaim=0
 
 while :; do
     shairport_pid=$(read_pid shairport)
@@ -144,6 +147,21 @@ while :; do
             available=0
             ;;
     esac
+    if [ "$free" -lt "$MIN_RUN_FREE_KIB" ] &&
+       [ "$available" -ge "$MIN_AVAILABLE_KIB" ]; then
+        now_tick=$(audio_now 2>/dev/null || echo 0)
+        if [ "$last_reclaim" = 0 ] || [ $((now_tick - last_reclaim)) -ge 30 ]; then
+            last_reclaim=$now_tick
+            [ "$DROP_CACHES" != /proc/sys/vm/drop_caches ] || sync
+            echo 1 >"$DROP_CACHES" 2>/dev/null || true
+            memory=$(memory_kib)
+            free=${memory%% *}
+            available=${memory#* }
+            case "$free:$available" in
+                *[!0-9:]*|:|*:) free=0; available=0;;
+            esac
+        fi
+    fi
     if [ "$free" -lt "$MIN_RUN_FREE_KIB" ] ||
         [ "$available" -lt "$MIN_AVAILABLE_KIB" ]; then
         low_count=$((low_count + 1))

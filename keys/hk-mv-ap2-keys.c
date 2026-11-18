@@ -59,7 +59,8 @@ static volatile int mcu_volume = -1;
 
 static const char player_socket[] = "/tmp/Requesta01controller";
 static const char forward_flag[] = "/tmp/hk-ap2/run/buttons.forward";
-static const char disable_flag[] = "/tmp/hk-keys/disable";
+static const char disable_flag[] = "/vendor/hk-keys/disable";
+static const char legacy_disable_flag[] = "/tmp/hk-keys/disable";
 static const char key_log[] = "/tmp/hk-keys/keys.log";
 static const char trace_flag[] = "/tmp/hk-keys/trace";
 static const char voice_events[] = "/tmp/hk-keys/voice.events";
@@ -248,7 +249,7 @@ int SocketClientReadWriteMsg(const char *path, const char *message, int length,
   }
   int forwarding = (command != NULL || is_key_volume) &&
                    access(forward_flag, F_OK) == 0 &&
-                   access(disable_flag, F_OK) != 0;
+                   access(disable_flag, F_OK) != 0 && access(legacy_disable_flag, F_OK) != 0;
   if (forwarding) {
     int sent = command == NULL || mqtt_publish(remote_topic, command) == 0;
     /* One physical key press moves the stock volume ~12%; one AirPlay step is

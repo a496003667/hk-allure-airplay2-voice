@@ -12,6 +12,7 @@ REPO = Path(__file__).resolve().parents[1]
 WRAPPER = REPO / "airplay2/hk-bt-controller-wrapper.sh"
 BOOT = REPO / "airplay2/hk-bt-boot"
 SHIM = REPO / "airplay2/hk-bt-open-redirect.so"
+PARK = REPO / "airplay2/libasound_module_pcm_hkbtpark.so"
 BOOT_ORDER = REPO / "init/S05linkplay.sh"
 
 
@@ -33,6 +34,8 @@ class BluetoothLauncherTest(unittest.TestCase):
         self.shim.write_text("isolated test shim\n")
         self.conf = self.root / "alsa.conf"
         self.conf.write_text("isolated test configuration\n")
+        self.park = self.root / "park.so"
+        self.park.write_text("isolated test backend\n")
         self.env = os.environ.copy()
         self.env.pop("LD_PRELOAD", None)
         self.env.pop("ALSA_CONFIG_PATH", None)
@@ -44,6 +47,8 @@ class BluetoothLauncherTest(unittest.TestCase):
                 "HK_BT_REDIRECT_SHA256": sha256(self.shim),
                 "HK_BT_PRIVATE_CONF": str(self.conf),
                 "HK_BT_PRIVATE_CONF_SHA256": sha256(self.conf),
+                "HK_BT_PARK_LIB": str(self.park),
+                "HK_BT_PARK_SHA256": sha256(self.park),
             }
         )
 
@@ -71,6 +76,7 @@ class BluetoothLauncherTest(unittest.TestCase):
             "HK_BT_STOCK_SHA256",
             "HK_BT_REDIRECT_SHA256",
             "HK_BT_PRIVATE_CONF_SHA256",
+            "HK_BT_PARK_SHA256",
         ):
             self.assertEqual(
                 self.run_wrapper(self.env | {key: "bad"}),
@@ -91,6 +97,8 @@ class BluetoothLauncherTest(unittest.TestCase):
         shim.write_text("verified shim\n")
         conf = base / "hk-bt-alsa.conf"
         conf.write_text("verified config\n")
+        park = base / "libasound_module_pcm_hkbtpark.so"
+        park.write_text("verified backend\n")
         target = self.root / "tmp/bin/a01controller"
         env = self.env | {
             "HK_BT_BASE": str(base),
@@ -100,6 +108,7 @@ class BluetoothLauncherTest(unittest.TestCase):
             "HK_BT_WRAPPER_SHA256": sha256(wrapper),
             "HK_BT_REDIRECT_SHA256": sha256(shim),
             "HK_BT_PRIVATE_CONF_SHA256": sha256(conf),
+            "HK_BT_PARK_SHA256": sha256(park),
         }
         result = subprocess.run(
             ["sh", str(BOOT)],
@@ -147,6 +156,10 @@ class BluetoothLauncherTest(unittest.TestCase):
         self.assertEqual(wrapper_shim.group(1), sha256(SHIM))
         self.assertEqual(boot_shim.group(1), sha256(SHIM))
         self.assertEqual(boot_wrapper.group(1), sha256(WRAPPER))
+        for script in (wrapper, boot):
+            match = re.search(r"^PARK_SHA256=.*:-([0-9a-f]{64})\}$", script, re.M)
+            self.assertIsNotNone(match)
+            self.assertEqual(match.group(1), sha256(PARK))
 
 
 if __name__ == "__main__":

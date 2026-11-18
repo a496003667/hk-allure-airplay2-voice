@@ -6,12 +6,22 @@
 
 AirPlay、原厂蓝牙和语音播报接入 Harman DSP；音箱保留原厂唤醒词和实体控制，并通过开机自启的 mTLS 通道维护。项目提供音频交接保护与回滚方案，适用于愿意自行维护设备的用户。
 
-截至 2026-11-08，AirPlay 和蓝牙均曾在实机出声；蓝牙的一次暂停与恢复没有听到爆音。新的共享防爆音流程及最新 AirPlay 音量设置仍需重新连接后听测，低频单元和蓝牙播放时的完整语音交接也有待进一步验证。自动化测试通过不代表这些听测已完成。
+截至 2026-11-18，当前分支 **345 项 Linux/BusyBox 回归通过**。蓝牙后端已补齐 MMAP、44.1→48 kHz 适配、实际声卡 FD 归属检查和两层完整包补写；44.1/48 kHz 文件输出与直接 ALSA 参考逐字节一致。最新回归在原有 335 项基础上新增 10 项真实守护进程三方交叉交替与并发目录锁边界测试，覆盖 AirPlay / 蓝牙 / Alexa 连续多轮穿插、两轮追问混音恢复、手机仅连接双次 PA 静音修复、陈旧 `status=play` 去重与抢占解锁、语音提问中途断联回退、语音期间延迟 AirPlay 接管、watchdog 启动锁争用、高频并发解锁边界与干净页缓存回收。
+
+实机无声进一步定位为原厂全局强制静音残留：音乐已经送达声卡，声源未静音，但全局标志仍关闭功放。通过官方 IOGuard 命令和只读回读，将修正固化进蓝牙开声流程后，**用户确认播放及暂停恢复都正常，无爆音、吱声或音量突增**。AirPlay −30…−6 dB 配置保留；按需诊断只记录电平和帧数，不保存音乐内容。
+
+蓝牙启动优化版已部署，用户确认**开始和恢复明显更快，声音正常**。三次日志中的开声流程为 3.00、2.53、2.79 秒，之前约 4 秒；这些是 hook 内部耗时，不是手机点击到出声的端到端测量。蓝牙改用自身原厂功放状态和官方通知，省去临时 AirPlay 辅助进程，加快空闲检测，并将数字静音准备与看门狗确认重叠；静音斜坡、功放稳定等待和回读保护保留。**双向来源切换、最新版本语音回归与长测仍待验收。**
+
+最新组合故障出现在“AirPlay 正在播放，手机只连接蓝牙但不播放”时：原厂可能保留陈旧的 `status=play`，并改变 AirPlay 正在使用的功放静音状态。修正版不再只信这段文本，而以私有蓝牙后端的连续新鲜帧作为播放证据；没有新帧时恢复当前 AirPlay 的功放状态，有新帧时才进入受保护的蓝牙接管。若原厂播放器暂停 RPC 暂时失败，AirPlay 仍正常继续，桥接器保留待办暂停并在后续安全重试，避免为了执行蓝牙暂停反而把 AirPlay 留成静音。AirPlay 自身增益恢复也绑定同一租约 token 和时间，旧会话不会把新的 AirPlay 时钟写成静音。
+
+十脚本重构修正已在维护静音下通过事务 `/vendor/airplay2/.updates/20261118T063814-13768` 安装并精确核验：更新返回 0、无 pending、十文件哈希和运行时 `verify=0` 均通过，AirPlay 5.6、端口 7000、watchdog、蓝牙桥、灯效与语音监督保持正常，AirPlay 配置逐字节保留 `flat / 24 dB / -30…-6 dB / default -30`；随后在空闲声卡与原子目录锁下分两阶段解除维护静音。**345 项回归、13 项 1:1 真实时间尺度验收预演与设备部署已通过，但双向来源抢占、穿插使用语音和持续运行仍必须由用户在场低音量验收，不能把自动化结果写成完整修复已验收。**
+
+此前版本的 AirPlay 音量、暂停恢复、重连、机身按键与语音续播已通过试听；蓝牙的音量、暂停恢复和语音交接也通过，用户未报告爆音或音量突增。修正 XRUN 误锁静音后，500–60 Hz 各段可听到，用户确认熟悉音乐的低频明显改善、听感正常；这不能独立认证每个单元或功放。维护后 Mac“音乐”滑块曾失效，保持接收器不变、正常重开“音乐”后恢复实际静音；发送端内部原因未确定。详见[试听记录](docs/LISTENING-VALIDATION-2026-11-15.md)、[蓝牙通路](docs/BLUETOOTH.md)与[修复状态](docs/AUDIT-REPAIRS-2026-11-14.md)。
 
 ## ⚠️ 风险提示
 
 - 需要音箱的 **root shell**；[首次获取 root](docs/ROOTING.md) 使用原厂 UPnP 入口，后续日常使用[开机自启的 mTLS 维护通道](docs/MAINTENANCE.md)。仓库不包含维护通道的证书和密钥。
-- 这台音箱**没有离线救砖手段**。本项目只改 `/vendor` 用户数据区和 `/etc/init.d` 启动脚本，从不写 bootloader、内核或固件分区；所有功能都可以用 `touch …/disable` 关掉。请你也遵守这个边界。
+- 这台音箱**没有离线救砖手段**。本项目只改 `/vendor` 用户数据区和 `/etc/init.d` 启动脚本，从不写 bootloader、内核或固件分区；各模块的禁用语义见[构建与交付说明](docs/BUILD-AND-UPDATE.md)；关闭 AirPlay 会保留蓝牙/语音需要的共享保护。请你也遵守这个边界。
 - 只在作者自己的一台 Allure 上验证过（Amlogic 4 核 Cortex‑A5，约 110 MB 内存，Linux 3.10.33，2019-09 固件）。
 - 与哈曼卡顿、Amazon、Apple、百度、魔搭无任何关联；相关名称为各自所有者的商标。
 
@@ -19,18 +29,19 @@ AirPlay、原厂蓝牙和语音播报接入 Harman DSP；音箱保留原厂唤�
 
 | 模块 | 说明 |
 |---|---|
-| **AirPlay 2** | Shairport Sync 5.6 + NQPTP，音频经原厂 ABI 桥进入 Harman DSP。软件输出范围为 -36 至 -6 dB；默认 AirPlay 输入值为 -30（对应约 -36 dB，发送端可覆盖） |
-| **蓝牙 / 低音** | 保留原厂 A2DP 蓝牙，把播放器接回 Harman DSP 的左右两路：左声道驱动 90 mm 低音单元，右声道驱动中高音；手机音量驱动 DSP 前的 33 级软件音量 |
+| **AirPlay 2** | Shairport Sync 5.6 + NQPTP，音频经原厂 ABI 桥进入 Harman DSP。本分支新增受测的 24 dB flat 范围：软件衰减 -30 至 -6 dB；默认协议输入 -30 映射到 -30 dB，发送端可覆盖 |
+| **蓝牙 / 低音** | 保留原厂 A2DP 蓝牙，播放器进入 Harman DSP 分频，手机音量驱动 DSP 前的 33 级软件音量；现有通路已听测到低频输出与熟悉音乐的正常低频，但这不等于对每个单元和功放做了独立认证 |
 | **防爆音** | AirPlay、蓝牙和语音统一经过 `hk-ap2-audio-hook.sh` 的 `guard`：先验证租约、时钟和静音基线，再开 I2S 数据流、解除原厂功放静音、开喇叭并渐入 |
 | **灯效 / 音量环** | 播放时显示原厂播放灯效，音量环跟随发送端音量 |
 | **实体按键** | 连着 AirPlay 时，播放/暂停、音量键控制发送端，并与原厂音量双向同步 |
 | **语音助手** | 用原厂的 "Alexa" 唤醒词；百度短语音识别 → 魔搭 Qwen 大模型（流式）→ 百度语音合成（音色 4189），播报同样经过 Harman DSP |
 | **语音交互** | 说完有提示音；回答后 5 秒内可直接追问；喊 "Alexa" 可打断；边生成边播报 |
+| **蓝牙与语音** | 默认同一 PCM 内把背景音乐压至静音后混入回复，手机进度可能继续；明确“暂停”会真实执行并取消自动续播 |
 | **本地指令** | 暂停 / 继续 / 下一首 / 上一首 / 大声 / 小声，不经大模型 |
 | **天气** | open-meteo（免费、无需 key），默认城市按 IP 定位，可问任意城市和明后天 |
 | **提醒 / 闹钟 / 定时器** | "十分钟后提醒我关火""明早七点叫我""倒计时五分钟""我有哪些提醒""取消提醒" |
-| **AirPlay 与语音共存** | 放歌时唤醒：音乐淡出并暂停、让出声卡，回答完自动续播 |
-| **可靠性** | 断网 / 服务出错有离线语音提示；内存紧张时语音助手先退让；守护进程自动拉起；预录有内存上限 |
+| **AirPlay 与语音共存** | 放歌时唤醒：音乐淡出并暂停、让出声卡；语音后通过受保护入口重建 DSP 时钟并请求续播；本轮问答及追问后自动续播试听通过 |
+| **可靠性** | 断网 / 服务出错有离线语音提示；可选进程保持正数 OOM 权重；AP2 回收保留有效蓝牙租约；预录及日志限制占用；不保证内核回收顺序 |
 | **精简** | 开机停用 OTA、Alexa 闹钟、Alexa 多房间（可恢复） |
 
 ## 目录
@@ -49,19 +60,18 @@ docs/       技术笔记与踩坑记录
 
 ## 构建
 
-- **Shairport Sync**：取官方 5.6（作者基于提交 `9118bbc`），打上 `airplay2/shairport-sync-5.6-hk.patch`，用 crosstool-ng 构建的 `arm-unknown-linux-gnueabi`（soft-float，glibc 2.27）交叉编译，依赖 alsa-lib、libsoxr、ffmpeg（libavcodec/swresample）、libsodium、libgcrypt、libplist、libmosquitto、avahi、libconfig、libpopt、OpenSSL。运行时打包成 cramfs 放在 `/vendor/airplay2/`，与原厂的 hard-float glibc 2.19 完全隔离。NQPTP 用上游 1.2.x，未改动。
-- **AirPlay DSP 桥**：Shairport 输出固定 S32_LE/48 kHz 原始 PCM；`airplay2/hk-ap2-dsp-bridge.c` 用原厂 hard-float ABI 读取 FIFO，仅在收到音频时打开 `harmandsp`。构建命令见文件头。
-- **hk-voice / 按键钩子**：`armv7-linux-gnueabihf-gcc -Os -o hk-voice hk-voice.c -ldl -static-libgcc`。程序用 `dlopen` 调用原厂的 libcurl + OpenSSL 1.1，不链接 libm，符号版本不超过 GLIBC_2.17，可以在原厂 glibc 2.19 上运行。
-- **tools/**：用原始系统调用写的静态小程序，任意 ARM 交叉编译器都能编。
+使用[构建与交付说明](docs/BUILD-AND-UPDATE.md)中的 `tools/build-local.sh`、`tools/sync-pins.py` 与 `tools/release.py`。源码包含 DSP 桥、蓝牙重定向、IPC、按键、NSS/能力 shim 和功放辅助库的构建输入。第三方运行时依赖由 `docs/runtime-inputs.lock.json` 固定；原厂专有 ALSA 库须从自己的固件提取。
+
+AirPlay 使用 soft-float/glibc 2.27 隔离运行时；DSP/蓝牙/语音使用原厂 hard-float ABI。构建后检查 GLIBC 符号版本和两种 ABI，不能只验证编译器退出码。4.3.6 不再作为未经等价验收的自动回退版本。
 
 ## 安装要点
 
 1. 把各模块放到 `/vendor/airplay2`、`/vendor/hk-lights`、`/vendor/hk-keys`、`/vendor/hk-voice`、`/vendor/hk-debloat`，启动脚本放到 `/etc/init.d/`。`hk-dsp-alsa.conf` 和 `hk-ap2-dsp-bridge` 必须位于 `/vendor/airplay2`；蓝牙 DSP 路径、安装和回滚见 [docs/BLUETOOTH.md](docs/BLUETOOTH.md)。
-2. 改 `airplay2/shairport-sync.conf` 里的 `airplay_device_id`，填你音箱 wlan0 的 MAC。
+2. 用 `tools/release.py package --device-config <私有配置>` 保留已有设备 ID 并生成 `ap2-device.env` pin；新设备也可用 `--device-mac <MAC>` 生成。设备配置和 pin 只放在私有发布目录。
 3. 语音助手：把 `voice/voice.conf.example` 复制成 `/vendor/hk-voice/voice.conf`（权限 600），填入百度语音（短语音识别 + 语音合成）和魔搭 API-Inference 的 key；运行 `hk-voice check` 检查；`hk-voice mkclips` 生成离线提示音。以后换 key 用 `voice/update-voice-keys.sh`（把 `HK_PUT` / `HK_SHELL` 设成你自己连接音箱的方式）。
 4. 设备上的 CA 证书很旧，访问 open-meteo 需要额外的 ISRG Root X1/X2 根证书，合并成 `/vendor/hk-voice/ca.pem`。
-5. 已经被 bind mount 的 AirPlay 文件**不要直接覆盖**，先上传为 `<文件>.new`，再用 `airplay2/hk-ap2-replace.sh <文件>…` 替换（先停、卸载、安装、启动，失败自动回滚）。`hk-ap2-prodctl` 会校验各文件的 SHA1，改动后要同步更新里面的哈希。
-6. 关掉某个功能：`touch /vendor/<模块>/disable`。
+5. 更新使用完整发布清单：先验证候选目录，上传后用 `tools/stage-update.sh` 放入 `.new`，再运行 `hk-ap2-replace.sh --manifest <发布目录>/update.manifest`。更新器检查候选、空间和全批备份，维护静音下停服/卸载/替换，验证精确版本；失败全批回滚，失败状态返回非零。依赖模块受控重载后再验收，成功也保留维护 hold，等待用户试听。
+6. `touch /vendor/airplay2/disable` 关闭 AirPlay 接收，保留共享蓝牙/语音保护；keys/lights/voice 的持久 disable 分别作用于自己的模块。首次安装和恢复步骤与现有设备更新不同，详见交付说明。
 
 ## 致谢
 

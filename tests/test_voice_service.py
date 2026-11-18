@@ -26,7 +26,7 @@ class VoiceServiceTest(unittest.TestCase):
     def test_all_voice_speaker_paths_use_the_shared_pop_free_guard(self):
         script = VOICE.read_text()
         self.assertIn('"$HOOK" guard', script)
-        self.assertIn('env HK_AP2_BT=1 $HOOK_ENV "$HOOK" guard active', script)
+        self.assertIn('env HK_AP2_BT=1 $HOOK_ENV HK_AUDIO_TOKEN= "$HOOK" guard active', script)
         self.assertNotRegex(script, r'sset "Ext Spk" on|sset Ext Spk on')
         opens = [line for line in script.splitlines()
                  if '"$HOOK" start' in line and 'guard' not in line]
@@ -59,6 +59,23 @@ class VoiceServiceTest(unittest.TestCase):
             'echo "$VOICE_SUPERVISOR_OOM_SCORE_ADJ" >/proc/self/oom_score_adj',
             supervise,
         )
+
+    def test_supervisor_has_a_process_safe_singleton_lock(self):
+        script = VOICE.read_text()
+        supervise = script.split("    supervise)\n", 1)[1].split(
+            "    start)\n", 1
+        )[0]
+        self.assertLess(
+            supervise.index('audio_lock "$RUN/supervisor.lock"'),
+            supervise.index('supervisor.pid'),
+        )
+        self.assertIn('trap \'supervisor_cleanup\' 0', supervise)
+        self.assertIn('trap \'exit 0\' HUP INT TERM', supervise)
+        self.assertIn(
+            '[ "$(audio_control_read "$RUN/supervisor.pid")" = "$$" ]',
+            supervise,
+        )
+        self.assertIn('audio_unlock "$RUN/supervisor.lock"', supervise)
 
     def test_start_reaps_a_stale_fifo_reader(self):
         script = VOICE.read_text()
@@ -169,11 +186,32 @@ bt_inject_end
         self.assertLess(round_body.index("rec_pause_and_drop"), round_body.index("rec_fresh"))
         self.assertIn("round timed out after 60s", round_body)
 
+    def test_prepare_failure_publishes_a_terminal_fail_marker(self):
+        script = VOICE.read_text()
+        prepare = 'prepare_output() {' + script.split('prepare_output() {', 1)[1].split(
+            '\n# Close the speaker path', 1
+        )[0]
+        shell = '''
+voice_round_current() { return 1; }
+audio_write_control() { printf '%s\\n' "$2" >"$PREPARED"; }
+''' + prepare + '''
+prepare_output
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            prepared = pathlib.Path(directory) / 'prepared'
+            result = subprocess.run(
+                ['sh', '-c', shell],
+                env={'PREPARED': str(prepared), 'PATH': '/usr/bin:/bin'},
+                capture_output=True, text=True, timeout=4,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(prepared.read_text().strip(), 'fail')
+
     def test_stale_prepare_after_a_valid_output_does_not_restart_the_round(self):
         script = VOICE.read_text()
         health = script.split("supervisor_health() {", 1)[1].split("\ncase ", 1)[0]
         self.assertIn('[ "$prepared" = ok ] && limit=3', health)
-        self.assertIn('if [ "$prepared" != ok ]; then', health)
+        self.assertIn('if [ "$prepared" != ok ] && [ "$prepared" != finished ]; then', health)
 
 
 if __name__ == "__main__":

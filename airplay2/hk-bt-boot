@@ -8,13 +8,15 @@ STOCK=${HK_BT_STOCK_EXE:-/system/workdir/bin/a01controller}
 WRAPPER="$BASE/hk-bt-controller-wrapper.sh"
 SHIM="$BASE/hk-bt-open-redirect.so"
 CONF="$BASE/hk-bt-alsa.conf"
+PARK="$BASE/libasound_module_pcm_hkbtpark.so"
 TARGET=${HK_BT_TARGET:-/tmp/bin/a01controller}
 TARGET_DIR=${TARGET%/*}
 LOG=${HK_BT_BOOT_LOG:-/tmp/hk-bt-boot.log}
 STOCK_SHA256=${HK_BT_STOCK_SHA256:-150bdfbe5757fd81010d2b99ed700fff591664ba729e901617e31b5d32f748f1}
-WRAPPER_SHA256=${HK_BT_WRAPPER_SHA256:-9159c3dcd72b51e868e6691a500076924a8b9ac3474b593a1112957e23a80e57}
-SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-b16645e60a0fe48a0af7ce13664437067184c498c26d678921dbefbd869871aa}
-CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2d128861ebd8285815d2247230fe9d32b43936b36a7bf916a90955e30c21c44a}
+WRAPPER_SHA256=${HK_BT_WRAPPER_SHA256:-bdadd623e3b8a2d8a7c1253c8dced9e75b0a0abb6e2eb039620deadd1ae33e21}
+SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-f26226b3b03a4ec08d257ff4cede090f1f62be2aedd0c9973077e4e4d46a9689}
+CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2693ecef47f57f4f9df526114018d5c2ad2dfe0b6b36aba9cb7192235590ebf2}
+PARK_SHA256=${HK_BT_PARK_SHA256:-91cb76b051fe2cffdc4472f22b1b4801007c033dfa37d2818d7027c1d60434c6}
 
 log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
@@ -41,10 +43,12 @@ fail() {
 [ -x "$WRAPPER" ] || fail "wrapper is missing or not executable"
 [ -r "$SHIM" ] || fail "redirect shim is missing"
 [ -r "$CONF" ] || fail "private ALSA configuration is missing"
+[ -r "$PARK" ] || fail "releasable PCM backend is missing"
 [ "$(hash_of "$STOCK")" = "$STOCK_SHA256" ] || fail "stock player checksum mismatch"
 [ "$(hash_of "$WRAPPER")" = "$WRAPPER_SHA256" ] || fail "wrapper checksum mismatch"
 [ "$(hash_of "$SHIM")" = "$SHIM_SHA256" ] || fail "redirect shim checksum mismatch"
 [ "$(hash_of "$CONF")" = "$CONF_SHA256" ] || fail "private ALSA configuration checksum mismatch"
+[ "$(hash_of "$PARK")" = "$PARK_SHA256" ] || fail "releasable PCM backend checksum mismatch"
 
 mkdir -p "$TARGET_DIR" || fail "cannot create $TARGET_DIR"
 cp "$WRAPPER" "$TARGET.new" || fail "cannot stage wrapper"

@@ -88,6 +88,27 @@ class LightsStateTest(unittest.TestCase):
         self.bluetooth_markers(comm="shairport-sync\n")
         self.assertEqual(self.state(), "idle")
 
+    def test_forwarding_follows_media_source_and_persistent_disable(self):
+        source=SCRIPT.read_text()
+        function='update_forward_flag() {'+source.split('update_forward_flag() {',1)[1].split('\nplay_status()',1)[0]
+        disable=self.run/'lights.disable'
+        shell='''
+log() { :; }
+sender_connected() { return 0; }
+broker_listening() { return 0; }
+'''+function+'\nupdate_forward_flag\n'
+        env=self.env|{'RUN':str(self.run),'D':str(self.run/'lights'),'DISABLE':str(disable)}
+        (self.run/'media-source').write_text('bluetooth')
+        subprocess.run(['sh','-c',shell],env=env,check=True,capture_output=True)
+        self.assertFalse((self.run/'buttons.forward').exists())
+        (self.run/'media-source').write_text('airplay')
+        (self.run/'voice-owns').write_text('0')
+        subprocess.run(['sh','-c',shell],env=env,check=True,capture_output=True)
+        self.assertTrue((self.run/'buttons.forward').exists(),'volume keys still control AirPlay during its voice reply')
+        disable.touch()
+        subprocess.run(['sh','-c',shell],env=env,check=True,capture_output=True)
+        self.assertFalse((self.run/'buttons.forward').exists())
+
 
 if __name__ == "__main__":
     unittest.main()

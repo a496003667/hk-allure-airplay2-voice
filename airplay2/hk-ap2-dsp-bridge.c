@@ -94,6 +94,13 @@ static int file_exists(const char *path) {
     return 1;
 }
 
+/* A hold/trip blocks new output immediately, but an existing clock stays
+ * alive until the muting owner revokes the lease after the fade. */
+static int airplay_clock_held(void) {
+    return file_exists(HK_AP2_RUNTIME_DIR "/run/ap2-claim") &&
+           file_exists(HK_AP2_RUNTIME_DIR "/run/safe/play.started");
+}
+
 static int airplay_allowed(void) {
     return !file_exists(HK_AP2_RUNTIME_DIR "-hold-mute") &&
            !file_exists(HK_AP2_RUNTIME_DIR "/run/safe/tripped") &&
@@ -140,7 +147,7 @@ void _start(void) {
     for (;;) {
         long result;
 
-        if (pcm && !airplay_allowed()) {
+        if (pcm && !airplay_clock_held()) {
             close_pcm(pcm);
             pcm = 0;
             pending = 0;
@@ -160,7 +167,7 @@ void _start(void) {
         poll_fd.revents = 0;
         result = syscall3(SYS_POLL, (long)&poll_fd, 1, pcm ? 0 : POLL_AFTER_MS);
         if (result == 0) {
-            if (airplay_allowed()) {
+            if ((pcm && airplay_clock_held()) || airplay_allowed()) {
                 if (!pcm && open_pcm(&pcm) < 0) wait_retry();
                 if (pcm && write_frames(pcm, silence, SILENCE_FRAMES) < 0) {
                     close_pcm(pcm);
@@ -181,7 +188,7 @@ void _start(void) {
         if (result == 0) {
             syscall3(SYS_CLOSE, fifo_fd, 0, 0);
             fifo_fd = -1;
-            if (airplay_allowed()) {
+            if ((pcm && airplay_clock_held()) || airplay_allowed()) {
                 if (!pcm && open_pcm(&pcm) < 0) wait_retry();
                 if (pcm && write_frames(pcm, silence, SILENCE_FRAMES) < 0) {
                     close_pcm(pcm);
@@ -203,6 +210,10 @@ void _start(void) {
             continue;
         }
 
+        if (!airplay_allowed()) {
+            /* Preserve the clock, but discard source audio while held. */
+            for (unsigned i = 0; i < pending; i++) buffer[i] = 0;
+        }
         unsigned frames = pending / 8;
         if (frames && write_frames(pcm, buffer, frames) < 0) {
             close_pcm(pcm);

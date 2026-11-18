@@ -12,12 +12,14 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct _snd_pcm snd_pcm_t;
@@ -35,6 +37,17 @@ static int16_t *music_buf;
 static int16_t *voice_buf;
 static size_t scratch_frames;
 static const char *inject_dir;
+static unsigned signal_frames, signal_nonzero, signal_peak[2];
+static int signal_started;
+
+static int bt_run_path(const char *leaf, char path[256])
+{
+    const char *run = getenv("HK_BT_PCM_RUN");
+    if (!run || !*run) run = "/tmp/hk-ap2/run";
+    if (*run != '/') return 0;
+    int n = snprintf(path, 256, "%s/%s", run, leaf);
+    return n > 0 && n < 256;
+}
 
 static void mix_logf(const char *format, ...)
 {
@@ -45,12 +58,41 @@ static void mix_logf(const char *format, ...)
     va_end(args);
     if (n <= 0) return;
     if ((size_t)n >= sizeof(message)) n = (int)sizeof(message) - 1;
-    int fd = open("/tmp/hk-ap2/run/bt-voice-mix.log",
-                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    char path[256];
+    if (!bt_run_path("bt-voice-mix.log", path)) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd < 0) return;
+    if (lseek(fd, 0, SEEK_END) > 65536 && ftruncate(fd, 0) != 0) { close(fd); return; }
     (void)write(fd, message, (size_t)n);
     (void)write(fd, "\n", 1);
     close(fd);
+}
+
+/* Explicit diagnostics contain aggregate levels only, never samples. */
+static void observe_bt_input(const void *data, snd_pcm_uframes_t frames)
+{
+    char marker[256];
+    if (!bt_run_path("bt-pcm-diagnostics", marker) || access(marker, F_OK)) {
+        signal_frames = signal_nonzero = signal_peak[0] = signal_peak[1] = 0;
+        signal_started = 0;
+        return;
+    }
+    const int16_t *samples = data;
+    for (snd_pcm_uframes_t i = 0; i < frames; ++i) {
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            int value = samples[i * 2 + channel];
+            unsigned magnitude = (unsigned)(value < 0 ? -value : value);
+            if (magnitude) ++signal_nonzero;
+            if (magnitude > signal_peak[channel]) signal_peak[channel] = magnitude;
+        }
+    }
+    signal_frames += (unsigned)frames;
+    if (!signal_started || signal_frames >= 48000) {
+        mix_logf("signal stage=player-input frames=%u nonzero=%u peak=%u,%u",
+                 signal_frames, signal_nonzero, signal_peak[0], signal_peak[1]);
+        signal_started = 1;
+        signal_frames = signal_nonzero = signal_peak[0] = signal_peak[1] = 0;
+    }
 }
 
 static int16_t clip_sample(int value)
@@ -105,6 +147,73 @@ static int resize_scratch(snd_pcm_uframes_t frames)
     return 0;
 }
 
+static void request_write_resync(void)
+{
+    char path[256], temp[288];
+    if (!bt_run_path("bt-wait-pcm", path)) return;
+    snprintf(temp, sizeof(temp), "%s.tmp.%ld", path, (long)getpid());
+    int fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    static const char reason[] = "write-backpressure\n";
+    int ok = write(fd, reason, sizeof(reason) - 1) == (ssize_t)sizeof(reason) - 1;
+    close(fd);
+    if (!ok || rename(temp, path) < 0) unlink(temp);
+}
+
+static uint64_t write_clock_ns(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+}
+
+/* The verified stock caller opens nonblocking and drops the rest of a
+ * packet on ANY nonnegative result, including a short write. Complete its
+ * packet here; voice mixing must run only once, before these retries. */
+static snd_pcm_sframes_t write_bt_packet(snd_pcm_t *pcm, const void *data,
+                                        snd_pcm_uframes_t frames)
+{
+    static writei_fn next;
+    static int (*wait_pcm)(snd_pcm_t *, int);
+    static int retry_logged;
+    if (!next) next = (writei_fn)dlsym(RTLD_NEXT, "snd_pcm_writei");
+    if (!wait_pcm) wait_pcm = (int (*)(snd_pcm_t *, int))dlsym(RTLD_NEXT, "snd_pcm_wait");
+    if (!next) return -ENOSYS;
+    if (frames > SIZE_MAX / 4) return -EINVAL;
+    uint64_t budget_ms = 500 + (uint64_t)frames * 1000 / 44100;
+    if (budget_ms > 2000) budget_ms = 2000;
+    uint64_t began = write_clock_ns();
+    snd_pcm_uframes_t done = 0;
+    unsigned calls = 0;
+    while (done < frames) {
+        snd_pcm_sframes_t n = next(pcm, (const char *)data + done * 4, frames - done);
+        ++calls;
+        if (n > 0 && (snd_pcm_uframes_t)n <= frames - done) done += (snd_pcm_uframes_t)n;
+        else if (n != 0 && n != -EAGAIN && n != -EINTR) {
+            request_write_resync();
+            return n < 0 ? n : -EIO;
+        }
+        if (done == frames) break;
+        uint64_t now = write_clock_ns();
+        if ((began && now >= began && now - began >= budget_ms * 1000000) || calls >= 4096) {
+            mix_logf("Bluetooth packet stalled frames=%lu written=%lu", (unsigned long)frames,
+                     (unsigned long)done);
+            request_write_resync();
+            return -EAGAIN;
+        }
+        if (n <= 0) {
+            if (wait_pcm) (void)wait_pcm(pcm, 10);
+            usleep(1000);
+        }
+    }
+    if (calls > 1 && !retry_logged) {
+        mix_logf("completed Bluetooth packet across short writes frames=%lu calls=%u",
+                 (unsigned long)frames, calls);
+        retry_logged = 1;
+    }
+    return (snd_pcm_sframes_t)frames;
+}
+
 static void close_voice(void)
 {
     if (voice_fd >= 0) close(voice_fd);
@@ -117,6 +226,13 @@ static snd_pcm_sframes_t mix_voice(snd_pcm_t *pcm, const void *data,
     char path[256];
     size_t voice_frames = 0;
     int active = marker_exists("active");
+    if (marker_exists("abort")) {
+        close_voice();
+        marker_remove("start");
+        marker_remove("abort");
+        marker_create("aborted");
+        mix_logf("aborted voice generation");
+    }
 
     if (!active && duck_gain >= 0.999f && voice_fd < 0)
         return real_write(pcm, data, frames);
@@ -225,6 +341,8 @@ int snd_pcm_open(snd_pcm_t **pcm, const char *name, int stream, int mode)
     int rc = real_open(pcm, selected, stream, mode);
     if (rc == 0 && selected && !strcmp(selected, "hk_bt_softvol"))
         bt_pcm = *pcm;
+    else if (rc == 0 && *pcm == bt_pcm)
+        bt_pcm = NULL; /* A later non-Bluetooth open reused the old handle. */
     return rc;
 }
 
@@ -239,5 +357,6 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *data,
         return -38;
     if (!pcm || !data || frames == 0 || pcm != bt_pcm)
         return real_write(pcm, data, frames);
-    return mix_voice(pcm, data, frames, real_write);
+    observe_bt_input(data, frames);
+    return mix_voice(pcm, data, frames, write_bt_packet);
 }

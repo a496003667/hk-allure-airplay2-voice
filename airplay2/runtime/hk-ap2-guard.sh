@@ -11,7 +11,14 @@ MIN_RUN_FREE_KIB=${HK_AP2_MIN_RUN_FREE_KIB:-8192}
 MIN_AVAILABLE_KIB=${HK_AP2_MIN_AVAILABLE_RUN_KIB:-32768}
 MAX_LOG_BYTES=${HK_AP2_MAX_LOG_BYTES:-131072}
 GUARD_OOM_SCORE_ADJ=${HK_AP2_GUARD_OOM_SCORE_ADJ:-600}
+MEMINFO=${HK_AP2_MEMINFO_FILE:-/proc/meminfo}
+DROP_CACHES=${HK_AP2_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}
 
+SAFE=$RUN/safe
+COMMON=${HK_AUDIO_COMMON:-/vendor/airplay2/hk-audio-common.sh}
+[ -r "$COMMON" ] || COMMON=$(dirname "$0")/../hk-audio-common.sh
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
 mkdir -p "$RUN"
 printf '%s\n' "$$" >"$RUN/guard.pid"
 echo "$GUARD_OOM_SCORE_ADJ" >"/proc/$$/oom_score_adj" 2>/dev/null || true
@@ -19,6 +26,7 @@ echo "$GUARD_OOM_SCORE_ADJ" >"/proc/$$/oom_score_adj" 2>/dev/null || true
 log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*" \
         >>"$RUN/guard.log"
+    audio_trim_log "$RUN/guard.log" "$MAX_LOG_BYTES"
 }
 
 memory_kib() {
@@ -34,7 +42,7 @@ memory_kib() {
             available = free + buffers + cached + sreclaim - shmem
             printf "%d %d\n", free, available
         }
-    ' /proc/meminfo 2>/dev/null
+    ' "$MEMINFO" 2>/dev/null
 }
 
 read_pid() {
@@ -47,6 +55,7 @@ expected_comm() {
         avahi) echo avahi-daemon ;;
         nqptp) echo nqptp ;;
         shairport) echo shairport-sync ;;
+        mosquitto) echo mosquitto ;;
         *) return 1 ;;
     esac
 }
@@ -59,12 +68,16 @@ pid_matches() {
     [ "$comm" = "$expected" ] && return 0
     [ "$comm" = "ld-linux.so.3" ] || return 1
     case "$(strings "/proc/$pid/cmdline" 2>/dev/null || true)" in
-        *"/opt/bin/$expected"*|*"/opt/sbin/$expected"*) return 0 ;;
+        *"/opt/bin/$expected"*|*"/opt/sbin/$expected"*|*"/airplay2/ap2-56/$expected"*) return 0 ;;
     esac
     return 1
 }
 
 mute_audio() {
+    if audio_bt_valid || { audio_read_lease && [ "$lease_source" = voice ]; }; then
+        log "preserving independent $lease_source lease while reclaiming AP2"
+        return 0
+    fi
     if [ -x "$ROOT/hk-ap2-audio-hook.sh" ]; then
         "$ROOT/hk-ap2-audio-hook.sh" mute >/dev/null 2>&1 || true
     fi
@@ -85,6 +98,7 @@ stop_kind() {
 stop_ap2() {
     mute_audio
     stop_kind shairport
+    stop_kind mosquitto
     stop_kind nqptp
     stop_kind avahi
     stop_kind dbus
@@ -92,21 +106,8 @@ stop_ap2() {
 }
 
 trim_logs() {
-    for log_file in \
-        "$RUN/dbus.log" \
-        "$RUN/avahi.log" \
-        "$RUN/nqptp.log" \
-        "$RUN/shairport.log" \
-        "$RUN/guard.log"; do
-        [ -f "$log_file" ] || continue
-        size=$(wc -c <"$log_file" 2>/dev/null || echo 0)
-        case "$size" in
-            ''|*[!0-9]*) size=0 ;;
-        esac
-        if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
-            tail -c 65536 "$log_file" >"$log_file.tmp" 2>/dev/null &&
-                mv "$log_file.tmp" "$log_file" 2>/dev/null || true
-        fi
+    for log_file in "$RUN"/*.log "$RUN/safe"/*.log /tmp/hk-ap2-supervisor.log /tmp/hk-voice/*.log; do
+        audio_trim_log "$log_file" "$MAX_LOG_BYTES"
     done
 }
 
@@ -116,13 +117,14 @@ trip() {
     log "tripped: $reason"
     stop_ap2
     rm -f "$RUN/guard.pid"
-    log "AP2 stopped and audio muted"
+    log "AP2 stopped; independent playback preserved when valid"
     exit 0
 }
 
 log "guard started pid=$$ min_free=${MIN_RUN_FREE_KIB}KiB min_available=${MIN_AVAILABLE_KIB}KiB"
 low_count=0
 loop=0
+last_reclaim=0
 
 while :; do
     shairport_pid=$(read_pid shairport)
@@ -145,6 +147,21 @@ while :; do
             available=0
             ;;
     esac
+    if [ "$free" -lt "$MIN_RUN_FREE_KIB" ] &&
+       [ "$available" -ge "$MIN_AVAILABLE_KIB" ]; then
+        now_tick=$(audio_now 2>/dev/null || echo 0)
+        if [ "$last_reclaim" = 0 ] || [ $((now_tick - last_reclaim)) -ge 30 ]; then
+            last_reclaim=$now_tick
+            [ "$DROP_CACHES" != /proc/sys/vm/drop_caches ] || sync
+            echo 1 >"$DROP_CACHES" 2>/dev/null || true
+            memory=$(memory_kib)
+            free=${memory%% *}
+            available=${memory#* }
+            case "$free:$available" in
+                *[!0-9:]*|:|*:) free=0; available=0;;
+            esac
+        fi
+    fi
     if [ "$free" -lt "$MIN_RUN_FREE_KIB" ] ||
         [ "$available" -lt "$MIN_AVAILABLE_KIB" ]; then
         low_count=$((low_count + 1))
@@ -156,7 +173,7 @@ while :; do
     fi
 
     loop=$((loop + 1))
-    if [ $((loop % 15)) -eq 0 ]; then
+    if [ $((loop % 2)) -eq 0 ]; then
         trim_logs
     fi
     sleep 2

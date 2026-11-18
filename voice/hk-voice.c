@@ -8,7 +8,7 @@
  *
  * Input: the stock asr_tts recording (44.1 kHz, 16-bit, stereo; the louder
  * channel is the microphone).  Output: raw S16_LE 48 kHz stereo for
- * "aplay -D hw:0,0", already attenuated to follow the AirPlay volume.
+ * "aplay -D hk_harman_dsp", with source-aware software gain.
  *
  * HTTPS goes through the stock libcurl/OpenSSL 1.1 (dlopen, so no headers or
  * import library are needed).  Keys are read from the config file and never
@@ -31,13 +31,14 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "../tools/hk-ipc.h"
 
 extern int malloc_trim(size_t);
 
 #define CONF_PATH "/vendor/hk-voice/voice.conf"
 #define TOKEN_PATH "/vendor/hk-voice/baidu.token"
 #define HIST_PATH "/tmp/hk-voice/history"
-#define VOLUME_LOG "/tmp/hk-ap2/run/volume.log"
+#define VOLUME_STATE "/tmp/hk-ap2/run/volume.state"
 #define CA_FILE (access("/vendor/hk-voice/ca.pem", R_OK) == 0 ? "/vendor/hk-voice/ca.pem" : "/etc/ssl/certs/ca-certificates.crt")
 
 /* ---------- small helpers ---------- */
@@ -602,6 +603,11 @@ static char *asr_best(const int16_t *pcm, size_t n) {
   int pfd[2];
   if (pipe(pfd) != 0) return baidu_asr(pcm, n);
   pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return baidu_asr(pcm, n);
+  }
   if (pid == 0) {
     close(pfd[0]);
     char *b = baidu_asr(pcm, n);
@@ -617,11 +623,11 @@ static char *asr_best(const int16_t *pcm, size_t n) {
   ssize_t r;
   /* read Baidu's answer (it is short); if SenseVoice won, don't wait long */
   if (sv && *sv) {
-    kill(pid, SIGKILL);
+    if (pid > 0) kill(pid, SIGKILL);
   }
   while ((r = read(pfd[0], tmp, sizeof tmp)) > 0) buf_add(&bd, tmp, (size_t)r);
   close(pfd[0]);
-  waitpid(pid, NULL, 0);
+  if (pid > 0) while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
   fprintf(stderr, "hk-voice: sensevoice \"%s\" (%ld ms), baidu \"%s\"\n", sv ? sv : "-", tsv,
           bd.p ? bd.p : "-");
   if (sv && *sv) {
@@ -1363,8 +1369,8 @@ static void denoise(int16_t *x, size_t n) {
   free(pw), free(re), free(im), free(noise), free(gprev), free(out);
 }
 
-/* AirPlay volume (-30..0, -144 mute) -> output attenuation in dB, following
- * Shairport's dasl_tapered profile with the deployed max of -6 dB. */
+/* Fallback stock-volume loudness law. AirPlay uses the actual attenuation
+ * published by its configured profile, not a separate guessed curve. */
 static float log2f_approx(float v) {
   int e = 0;
   while (v < 1) v *= 2, e--;
@@ -1379,45 +1385,37 @@ static float log2f_approx(float v) {
 }
 
 static char *unix_request(const char *path, const char *cmd) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) return NULL;
-  struct sockaddr_un a;
-  memset(&a, 0, sizeof a);
-  a.sun_family = AF_UNIX;
-  snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
-  if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
-    close(fd);
+  char *response = malloc(16384);
+  unsigned long length;
+  if (!response) return NULL;
+  if (hk_ipc_request(path, cmd, 1200, response, 16384, &length) != 0) {
+    free(response);
     return NULL;
   }
-  if (write(fd, cmd, strlen(cmd) + 1) < 0) {
-    close(fd);
-    return NULL;
-  }
-  shutdown(fd, SHUT_WR);
-  buf_t b = {0};
-  char tmp[2048];
-  ssize_t n;
-  while ((n = read(fd, tmp, sizeof tmp)) > 0) buf_add(&b, tmp, (size_t)n);
-  close(fd);
-  return b.p;
+  return response;
 }
 
 /* Is an AirPlay sender connected (RTSP on :7000 established)? */
+static int ap2_table_connected(const char *text) {
+  if (!text) return 0;
+  for (const char *l = text; *l;) {
+    char local[65], remote[65];
+    unsigned local_port, remote_port, state;
+    if (sscanf(l, " %*u: %64[0-9A-Fa-f]:%x %64[0-9A-Fa-f]:%x %x",
+               local, &local_port, remote, &remote_port, &state) == 5 &&
+        local_port == 7000 && state == 1) return 1;
+    const char *next = strchr(l, '\n');
+    if (!next) break;
+    l = next + 1;
+  }
+  return 0;
+}
 static int ap2_connected(void) {
   char *t = read_file("/proc/net/tcp", NULL), *t6 = read_file("/proc/net/tcp6", NULL);
-  int c = 0;
-  for (char *src = t; src; src = (src == t ? t6 : NULL)) {
-    for (char *l = strtok(src, "\n"); l; l = strtok(NULL, "\n")) {
-      char *p = strchr(l, ':');
-      if (!p) continue;
-      p = strchr(p + 1, ' '); /* after local address */
-      if (p && strstr(l, ":1B58 ") && strstr(l, ":1B58 ") < p && strstr(p, " 01 ")) c = 1;
-    }
-    if (src == t6) break;
-  }
+  int result = ap2_table_connected(t) || ap2_table_connected(t6);
   free(t);
   free(t6);
-  return c;
+  return result;
 }
 
 /* Reply loudness follows the speaker volume: the AirPlay slider while a
@@ -1425,22 +1423,40 @@ static int ap2_connected(void) {
  * the level at volume 25 (what the user picked); each doubling adds 6 dB. */
 static float output_gain_db(void) {
   const char *bt_mix = getenv("HK_VOICE_BT_INJECT_ACTIVE");
-  if (bt_mix && access(bt_mix, F_OK) == 0) return -12.0f;
+  if (bt_mix && access(bt_mix, F_OK) == 0) {
+    /* The stock Master already attenuates the mixed PCM. Applying its
+     * percentage a second time would attenuate the reply twice. */
+    float mix_gain = (float)strtod(conf_get("GAIN_BT_MIX_DB", "-12"), NULL);
+    if (!(mix_gain >= -40 && mix_gain <= -6)) mix_gain = -12;
+    return mix_gain;
+  }
   const char *fixed = conf_get("GAIN_DB", NULL);
-  if (fixed) return (float)strtod(fixed, NULL);
+  if (fixed) {
+    float gain = (float)strtod(fixed, NULL);
+    return gain >= -60 && gain <= 0 ? gain : -20;
+  }
   float ref = (float)strtod(conf_get("GAIN_REF_DB", "-20"), NULL);
+  if (!(ref >= -60 && ref <= -6)) ref = -20;
   float pct = -1;
-  if (ap2_connected()) {
-    char *log = read_file(VOLUME_LOG, NULL);
-    char *last = NULL;
-    if (log)
-      for (char *l = strtok(log, "\n"); l; l = strtok(NULL, "\n")) last = l;
-    if (last) {
-      char *sp = strchr(last, ' ');
-      float v = (float)strtod(sp ? sp + 1 : last, NULL);
-      pct = v < -30 ? 0 : (v + 30) / 30 * 100;
-    }
-    free(log);
+  const char *source = getenv("HK_VOICE_SOURCE");
+  if ((source && !strcmp(source, "airplay")) || (!source && ap2_connected())) {
+    const char *state_path = getenv("HK_VOICE_VOLUME_STATE");
+    char *state = read_file(state_path ? state_path : VOLUME_STATE, NULL);
+    double v, db;
+    int muted;
+    long stamp;
+    int valid = state && sscanf(state, "%ld %lf %lf %d", &stamp, &v, &db, &muted) == 4 &&
+                v >= -144 && v <= 0 && db >= -144 && db <= 0 &&
+                (muted == 0 || muted == 1);
+    free(state);
+    if (!valid) return ref;
+    if (muted || v < -30) return -144;
+    float offset = (float)strtod(conf_get("GAIN_MEDIA_OFFSET_DB", "0"), NULL);
+    if (!(offset >= -12 && offset <= 12)) offset = 0;
+    float gain = (float)db + offset;
+    if (gain > -6) gain = -6;
+    if (gain < -60) gain = -60;
+    return gain;
   }
   if (pct < 0) {
     char *st = unix_request("/tmp/Requesta01controller", "getPlayerStatus");
@@ -1448,7 +1464,8 @@ static float output_gain_db(void) {
     if (v) pct = (float)atoi(v + 7);
     free(st);
   }
-  if (pct < 0) return ref;
+  if (pct < 0 || pct > 100) return ref;
+  if (pct == 0) return -144;
   if (pct < 3) pct = 3; /* still audible when the speaker is turned right down */
   float g = ref + 6 * log2f_approx(pct / 25.f);
   if (g > -6) g = -6;
@@ -1879,6 +1896,16 @@ static void run_prepare_hook(void) {
   const char *cmd = getenv("HK_VOICE_PREPARE");
   if (!cmd || !*cmd) return;
   pid_t p = fork();
+  if (p < 0) {
+    int saved = errno;
+    const char *dir = getenv("HK_VOICE_QDIR");
+    if (dir && *dir) {
+      char failed[300];
+      snprintf(failed, sizeof failed, "%s/prepared", dir);
+      write_file_atomic(failed, "fail\n", 5, 0644);
+    }
+    die("prepare fork failed: %s", strerror(saved));
+  }
   if (p == 0) {
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
@@ -2049,30 +2076,48 @@ static void handle_reminder(const char *q, FILE *out) {
   fprintf(stderr, "hk-voice: reminder in %ld s: %s\n", secs, t2);
 }
 
-/* Print reminders that are due (one text per line) and remove them. */
+/* Peek due records with a stable ID. Do not consume before output succeeds. */
+static const char *reminders_path(void) {
+  const char *p = getenv("HK_VOICE_REMINDERS");
+  return p && *p ? p : REMINDERS;
+}
+static unsigned long reminder_id(const char *s) {
+  unsigned long h = 2166136261u;
+  for (; *s; s++) h = ((h ^ (unsigned char)*s) * 16777619u) & 0xffffffffu;
+  return h;
+}
 static int reminders_due(void) {
-  char *r = read_file(REMINDERS, NULL);
+  char *r = read_file(reminders_path(), NULL);
   if (!r) return 0;
   time_t now = time(NULL);
-  buf_t keep = {0};
-  buf_add(&keep, "", 0);
   int n = 0;
   for (char *l = strtok(r, "\n"); l; l = strtok(NULL, "\n")) {
-    long t = atol(l);
-    char *sp = strchr(l, ' ');
-    if (t > now) {
-      buf_str(&keep, l);
-      buf_str(&keep, "\n");
-    } else if (now - t < 1800) { /* missed by more than 30 min: drop */
-      printf("%s\n", sp && sp[1] ? sp + 1 : "-");
+    char *end;
+    long t = strtol(l, &end, 10);
+    if (end == l || *end != ' ' || t <= 0) continue;
+    if (t <= now && now - t < 1800) {
+      printf("%08lx\t%s\n", reminder_id(l), end[1] ? end + 1 : "-");
       n++;
     }
   }
   free(r);
-  if (keep.n) write_file_atomic(REMINDERS, keep.p, keep.n, 0644);
-  else unlink(REMINDERS);
-  free(keep.p);
   return n;
+}
+static int reminder_ack(const char *id) {
+  if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8) return 1;
+  char *r = read_file(reminders_path(), NULL);
+  if (!r) return 1;
+  buf_t keep = {0};
+  int found = 0;
+  for (char *l = strtok(r, "\n"); l; l = strtok(NULL, "\n")) {
+    char current[9];
+    snprintf(current, sizeof current, "%08lx", reminder_id(l));
+    if (!found && !strcmp(current, id)) { found = 1; continue; }
+    buf_str(&keep, l); buf_str(&keep, "\n");
+  }
+  int rc = found ? write_file_atomic(reminders_path(), keep.p ? keep.p : "", keep.n, 0600) : -1;
+  free(keep.p); free(r);
+  return rc == 0 ? 0 : 1;
 }
 
 static int answer_sequential(const char *q, const char *qdir) {
@@ -2151,6 +2196,12 @@ static int answer_streamed(const char *q, const char *qdir) {
   if (pipe(pfd) != 0) die("pipe");
   long t0 = mono_ms();
   pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    http_close();
+    return answer_sequential(q, qdir);
+  }
   if (pid == 0) {
     close(pfd[0]);
     FILE *out = fdopen(pfd[1], "w");
@@ -2197,7 +2248,7 @@ static int answer_streamed(const char *q, const char *qdir) {
     if (nq == 1) fprintf(stderr, "hk-voice: first sentence ready after %ld ms (gain %.1f dB)\n", mono_ms() - t0, g);
   }
   fclose(in);
-  waitpid(pid, NULL, 0);
+  if (pid > 0) while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
   if (nq == 0) { /* network trouble: say so with a stored prompt */
     snprintf(tmp, sizeof tmp, "%s/q.tmp", qdir);
     if (clip_to_file(tts_svc_err && !net_err ? "ttserr" : "neterr", tmp, g) == 0) {
@@ -2224,7 +2275,10 @@ int main(int argc, char **argv) {
   }
   if (argc >= 5 && !strcmp(argv[1], "feed")) return feed(argv[2], argv[3], argv[4]);
   if (argc >= 3 && !strcmp(argv[1], "feedq")) return feedq(argv[2]);
+  if (argc == 2 && !strcmp(argv[1], "volume-gain")) { printf("%.3f\n", output_gain_db()); return 0; }
+  if (argc == 2 && !strcmp(argv[1], "connected")) return ap2_connected() ? 0 : 1;
   if (argc >= 2 && !strcmp(argv[1], "due")) return reminders_due() ? 0 : 1;
+  if (argc == 3 && !strcmp(argv[1], "ack")) return reminder_ack(argv[2]);
   if (argc >= 3 && !strcmp(argv[1], "classify")) { /* classify <text>... */
     for (int i = 2; i < argc; i++) {
       const char *q = argv[i];

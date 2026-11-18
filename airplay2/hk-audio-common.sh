@@ -105,51 +105,73 @@ audio_lock() {
     _al_limit=${HK_AUDIO_LOCK_TRIES:-55}
     case "$_al_limit" in ''|*[!0-9]*|0) _al_limit=55;; esac
     _al_count=0
+    _al_ownerless=0
     AUDIO_LOCK_WAITED=0
     while ! mkdir "$_al_path" 2>/dev/null; do
         AUDIO_LOCK_WAITED=1
-        if [ -s "$_al_path/owner" ]; then
-            _al_owner=$(audio_control_read "$_al_path/owner") || return 1
-            read -r _al_pid _al_start <<EOF
+        if [ -L "$_al_path/owner" ]; then
+            return 1
+        elif [ -s "$_al_path/owner" ]; then
+            _al_ownerless=0
+            if _al_owner=$(audio_control_read "$_al_path/owner"); then
+                read -r _al_pid _al_start <<EOF
 $_al_owner
 EOF
-            if ! audio_pid_live "$_al_pid" "$_al_start"; then
-                rm -f "$_al_path/owner"
-                rmdir "$_al_path" 2>/dev/null || true
-            fi
-        elif [ "$_al_count" -ge 5 ] &&
-             { [ ! -e "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] ||
-               { [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
-                 [ ! -s "$_al_path/owner" ]; }; }; then
-            # A process killed between mkdir and publishing owner used to
-            # leave a permanent ownerless lock. Give the creator five
-            # scheduling intervals, then remove only temporary owner files
-            # whose writer is gone. A live creator is never disturbed.
-            for _al_tmp in "$_al_path"/owner.tmp.*; do
-                [ -e "$_al_tmp" ] || [ -L "$_al_tmp" ] || continue
-                _al_tmp_name=${_al_tmp##*/}
-                _al_tmp_suffix=${_al_tmp_name#owner.tmp.}
-                _al_tmp_pid=${_al_tmp_suffix%%.*}
-                _al_tmp_start=
-                case "$_al_tmp_suffix" in
-                    *.*) _al_tmp_start=${_al_tmp_suffix#*.};;
-                esac
-                case "$_al_tmp_pid" in
-                    ''|*[!0-9]*) continue;;
-                esac
-                if [ -n "$_al_tmp_start" ]; then
-                    audio_pid_live "$_al_tmp_pid" "$_al_tmp_start" ||
-                        rm -f "$_al_tmp"
-                else
-                    # Backward compatibility for a temp left by an older build.
-                    kill -0 "$_al_tmp_pid" 2>/dev/null || rm -f "$_al_tmp"
+                if ! audio_pid_live "$_al_pid" "$_al_start"; then
+                    rm -f "$_al_path/owner"
+                    rmdir "$_al_path" 2>/dev/null || true
                 fi
-            done
-            if [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
-               [ ! -s "$_al_path/owner" ]; then
-                rm -f "$_al_path/owner"
+            else
+                [ ! -L "$_al_path/owner" ] || return 1
+                continue
             fi
-            rmdir "$_al_path" 2>/dev/null || true
+        elif [ ! -e "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] ||
+             { [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
+               [ ! -s "$_al_path/owner" ]; }; then
+            _al_ownerless=$((_al_ownerless + 1))
+            if [ "$_al_ownerless" -ge 5 ]; then
+                # A process killed between mkdir and publishing owner used to
+                # leave a permanent ownerless lock. Give each new creator five
+                # consecutive ownerless intervals, then remove only temporary
+                # owner files whose writer is gone. A live creator is never
+                # disturbed.
+                _al_live_writer=0
+                for _al_tmp in "$_al_path"/owner.tmp.*; do
+                    [ -e "$_al_tmp" ] || [ -L "$_al_tmp" ] || continue
+                    _al_tmp_name=${_al_tmp##*/}
+                    _al_tmp_suffix=${_al_tmp_name#owner.tmp.}
+                    _al_tmp_pid=${_al_tmp_suffix%%.*}
+                    _al_tmp_start=
+                    case "$_al_tmp_suffix" in
+                        *.*) _al_tmp_start=${_al_tmp_suffix#*.};;
+                    esac
+                    case "$_al_tmp_pid" in
+                        ''|*[!0-9]*) continue;;
+                    esac
+                    if [ -n "$_al_tmp_start" ]; then
+                        if audio_pid_live "$_al_tmp_pid" "$_al_tmp_start"; then
+                            _al_live_writer=1
+                        else
+                            rm -f "$_al_tmp"
+                        fi
+                    else
+                        # Backward compatibility for a temp left by an older build.
+                        if kill -0 "$_al_tmp_pid" 2>/dev/null; then
+                            _al_live_writer=1
+                        else
+                            rm -f "$_al_tmp"
+                        fi
+                    fi
+                done
+                if [ "$_al_live_writer" = 0 ] && [ ! -s "$_al_path/owner" ]; then
+                    if [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
+                       [ ! -s "$_al_path/owner" ]; then
+                        rm -f "$_al_path/owner"
+                    fi
+                    rmdir "$_al_path" 2>/dev/null || true
+                fi
+                _al_ownerless=0
+            fi
         fi
         _al_count=$((_al_count + 1))
         [ "$_al_count" -lt "$_al_limit" ] || return 1

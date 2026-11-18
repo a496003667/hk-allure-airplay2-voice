@@ -1069,6 +1069,42 @@ finally:
         (self.run / 'volume.state').write_text('3 -15.0 -15.0 0\n')
         eventually(lambda: any('VOLUMECHANGE' in x for x in self.events()), timeout=4.0)
 
+    def test_audio_lock_succeeds_across_rapid_concurrent_unlock_edges(self):
+        """Concurrent contenders must not abort when owner disappears mid-read during unlock."""
+        lock_path = self.run / 'contend.lock'
+        worker_script = self.base / 'lock-worker.sh'
+        self._exec_script(worker_script, f'''#!/bin/sh
+set -eu
+. "{COMMON}"
+i=0
+while [ "$i" -lt 15 ]; do
+    audio_lock "{lock_path}"
+    usleep 10000 2>/dev/null || true
+    audio_unlock "{lock_path}"
+    i=$((i + 1))
+done
+''')
+        procs = [
+            subprocess.Popen(['sh', str(worker_script)], env=self.env, stderr=subprocess.PIPE, text=True)
+            for _ in range(4)
+        ]
+        for p in procs:
+            _, err = p.communicate(timeout=15)
+            self.assertEqual(p.returncode, 0, f'audio_lock contender failed on unlock edge: {err}')
+        self.assertFalse(lock_path.exists())
+
+        # Symlink owner inside lock directory must still fail closed immediately
+        lock_path.mkdir()
+        (lock_path / 'owner').symlink_to('/etc/passwd')
+        res = subprocess.run(
+            ['sh', '-c', f'. "{COMMON}"; audio_lock "{lock_path}"'],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        self.assertNotEqual(res.returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -13,6 +13,9 @@ RUN=${HK_AP2_RUN:-/tmp/hk-ap2/run}
 SAFE="$RUN/safe"
 BT_OWNER="$RUN/bt-owner.pid"
 BT_HEARTBEAT="$RUN/bt-heartbeat"
+LEASE_REQUEST="$SAFE/lease.request"
+LEASE_ACK="$SAFE/lease.ack"
+RELEASE_INTENT="$RUN/release-intent"
 HOLD_MUTE=${HK_AP2_HOLD_MUTE_FILE:-/tmp/hk-ap2-hold-mute}
 AP2CTL="$ROOT/bin/hk-ap2ctl"
 AMIXER=${HK_AP2_AMIXER:-/system/workdir/bin/amixer}
@@ -43,12 +46,319 @@ log_action() {
 }
 
 read_file() {
-    [ -f "$1" ] && sed -n '1p' "$1" 2>/dev/null || true
+    audio_control_read "$1" || true
 }
 
 write_file() {
-    printf '%s\n' "$2" >"$1.tmp" 2>/dev/null &&
-        mv "$1.tmp" "$1" 2>/dev/null
+    audio_write_control "$1" "$2"
+}
+
+read_lease_record() {
+    # Parse a complete lease record without requiring its owner process to be
+    # alive. This is used only to classify a failed live validation; it never
+    # authorizes output.
+    lease_record_source=
+    lease_record_pid=
+    lease_record_start=
+    lease_record_token=
+    lease_record_time=
+    lease_record_phase=
+    lease_record_extra=
+    audio_regular_file "$SAFE/lease" && [ -s "$SAFE/lease" ] ||
+        return 1
+    read -r lease_record_source lease_record_pid lease_record_start \
+        lease_record_token lease_record_time lease_record_phase \
+        lease_record_extra <"$SAFE/lease" 2>/dev/null || true
+    [ -z "${lease_record_extra:-}" ] || return 1
+    case "$lease_record_source" in airplay|bluetooth|voice) ;; *) return 1;; esac
+    case "$lease_record_pid:$lease_record_start" in
+        *[!0-9:]*|:*|*:) return 1;;
+    esac
+    case "$lease_record_token" in ''|*[!a-zA-Z0-9:_-]*) return 1;; esac
+    case "$lease_record_time" in ''|*[!0-9]*) return 1;; esac
+    case "$lease_record_phase" in priming|active|draining) ;; *) return 1;; esac
+}
+
+lease_record_matches() {
+    # Compare a freshly parsed raw record with a caller-owned snapshot. This
+    # intentionally does not require the owner process to be alive; it is only
+    # used to avoid deleting a replacement while cleaning up an observed fault.
+    _lrm_source=$1
+    _lrm_pid=$2
+    _lrm_start=$3
+    _lrm_token=$4
+    _lrm_time=$5
+    _lrm_phase=$6
+    read_lease_record || return 1
+    [ "$lease_record_source" = "$_lrm_source" ] &&
+        [ "$lease_record_pid" = "$_lrm_pid" ] &&
+        [ "$lease_record_start" = "$_lrm_start" ] &&
+        [ "$lease_record_token" = "$_lrm_token" ] &&
+        [ "$lease_record_time" = "$_lrm_time" ] &&
+        [ "$lease_record_phase" = "$_lrm_phase" ]
+}
+
+lease_snapshot_current() {
+    audio_read_lease || return 1
+    [ "$lease_source" = "$snapshot_source" ] &&
+        [ "$lease_pid" = "$snapshot_pid" ] &&
+        [ "$lease_start" = "$snapshot_start" ] &&
+        [ "$lease_token" = "$snapshot_token" ] &&
+        [ "$lease_time" = "$snapshot_time" ] &&
+        [ "$lease_phase" = "$snapshot_phase" ] &&
+        [ "$(read_file "$SAFE/play.started")" = "$marker" ]
+}
+
+lease_path_absent() {
+    [ ! -e "$SAFE/lease" ] && [ ! -L "$SAFE/lease" ]
+}
+
+state_lock() {
+    audio_lock "$RUN/speaker.lock" || return 1
+    speaker_lock_held=1
+}
+
+state_unlock() {
+    [ "${speaker_lock_held:-0}" = 1 ] || return 0
+    audio_unlock "$RUN/speaker.lock" 2>/dev/null || return 1
+    speaker_lock_held=0
+}
+
+mute_without_active_generation() {
+    # The no-marker decision is based on an earlier loop sample. Take the
+    # publication lock and re-read both files before changing any gain. Without
+    # this, a new hook could publish a lease after the sample but before the
+    # mute and have its speaker path closed underneath it.
+    # An AirPlay claim is published before the hook waits for Bluetooth to
+    # release the speaker. While that live claim owns the transition, waiting
+    # for speaker.lock here can deadlock against the hook waiting for this
+    # watchdog's exact lease ACK. Defer without opening or muting anything; the
+    # claim is process-bound and bounded to 30 seconds.
+    audio_claim_recent "$RUN/ap2-claim" && return 1
+    state_lock || return 2
+    if audio_marker_present "$SAFE/tripped" ||
+       audio_marker_present "$HOLD_MUTE" ||
+       audio_read_lease || [ -n "$(read_file "$SAFE/play.started")" ]; then
+        state_unlock
+        return 1
+    fi
+    hard_mute
+    if ! audio_claim_recent "$RUN/ap2-claim"; then
+        rm -f "$RUN/ap2-claim"
+    fi
+    # A bridge can be killed after publishing its owner but before its
+    # playback lease. That optional-source failure must not leave a permanent
+    # owner/trip marker that prevents the next Bluetooth connection. A live
+    # bridge with a fresh heartbeat gets to finish its guarded startup.
+    _mwag_bt_pid=$(read_file "$BT_OWNER")
+    if [ -n "$_mwag_bt_pid" ]; then
+        _mwag_bt_beat=$(read_file "$BT_HEARTBEAT")
+        _mwag_bt_now=$(now)
+        _mwag_bt_live=0
+        case "$_mwag_bt_pid:$_mwag_bt_beat:$_mwag_bt_now" in
+            *[!0-9:]*|:*|*:|*::* ) ;;
+            *)
+                if kill -0 "$_mwag_bt_pid" 2>/dev/null &&
+                   [ "$_mwag_bt_beat" -le "$_mwag_bt_now" ] &&
+                   [ $((_mwag_bt_now - _mwag_bt_beat)) -le 4 ]; then
+                    _mwag_bt_live=1
+                fi
+                ;;
+        esac
+        if [ "$_mwag_bt_live" = 0 ]; then
+            rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+            log_action "orphaned Bluetooth owner cleared; hard mute (recoverable)"
+        fi
+    elif [ -e "$RUN/bt-release" ] || [ -L "$RUN/bt-release" ]; then
+        rm -f "$RUN/bt-release"
+        log_action "orphaned Bluetooth release request cleared"
+    fi
+    state_unlock
+    return 0
+}
+
+read_lease_request() {
+    lease_request_token=
+    lease_request_nonce=
+    lease_request_extra=
+    [ -f "$LEASE_REQUEST" ] && [ ! -L "$LEASE_REQUEST" ] || return 1
+    read -r lease_request_token lease_request_nonce lease_request_extra \
+        <"$LEASE_REQUEST" 2>/dev/null || true
+    [ -n "$lease_request_token" ] &&
+        [ -n "$lease_request_nonce" ] &&
+        [ -z "${lease_request_extra:-}" ]
+    case "$lease_request_token:$lease_request_nonce" in
+        *[!a-zA-Z0-9:_-]*|:*|*:) return 1;;
+    esac
+}
+
+read_release_intent() {
+    release_intent_source=
+    release_intent_token=
+    release_intent_time=
+    release_intent_extra=
+    [ -f "$RELEASE_INTENT" ] && [ ! -L "$RELEASE_INTENT" ] || return 1
+    read -r release_intent_source release_intent_token release_intent_time \
+        release_intent_extra <"$RELEASE_INTENT" 2>/dev/null || true
+    case "$release_intent_source" in airplay|bluetooth|voice) ;; *) return 1;; esac
+    [ -n "$release_intent_token" ] && [ -n "$release_intent_time" ] &&
+        [ -z "${release_intent_extra:-}" ] || return 1
+    case "$release_intent_token" in ''|*[!a-zA-Z0-9:_-]*) return 1;; esac
+    case "$release_intent_time" in ''|*[!0-9]*) return 1;; esac
+}
+
+release_intent_matches() {
+    read_release_intent || return 1
+    [ "$release_intent_source" = "$1" ] &&
+        [ "$release_intent_token" = "$2" ] &&
+        [ "$release_intent_time" = "$3" ]
+}
+
+lease_fault_state() {
+    # Returns through _fault_state after comparing an observation with the
+    # current lease generation. A new lease must never be removed or muted by
+    # a watchdog iteration that was still examining the previous source.
+    _fs_source=$1
+    _fs_pid=$2
+    _fs_start=$3
+    _fs_token=$4
+    _fs_time=$5
+    _fs_marker=$6
+    _fs_phase=$7
+    if audio_read_lease; then
+        if [ "$lease_source" = "$_fs_source" ] &&
+           [ "$lease_pid" = "$_fs_pid" ] &&
+           [ "$lease_start" = "$_fs_start" ] &&
+           [ "$lease_token" = "$_fs_token" ] &&
+           [ "$lease_time" = "$_fs_time" ] &&
+           [ "$lease_phase" = "$_fs_phase" ]; then
+            _fault_state=current
+        else
+            _fault_state=changed
+        fi
+        return 0
+    fi
+    _fs_marker_now=$(read_file "$SAFE/play.started")
+    if [ "$_fs_marker_now" != "$_fs_marker" ]; then
+        _fault_state=changed
+    elif release_intent_matches "$_fs_source" "$_fs_token" "$_fs_time"; then
+        _fault_state=release
+    else
+        _fault_state=invalid
+    fi
+}
+
+latch_generation_fault() {
+    # Mute and latch only after taking the same lock used to publish leases.
+    # This closes the race where an old watchdog observation mutes or deletes a
+    # newer source that has already won ownership.
+    _lgf_reason=$1
+    _lgf_source=$2
+    _lgf_pid=$3
+    _lgf_start=$4
+    _lgf_token=$5
+    _lgf_time=$6
+    _lgf_marker=$7
+    _lgf_phase=$8
+    if ! state_lock; then
+        log_action "$_lgf_reason deferred; state lock unavailable"
+        return 2
+    fi
+    if audio_marker_present "$SAFE/tripped" ||
+       audio_marker_present "$HOLD_MUTE"; then
+        state_unlock
+        log_action "$_lgf_reason superseded by maintenance mute"
+        return 3
+    fi
+    lease_fault_state "$_lgf_source" "$_lgf_pid" "$_lgf_start" \
+        "$_lgf_token" "$_lgf_time" "$_lgf_marker" "$_lgf_phase"
+    if [ "$_fault_state" != current ] ||
+       [ "$(read_file "$SAFE/play.started")" != "$_lgf_marker" ]; then
+        state_unlock
+        log_action "$_lgf_reason superseded; no latch"
+        return 3
+    fi
+    if ! write_file "$SAFE/tripped" "$_lgf_reason"; then
+        hard_mute
+        state_unlock
+        log_action "$_lgf_reason latch write failed; hard mute"
+        return 1
+    fi
+    hard_mute
+    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$RELEASE_INTENT"
+    case "$_lgf_source" in
+        bluetooth) rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release";;
+        airplay) rm -f "$RUN/ap2-claim";;
+    esac
+    state_unlock
+    log_action "$_lgf_reason; hard mute"
+    return 0
+}
+
+bt_release_marker_matches_start() {
+    # A successful bridge release removes lease, owner and heartbeat in
+    # separate operations. Only the current Bluetooth generation's explicit
+    # token may bridge that expected interval. The token embeds the bridge's
+    # start time; require it to agree with play.started so an old marker cannot
+    # excuse an unrelated malformed lease.
+    _bm_start=$1
+    case "$_bm_start" in ''|*[!0-9]*) return 1;; esac
+    [ -f "$RUN/bt-wait-pcm" ] && [ ! -L "$RUN/bt-wait-pcm" ] || return 1
+    _bm_marker=$(read_file "$RUN/bt-wait-pcm")
+    case "$_bm_marker" in bt-*) ;; *) return 1;; esac
+    _bm_rest=${_bm_marker#bt-}
+    case "$_bm_rest" in *-*-*) ;; *) return 1;; esac
+    _bm_pid=${_bm_rest%%-*}
+    _bm_rest=${_bm_rest#*-}
+    _bm_time=${_bm_rest%%-*}
+    _bm_seq=${_bm_rest#*-}
+    case "$_bm_pid:$_bm_time:$_bm_seq" in
+        *[!0-9:]*|:*|*:|*::* ) return 1;;
+    esac
+    read_release_intent || return 1
+    [ "$release_intent_source" = bluetooth ] &&
+        [ "$release_intent_token" = "$_bm_marker" ] &&
+        [ "$release_intent_time" = "$_bm_start" ] || return 1
+    [ "$_bm_time" -le "$_bm_start" ] &&
+        [ $((_bm_start - _bm_time)) -le 2 ] || return 1
+    if [ -s "$BT_OWNER" ]; then
+        [ "$(read_file "$BT_OWNER")" = "$_bm_pid" ] &&
+            kill -0 "$_bm_pid" 2>/dev/null
+    fi
+}
+
+lease_ack_ready() {
+    _la_marker=$1
+    ! audio_marker_present "$SAFE/tripped" &&
+        ! audio_marker_present "$HOLD_MUTE" || return 1
+    [ -n "$_la_marker" ] && [ -s "$SAFE/lease" ] || return 1
+    audio_read_lease || return 1
+    [ "$_la_marker" = "$lease_time" ] || return 1
+    [ "$lease_phase" != draining ] || return 1
+    read_lease_request || return 1
+    [ "$lease_request_token" = "$lease_token" ] || return 1
+    case "$lease_source" in
+        bluetooth) audio_bt_bridge_live ;;
+        airplay)
+            [ "$(read_file "$RUN/shairport.pid")" = "$lease_pid" ]
+            ;;
+        voice) audio_voice_generation_valid ;;
+        *) false ;;
+    esac
+}
+
+write_lease_ack() {
+    # Revalidate the exact generation and nonce immediately before publishing
+    # the ACK. A lease replacement between sampling and writing must not let an
+    # old watchdog iteration authorize the new owner.
+    _wa_marker=$1
+    _wa_token=$2
+    _wa_nonce=$3
+    lease_ack_ready "$_wa_marker" || return 1
+    [ "$lease_token" = "$_wa_token" ] &&
+        [ "$lease_request_nonce" = "$_wa_nonce" ] || return 1
+    write_file "$LEASE_ACK" "$_wa_token $_wa_nonce"
 }
 
 mixer_set() {
@@ -103,17 +413,11 @@ safe_baseline() {
 }
 
 watchdog_pid() {
-    read_file "$SAFE/watchdog.pid"
+    audio_watchdog_pid
 }
 
 watchdog_alive() {
-    pid=$(watchdog_pid)
-    [ -n "$pid" ] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
-    heartbeat=$(read_file "$SAFE/watchdog.heartbeat")
-    [ -n "$heartbeat" ] || return 1
-    current=$(now)
-    [ $((current - heartbeat)) -le 4 ]
+    audio_watchdog_live
 }
 
 wait_watchdog_ready() {
@@ -134,7 +438,9 @@ start_watchdog() {
         return 1
     fi
 
-    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat" "$SAFE/deadline"
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.identity" \
+        "$SAFE/watchdog.heartbeat" "$SAFE/deadline" \
+        "$LEASE_REQUEST" "$LEASE_ACK" "$RELEASE_INTENT"
     : >"$SAFE/watchdog.log"
     nohup setsid "$0" __watchdog </dev/null >>"$SAFE/watchdog.log" 2>&1 &
     if ! wait_watchdog_ready; then
@@ -150,59 +456,493 @@ stop_watchdog() {
     [ -n "$pid" ] || return 0
     kill -TERM "$pid" 2>/dev/null || true
     tries=0
-    while [ "$tries" -lt 8 ]; do
+    while [ "$tries" -lt 20 ]; do
         kill -0 "$pid" 2>/dev/null || break
-        sleep 1
+        audio_delay 100000
         tries=$((tries + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
+        tries=0
+        while [ "$tries" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+            audio_delay 100000
+            tries=$((tries + 1))
+        done
     fi
-    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat"
+    wait "$pid" 2>/dev/null || true
+    _sw_identity=$(read_file "$SAFE/watchdog.identity")
+    read -r _sw_identity_pid _sw_identity_extra <<EOF
+$_sw_identity
+EOF
+    if [ "$_sw_identity_pid" = "$pid" ] && [ -z "${_sw_identity_extra:-}" ]; then
+        rm -f "$SAFE/watchdog.identity"
+    fi
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat" \
+        "$LEASE_REQUEST" "$LEASE_ACK" "$RELEASE_INTENT"
 }
 
 watchdog_loop() {
-    printf '%s\n' "$$" >"$SAFE/watchdog.pid"
+    speaker_lock_held=0
+    watchdog_lock_held=0
+    watchdog_self_pid=
+    watchdog_self_start=
+    watchdog_self_identity=
+    watchdog_cleanup() {
+        trap - EXIT HUP INT TERM
+        # A signal can arrive while latch_generation_fault owns the speaker
+        # publication lock. Release both locks before removing this
+        # generation's identity. Otherwise the old heartbeat and lock survive
+        # a controlled receiver stop and block the next Bluetooth start.
+        state_unlock 2>/dev/null || true
+        if [ "${watchdog_lock_held:-0}" = 1 ]; then
+            audio_unlock "$SAFE/watchdog.lock" 2>/dev/null || true
+            watchdog_lock_held=0
+        fi
+        if [ -n "${watchdog_self_identity:-}" ] &&
+           [ "$(read_file "$SAFE/watchdog.identity")" = "$watchdog_self_identity" ]; then
+            rm -f "$SAFE/watchdog.identity" "$SAFE/watchdog.pid" \
+                "$SAFE/watchdog.heartbeat"
+        fi
+    }
+    trap 'watchdog_cleanup' 0
+    trap 'exit 0' HUP INT TERM
+    if ! audio_lock "$SAFE/watchdog.lock"; then
+        printf '%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date) duplicate watchdog refused pid=$$" \
+            >>"$SAFE/watchdog.log" 2>/dev/null || true
+        exit 1
+    fi
+    watchdog_lock_held=1
+    audio_set_self || exit 1
+    watchdog_self_pid=$AUDIO_SELF_PID
+    watchdog_self_start=$(audio_pid_start "$watchdog_self_pid") || exit 1
+    watchdog_self_identity="$watchdog_self_pid $watchdog_self_start"
+    write_file "$SAFE/watchdog.identity" "$watchdog_self_identity" || exit 1
+    write_file "$SAFE/watchdog.pid" "$$" || exit 1
     echo "$WATCHDOG_OOM_SCORE_ADJ" >"/proc/$$/oom_score_adj" 2>/dev/null || true
-    printf '%s\n' "$(now)" >"$SAFE/watchdog.heartbeat"
+    write_file "$SAFE/watchdog.heartbeat" "$(now)" || exit 1
     log_action "watchdog loop started pid=$$"
 
     deadline=
     last_marker=
-    while [ -f "$SAFE/armed" ]; do
+    last_ack_nonce=
+    while audio_regular_file "$SAFE/armed"; do
         current=$(now)
-        printf '%s\n' "$current" >"$SAFE/watchdog.heartbeat.tmp" 2>/dev/null &&
-            mv "$SAFE/watchdog.heartbeat.tmp" "$SAFE/watchdog.heartbeat" 2>/dev/null || true
+        write_file "$SAFE/watchdog.heartbeat" "$current" || true
 
         marker=$(read_file "$SAFE/play.started")
-        if [ -f "$HOLD_MUTE" ]; then
+        record_valid=0
+        lease_record_source=
+        lease_record_pid=
+        lease_record_start=
+        lease_record_token=
+        lease_record_time=
+        lease_record_phase=
+        if read_lease_record; then record_valid=1; fi
+        lease_valid=0
+        lease_source=
+        lease_pid=
+        lease_start=
+        lease_token=
+        lease_time=
+        lease_phase=
+        snapshot_source=
+        snapshot_pid=
+        snapshot_start=
+        snapshot_token=
+        snapshot_time=
+        snapshot_phase=
+        if audio_read_lease; then
+            lease_valid=1
+            snapshot_source=$lease_source
+            snapshot_pid=$lease_pid
+            snapshot_start=$lease_start
+            snapshot_token=$lease_token
+            snapshot_time=$lease_time
+            snapshot_phase=$lease_phase
+        fi
+        if audio_marker_present "$HOLD_MUTE"; then
             write_file "$SAFE/tripped" "manual mute" || true
         fi
-        if [ -f "$SAFE/tripped" ]; then
-            hard_mute
+        if audio_marker_present "$SAFE/tripped"; then
+            # The maintenance owner can clear the trip while this iteration
+            # is in flight. Recheck under the publication lock so a fresh
+            # source is never deleted merely because the loop sampled an old
+            # trip file.
+            if state_lock; then
+                if audio_marker_present "$SAFE/tripped" ||
+                   audio_marker_present "$HOLD_MUTE"; then
+                    hard_mute
+                    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                        "$SAFE/lease" "$RELEASE_INTENT"
+                fi
+                state_unlock
+            else
+                hard_mute
+            fi
             sleep 1
             continue
         fi
 
-        if [ -n "$marker" ] && ! audio_read_lease; then
+        if [ "$lease_valid" = 1 ] && [ "$lease_phase" = draining ]; then
+            # stop/mute marks the lease draining before it can be killed during
+            # the physical mute. Recover only that same generation after taking
+            # the same lock used to publish leases, so a replacement can never
+            # be deleted by this observation.
+            if state_lock; then
+                if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                       "$snapshot_start" "$snapshot_token" "$snapshot_time" draining; then
+                    hard_mute
+                    if [ "$snapshot_source" = bluetooth ]; then
+                        write_file "$RUN/bt-wait-pcm" "$snapshot_token" || true
+                    fi
+                    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                        "$SAFE/lease" "$RELEASE_INTENT"
+                    case "$snapshot_source" in
+                        bluetooth) rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release";;
+                        airplay) rm -f "$RUN/ap2-claim";;
+                    esac
+                    log_action "draining source recovered; hard mute (recoverable)"
+                else
+                    log_action "draining lease changed during recovery; no latch"
+                fi
+                state_unlock
+            else
+                log_action "draining lease recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
+            sleep 1
+            continue
+        fi
+
+        if [ "$record_valid" = 1 ] && [ "$lease_record_phase" = priming ] &&
+           [ $((current - lease_record_time)) -ge 12 ]; then
+            # A killed start can leave a valid-looking priming lease for the
+            # full 12-second grace period. Once that grace expires, close the
+            # path and discard only the exact generation; this is an expected
+            # interrupted-start recovery, not a global fault.
+            if state_lock; then
+                marker_now=$(read_file "$SAFE/play.started")
+                if [ "$marker_now" = "$marker" ] &&
+                   lease_record_matches "$lease_record_source" "$lease_record_pid" \
+                       "$lease_record_start" "$lease_record_token" \
+                       "$lease_record_time" priming; then
+                    hard_mute
+                    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                        "$SAFE/lease" "$RELEASE_INTENT"
+                    case "$lease_record_source" in
+                        bluetooth)
+                            write_file "$RUN/bt-wait-pcm" "$lease_record_token" || true
+                            rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                            ;;
+                        airplay) rm -f "$RUN/ap2-claim";;
+                    esac
+                    log_action "stale priming lease cleared; hard mute (recoverable)"
+                else
+                    log_action "priming lease changed during recovery; no latch"
+                fi
+                state_unlock
+            else
+                log_action "priming lease recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
+            sleep 1
+            continue
+        fi
+
+        # A heartbeat alone can be stale: it is written before this iteration
+        # reads the lease. Acknowledge the exact lease token and this start's
+        # nonce only after source ownership is valid. This also covers a
+        # reopen that reuses the token of the same Bluetooth bridge.
+        if lease_ack_ready "$marker"; then
+            ack_nonce=$lease_request_nonce
+            ack_token=$lease_token
+            if write_lease_ack "$marker" "$ack_token" "$ack_nonce"; then
+                if [ "$ack_nonce" != "${last_ack_nonce:-}" ]; then
+                    # A reopen can reuse a lease token and whole-second start
+                    # marker. The per-start nonce is the new generation edge.
+                    last_marker=
+                    last_ack_nonce=$ack_nonce
+                fi
+            else
+                rm -f "$LEASE_ACK"
+            fi
+        else
+            rm -f "$LEASE_ACK"
+        fi
+
+        if [ -n "$marker" ] && [ "$lease_valid" = 0 ]; then
             # Loss of an optional AirPlay owner closes its lease, not the
             # user's global manual-mute latch. A fresh session still needs
             # the complete guarded start sequence after AP2 recovery.
-            if [ "${lease_source:-}" = airplay ] &&
-               ! audio_pid_live "${lease_pid:-}" "${lease_start:-}"; then
-                hard_mute
-                rm -f "$SAFE/play.started" "$SAFE/lease"
-                log_action "AP2 stream process ended; hard mute (recoverable)"
+            marker_now=$(read_file "$SAFE/play.started")
+            if [ "$marker_now" != "$marker" ]; then
+                # The hook removes play.started before the lease. Seeing that
+                # exact transition means normal release, not a corrupt lease.
+                if audio_read_lease; then
+                    log_action "lease changed during release observation; previous observation discarded"
+                    sleep 1
+                    continue
+                fi
+                if state_lock; then
+                    marker_now=$(read_file "$SAFE/play.started")
+                    if audio_read_lease || [ "$marker_now" = "$marker" ]; then
+                        state_unlock
+                        log_action "release observation superseded; no cleanup"
+                        sleep 1
+                        continue
+                    fi
+                    hard_mute
+                    rm -f "$LEASE_REQUEST" "$LEASE_ACK"
+                    if [ "$lease_record_source" = airplay ] ||
+                       { read_release_intent && [ "$release_intent_source" = airplay ]; }; then
+                        rm -f "$RUN/ap2-claim"
+                    fi
+                    state_unlock
+                    log_action "source release completed; hard mute (recoverable)"
+                else
+                    log_action "source release cleanup deferred; lock unavailable"
+                fi
+                sleep 1
+                continue
+            fi
+            if audio_read_lease; then
+                # A new generation won the race after the failed sample. Its
+                # next iteration will validate and acknowledge it normally.
+                log_action "lease changed during validation; previous observation discarded"
+                sleep 1
+                continue
+            fi
+            if read_release_intent && [ "$release_intent_time" = "$marker" ]; then
+                if state_lock; then
+                    if lease_path_absent &&
+                       read_release_intent && [ "$release_intent_time" = "$marker" ] &&
+                       [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
+                        hard_mute
+                        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                            "$SAFE/lease" "$RUN/ap2-claim"
+                        log_action "source release in progress; hard mute (recoverable)"
+                    else
+                        log_action "source release observation superseded; no cleanup"
+                    fi
+                    state_unlock
+                else
+                    log_action "source release recovery deferred; lock unavailable"
+                fi
+                sleep 1
+                continue
+            fi
+            if [ "$record_valid" = 1 ] &&
+               [ "$lease_record_source" = airplay ] &&
+               [ "$lease_record_time" = "$marker" ] &&
+               ! audio_pid_live "$lease_record_pid" "$lease_record_start"; then
+                if state_lock; then
+                    if lease_record_matches "$lease_record_source" "$lease_record_pid" \
+                           "$lease_record_start" "$lease_record_token" \
+                           "$lease_record_time" "$lease_record_phase" &&
+                       ! audio_pid_live "$lease_record_pid" "$lease_record_start" &&
+                       [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
+                        hard_mute
+                        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                            "$SAFE/lease" "$RUN/ap2-claim"
+                        log_action "AP2 stream process ended; hard mute (recoverable)"
+                    else
+                        log_action "AP2 owner release observation superseded; no latch"
+                    fi
+                    state_unlock
+                else
+                    log_action "AP2 owner recovery deferred; lock unavailable"
+                fi
+                sleep 1
+                continue
+            fi
+            case "$lease_record_source" in
+                ''|bluetooth) lease_may_release=1 ;;
+                *) lease_may_release=0 ;;
+            esac
+            if [ "$lease_may_release" = 1 ] &&
+               bt_release_marker_matches_start "$marker"; then
+                # The bridge publishes its current token before its serialized
+                # stop. During that expected interval lease and owner can be
+                # absent separately, but an old token must never excuse an
+                # AirPlay/voice fault.
+                if state_lock; then
+                    if ! audio_read_lease &&
+                       bt_release_marker_matches_start "$marker" &&
+                       [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
+                        hard_mute
+                        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                            "$SAFE/lease" "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                        log_action "Bluetooth release in progress; hard mute (recoverable)"
+                    else
+                        log_action "Bluetooth release observation superseded; no cleanup"
+                    fi
+                    state_unlock
+                else
+                    log_action "Bluetooth release recovery deferred; lock unavailable"
+                fi
                 sleep 1
                 continue
             fi
             lease_error="invalid playback lease"
-            if [ -f "$BT_OWNER" ]; then lease_error="Bluetooth bridge lost"; fi
-            write_file "$SAFE/tripped" "$lease_error" || true
-            hard_mute
-            rm -f "$SAFE/play.started" "$SAFE/lease"
-            if [ "$lease_error" = "Bluetooth bridge lost" ]; then rm -f "$BT_OWNER" "$BT_HEARTBEAT"; fi
-            log_action "$lease_error; hard mute"
+            if { [ "$record_valid" = 1 ] &&
+                 [ "$lease_record_source" = bluetooth ]; } ||
+               [ -f "$BT_OWNER" ]; then
+                lease_error="Bluetooth bridge lost"
+            fi
+            if state_lock; then
+                if audio_read_lease; then
+                    state_unlock
+                    log_action "lease changed before fault latch; previous observation discarded"
+                    sleep 1
+                    continue
+                fi
+                if [ "$(read_file "$SAFE/play.started")" != "$marker" ]; then
+                    state_unlock
+                    log_action "lease release won before fault latch; no latch"
+                    sleep 1
+                    continue
+                fi
+                hard_mute
+                write_file "$SAFE/tripped" "$lease_error" || true
+                rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease"
+                if [ "$lease_error" = "Bluetooth bridge lost" ]; then
+                    rm -f "$BT_OWNER" "$BT_HEARTBEAT"
+                fi
+                state_unlock
+                log_action "$lease_error; hard mute"
+            else
+                log_action "invalid lease latch deferred; lock unavailable"
+            fi
+            sleep 1
+            continue
+        fi
+
+        if [ -z "$marker" ] && [ "$record_valid" = 1 ] &&
+           [ "$lease_record_source" = airplay ] &&
+           ! audio_pid_live "$lease_record_pid" "$lease_record_start"; then
+            # The owner can also exit between publishing its lease and its
+            # play.started marker. That is a recoverable optional-source exit.
+            if state_lock; then
+                if lease_record_matches "$lease_record_source" "$lease_record_pid" \
+                       "$lease_record_start" "$lease_record_token" \
+                       "$lease_record_time" "$lease_record_phase" &&
+                   ! audio_pid_live "$lease_record_pid" "$lease_record_start" &&
+                   [ -z "$(read_file "$SAFE/play.started")" ]; then
+                    hard_mute
+                    rm -f "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease" "$RELEASE_INTENT"
+                    rm -f "$RUN/ap2-claim"
+                    log_action "AP2 stream process ended; hard mute (recoverable)"
+                else
+                    log_action "AP2 owner release observation superseded; no latch"
+                fi
+                state_unlock
+            else
+                log_action "AP2 owner recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
+            sleep 1
+            continue
+        fi
+
+        if [ -z "$marker" ] && [ "$lease_valid" = 1 ] &&
+           release_intent_matches "$snapshot_source" "$snapshot_token" "$snapshot_time"; then
+            # clear_play_lease removes play.started before the lease. If the
+            # owner is killed in that narrow interval, finish only for the
+            # exact generation that published the release intent.
+            if state_lock; then
+                if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                       "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                       "$snapshot_phase" &&
+                   release_intent_matches "$snapshot_source" "$snapshot_token" \
+                       "$snapshot_time" &&
+                   [ -z "$(read_file "$SAFE/play.started")" ]; then
+                    hard_mute
+                    rm -f "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease" "$RELEASE_INTENT"
+                    rm -f "$RUN/ap2-claim"
+                    log_action "source release in progress; hard mute (recoverable)"
+                else
+                    log_action "source release observation superseded; no cleanup"
+                fi
+                state_unlock
+            else
+                log_action "source release recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
+            sleep 1
+            continue
+        fi
+
+        if [ -z "$marker" ] && [ "$lease_valid" = 1 ]; then
+            # play.started is the authoritative audible-generation marker. Both
+            # the hook and bridge publish it while holding speaker.lock. If a
+            # valid lease survives without that marker and without release
+            # intent, the owner died at a commit boundary; close output and
+            # discard only that exact generation.
+            if state_lock; then
+                if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                       "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                       "$snapshot_phase" &&
+                   [ ! -e "$SAFE/play.started" ] &&
+                   [ ! -L "$SAFE/play.started" ]; then
+                    hard_mute
+                    rm -f "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease" "$RELEASE_INTENT"
+                    case "$snapshot_source" in
+                        airplay) rm -f "$RUN/ap2-claim";;
+                        bluetooth)
+                            write_file "$RUN/bt-wait-pcm" "$snapshot_token" || true
+                            rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                            ;;
+                    esac
+                    log_action "orphaned lease without play marker recovered; hard mute (recoverable)"
+                else
+                    log_action "orphaned lease observation superseded; no cleanup"
+                fi
+                state_unlock
+            else
+                log_action "orphaned lease recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
+            sleep 1
+            continue
+        fi
+
+        wait_marker=$(read_file "$RUN/bt-wait-pcm")
+        if [ "$lease_valid" = 1 ] && [ "$lease_source" = bluetooth ] &&
+           [ ! -e "$BT_OWNER" ] && [ "$wait_marker" = "$lease_token" ]; then
+            # The bridge removes owner/heartbeat after its serialized stop.
+            # If the watchdog samples that narrow interval first, discard the
+            # exact completed generation instead of falling through as an AP2
+            # lease or waiting for the priming timeout.
+            if state_lock; then
+                if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                       "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                       "$snapshot_phase" &&
+                   [ ! -e "$BT_OWNER" ] &&
+                   [ "$(read_file "$RUN/bt-wait-pcm")" = "$snapshot_token" ]; then
+                    hard_mute
+                    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                        "$SAFE/lease" "$BT_HEARTBEAT" "$RUN/bt-release"
+                    log_action "Bluetooth release in progress; hard mute (recoverable)"
+                else
+                    log_action "Bluetooth release observation superseded; no cleanup"
+                fi
+                state_unlock
+            else
+                log_action "Bluetooth release recovery deferred; lock unavailable"
+            fi
+            deadline=
+            last_marker=
+            last_ack_nonce=
             sleep 1
             continue
         fi
@@ -228,18 +968,166 @@ watchdog_loop() {
                     [ $((bt_current - bt_heartbeat)) -le 4 ] || bt_valid=0
             fi
             if [ "$bt_valid" = 0 ] && [ ! -f "$BT_OWNER" ] &&
-               [ ! -s "$SAFE/play.started" ]; then
+               ! audio_play_marker_live; then
                 # A normal release removes the lease, owner and heartbeat.
                 # The owner may disappear after our initial existence check.
                 bt_valid=1
             fi
-            if [ "$bt_valid" = 0 ]; then
-                write_file "$SAFE/tripped" "Bluetooth bridge lost" || true
-                hard_mute
-                rm -f "$SAFE/play.started" "$BT_OWNER" "$BT_HEARTBEAT"
+            if [ "$bt_valid" = 0 ] && [ "$lease_valid" = 1 ] &&
+               [ "$lease_source" = bluetooth ] &&
+               [ "$(read_file "$BT_OWNER")" = "$lease_pid" ] &&
+               audio_pid_live "$lease_pid" "$lease_start" &&
+               { [ "$wait_marker" = "$lease_token" ] ||
+                 case "$wait_marker" in
+                     backend-*|write-backpressure) true ;;
+                     *) false ;;
+                 esac; }; then
+                # A normal stop can make the bridge heartbeat transiently
+                # stale while its serialized stop hook is still running. The
+                # exact current token (or a backend resync reason) proves that
+                # release intent; an old marker or another source cannot.
+                if state_lock; then
+                    if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                           "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                           "$snapshot_phase" &&
+                       [ "$(read_file "$BT_OWNER")" = "$snapshot_pid" ] &&
+                       { [ "$(read_file "$RUN/bt-wait-pcm")" = "$snapshot_token" ] ||
+                         case "$(read_file "$RUN/bt-wait-pcm")" in
+                             backend-*|write-backpressure) true;;
+                             *) false;;
+                         esac; }; then
+                        hard_mute
+                        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                            "$SAFE/lease" "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                        log_action "Bluetooth release in progress; hard mute (recoverable)"
+                    else
+                        log_action "Bluetooth release observation superseded; no cleanup"
+                    fi
+                    state_unlock
+                else
+                    log_action "Bluetooth release recovery deferred; lock unavailable"
+                fi
                 deadline=
                 last_marker=
-                log_action "Bluetooth bridge lost; hard mute pid=$bt_pid heartbeat=$bt_heartbeat now=${bt_current:-unknown}"
+                last_ack_nonce=
+                sleep 1
+                continue
+            fi
+            if [ "$bt_valid" = 0 ]; then
+                lease_fault_state "$snapshot_source" "$snapshot_pid" \
+                    "$snapshot_start" "$snapshot_token" "$snapshot_time" "$marker" \
+                    "$snapshot_phase"
+                case "$_fault_state" in
+                    release)
+                        if state_lock; then
+                            if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                                   "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                                   "$snapshot_phase" &&
+                               release_intent_matches "$snapshot_source" \
+                                   "$snapshot_token" "$snapshot_time"; then
+                                hard_mute
+                                rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                                    "$SAFE/lease" "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                                log_action "Bluetooth release in progress; hard mute (recoverable)"
+                            else
+                                log_action "Bluetooth release observation superseded; no cleanup"
+                            fi
+                            state_unlock
+                        else
+                            log_action "Bluetooth release recovery deferred; lock unavailable"
+                        fi
+                        sleep 1
+                        continue
+                        ;;
+                    changed)
+                        log_action "Bluetooth lease changed during bridge validation; no latch"
+                        sleep 1
+                        continue
+                        ;;
+                esac
+                if [ "$_fault_state" = current ]; then
+                    audio_delay 100000
+                    if audio_bt_bridge_live; then
+                        log_action "Bluetooth bridge heartbeat recovered before latch"
+                        sleep 1
+                        continue
+                    fi
+                    bt_pid_now=$(read_file "$BT_OWNER")
+                    if [ -z "$bt_pid_now" ]; then
+                        if state_lock; then
+                            if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                                   "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                                   "$snapshot_phase"; then
+                                hard_mute
+                                rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                                    "$SAFE/lease" "$BT_HEARTBEAT" "$RUN/bt-release"
+                                log_action "Bluetooth owner completed release; hard mute (recoverable)"
+                            else
+                                log_action "Bluetooth owner release superseded; no cleanup"
+                            fi
+                            state_unlock
+                        else
+                            log_action "Bluetooth owner release deferred; lock unavailable"
+                        fi
+                        sleep 1
+                        continue
+                    fi
+                fi
+                if [ "$_fault_state" = invalid ] &&
+                   ! audio_read_lease && ! audio_play_marker_live; then
+                    bt_pid_now=$(read_file "$BT_OWNER")
+                    # A bridge killed between owner publication and lease
+                    # publication has not authorized any audio. Reclaim that
+                    # exact optional-source startup instead of leaving a
+                    # global trip that also wedges the next phone connection.
+                    if state_lock; then
+                        if ! audio_read_lease && ! audio_play_marker_live &&
+                           ! audio_bt_bridge_live &&
+                           [ "$(read_file "$BT_OWNER")" = "$bt_pid_now" ]; then
+                            hard_mute
+                            rm -f "$BT_OWNER" "$BT_HEARTBEAT" "$RUN/bt-release"
+                            log_action "orphaned Bluetooth owner cleared; hard mute (recoverable)"
+                        else
+                            log_action "Bluetooth owner recovery superseded; no cleanup"
+                        fi
+                        state_unlock
+                    else
+                        log_action "Bluetooth owner recovery deferred; lock unavailable"
+                    fi
+                    deadline=
+                    last_marker=
+                    last_ack_nonce=
+                    sleep 1
+                    continue
+                fi
+                if state_lock; then
+                    lease_fault_state "$snapshot_source" "$snapshot_pid" \
+                        "$snapshot_start" "$snapshot_token" "$snapshot_time" "$marker" \
+                        "$snapshot_phase"
+                    if [ "$_fault_state" = changed ]; then
+                        state_unlock
+                        log_action "Bluetooth fault superseded by a new lease; no latch"
+                        sleep 1
+                        continue
+                    fi
+                    if audio_bt_bridge_live; then
+                        state_unlock
+                        log_action "Bluetooth bridge recovered under the state lock; no latch"
+                        sleep 1
+                        continue
+                    fi
+                    hard_mute
+                    write_file "$SAFE/tripped" "Bluetooth bridge lost" || true
+                    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                        "$BT_OWNER" "$BT_HEARTBEAT"
+                    state_unlock
+                    log_action "Bluetooth bridge lost; hard mute pid=$bt_pid heartbeat=$bt_heartbeat now=${bt_current:-unknown}"
+                else
+                    log_action "Bluetooth bridge loss latch deferred; lock unavailable"
+                fi
+                deadline=
+                last_marker=
+                last_ack_nonce=
                 sleep 1
                 continue
             fi
@@ -259,23 +1147,50 @@ watchdog_loop() {
         fi
 
         if [ -n "$deadline" ] && [ "$current" -ge "$deadline" ]; then
-            write_file "$SAFE/tripped" "watchdog deadline exceeded" || true
-            hard_mute
-            rm -f "$SAFE/play.started"
-            log_action "watchdog tripped: hard mute"
+            latch_generation_fault "watchdog deadline exceeded" \
+                "$snapshot_source" "$snapshot_pid" "$snapshot_start" \
+                "$snapshot_token" "$snapshot_time" "$marker" "$snapshot_phase"
+            latch_rc=$?
+            if [ "$latch_rc" = 2 ]; then
+                sleep 1
+                continue
+            fi
+            if [ "$latch_rc" != 0 ]; then
+                deadline=
+                last_marker=
+                last_ack_nonce=
+                rm -f "$SAFE/deadline"
+                log_action "playback deadline observation superseded; no latch"
+                sleep 1
+                continue
+            fi
             deadline=
+            last_marker=
+            last_ack_nonce=
+            rm -f "$SAFE/deadline"
+            sleep 1
+            continue
+        fi
+
+        if { [ -n "$marker" ] || [ "$lease_valid" = 1 ]; } &&
+           ! lease_snapshot_current; then
+            log_action "lease changed after watchdog snapshot; previous observation discarded"
+            deadline=
+            last_marker=
+            last_ack_nonce=
             sleep 1
             continue
         fi
 
         if [ -z "$marker" ]; then
-            # No active playback lease: keep the output path physically muted.
-            mixer_set "Ext Spk" off || true
-            mixer_set "Digital" off || true
-            mixer_set "aml audio i2s mute" on || true
-            mixer_set "Master" 0 || true
+            # This branch was sampled before a new owner may have published its
+            # marker and lease. Re-read while holding the same lock used to
+            # publish a generation. A heartbeat-only check used to race here
+            # and silently closed a newly acquired Bluetooth/AirPlay path.
+            mute_without_active_generation || true
             deadline=
             last_marker=
+            last_ack_nonce=
         else
             # A Bluetooth lease does not belong to Shairport.  LMK may recycle
             # the optional AirPlay process while Bluetooth continues playing;
@@ -283,11 +1198,26 @@ watchdog_loop() {
             if [ "$lease_source" = airplay ]; then
                 shairport_pid=$(read_file "$RUN/shairport.pid")
                 if [ -z "$shairport_pid" ] || ! kill -0 "$shairport_pid" 2>/dev/null; then
-                    hard_mute
-                    rm -f "$SAFE/play.started"
+                    if state_lock; then
+                        if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                               "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                               "$snapshot_phase" &&
+                           ! audio_pid_live "$snapshot_pid" "$snapshot_start" &&
+                           [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
+                            hard_mute
+                            rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+                                "$SAFE/lease"
+                            log_action "AP2 stream process ended; hard mute (recoverable)"
+                        else
+                            log_action "AP2 process exit observation superseded; no cleanup"
+                        fi
+                        state_unlock
+                    else
+                        log_action "AP2 process exit recovery deferred; lock unavailable"
+                    fi
                     deadline=
                     last_marker=
-                    log_action "AP2 stream process ended; hard mute"
+                    last_ack_nonce=
                     sleep 1
                     continue
                 fi
@@ -308,7 +1238,7 @@ watchdog_loop() {
                     # Source stop and lease replacement can race this sample.
                     # Re-read before acting on a previous generation's PCM.
                     if ! audio_read_lease; then
-                        hard_mute
+                        mute_without_active_generation || true
                         sleep 1
                         continue
                     fi
@@ -322,18 +1252,26 @@ watchdog_loop() {
                         # Revoke through the bridge's serialized stop hook.
                         # The physical path closes immediately; the next
                         # manual stream must earn a new lease and full guard.
-                        if ! write_file "$RUN/bt-wait-pcm" "$clock_token"; then
-                            write_file "$SAFE/tripped" "Bluetooth recovery marker failed" || true
+                        if state_lock; then
+                            if lease_snapshot_current &&
+                               audio_bt_bridge_live && audio_bt_clock_stopped; then
+                                if ! write_file "$RUN/bt-wait-pcm" "$clock_token"; then
+                                    write_file "$SAFE/tripped" "Bluetooth recovery marker failed" || true
+                                fi
+                                hard_mute
+                                log_action "Bluetooth PCM stopped; hard mute, awaiting a fresh clock"
+                            else
+                                log_action "Bluetooth clock-stop observation superseded; no mute"
+                            fi
+                            state_unlock
                         fi
-                        hard_mute
-                        log_action "Bluetooth PCM stopped; hard mute, awaiting a fresh clock"
                         sleep 1
                         continue
                     fi
                     # A brief underrun may already have recovered. Preserve
                     # protection without latching a fault from an old sample.
                     if ! audio_read_lease; then
-                        hard_mute
+                        mute_without_active_generation || true
                         sleep 1
                         continue
                     fi
@@ -345,18 +1283,128 @@ watchdog_loop() {
                     audio_bt_valid && pcm_ok=1
                 fi
                 if [ "$pcm_ok" = 0 ]; then
-                    write_file "$SAFE/tripped" "PCM owner or clock lost" || true
-                    hard_mute
-                    rm -f "$SAFE/play.started" "$SAFE/lease"
-                    log_action "PCM owner or clock lost; hard mute"
+                    if [ "$snapshot_source" = airplay ] &&
+                       ! audio_pid_live "$snapshot_pid" "$snapshot_start"; then
+                        if state_lock; then
+                            if lease_record_matches "$snapshot_source" "$snapshot_pid" \
+                                   "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                                   "$snapshot_phase" &&
+                               ! audio_pid_live "$snapshot_pid" "$snapshot_start" &&
+                               [ "$(read_file "$SAFE/play.started")" = "$marker" ]; then
+                                hard_mute
+                                rm -f "$SAFE/play.started" "$LEASE_REQUEST" \
+                                    "$LEASE_ACK" "$SAFE/lease"
+                                log_action "AP2 stream process ended; hard mute (recoverable)"
+                            else
+                                log_action "AP2 clock-exit observation superseded; no cleanup"
+                            fi
+                            state_unlock
+                        else
+                            log_action "AP2 process exit recovery deferred; lock unavailable"
+                        fi
+                        sleep 1
+                        continue
+                    fi
+                    lease_fault_state "$snapshot_source" "$snapshot_pid" \
+                        "$snapshot_start" "$snapshot_token" "$snapshot_time" "$marker" \
+                        "$snapshot_phase"
+                    case "$_fault_state" in
+                        release)
+                            if state_lock; then
+                                if lease_path_absent &&
+                                   [ "$(read_file "$SAFE/play.started")" = "$marker" ] &&
+                                   release_intent_matches "$snapshot_source" \
+                                       "$snapshot_token" "$snapshot_time"; then
+                                    hard_mute
+                                    log_action "source release in progress; hard mute (recoverable)"
+                                else
+                                    log_action "source release observation superseded; no mute"
+                                fi
+                                state_unlock
+                            fi
+                            sleep 1
+                            continue
+                            ;;
+                        changed)
+                            log_action "lease changed after clock sample; previous fault discarded"
+                            sleep 1
+                            continue
+                            ;;
+                    esac
+                    # Avoid latching a permanent fault from one truncated proc
+                    # or mixer read. Reconfirm both generation and clock after
+                    # a short guard interval.
+                    if [ "$_fault_state" = current ]; then
+                        audio_delay 100000
+                        lease_fault_state "$snapshot_source" "$snapshot_pid" \
+                            "$snapshot_start" "$snapshot_token" "$snapshot_time" "$marker" \
+                            "$snapshot_phase"
+                        if [ "$_fault_state" != current ]; then
+                            log_action "clock fault superseded during recheck; no latch"
+                            sleep 1
+                            continue
+                        fi
+                        pcm_pid=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$pcm" 2>/dev/null)
+                        pcm_ok=0
+                        if grep -q '^state: RUNNING' "$pcm" 2>/dev/null; then
+                            case "$snapshot_source" in
+                                bluetooth) audio_bt_valid && pcm_ok=1;;
+                                voice) [ "$(cat "$AUDIO_PROC/$pcm_pid/comm" 2>/dev/null)" = aplay ] && pcm_ok=1;;
+                                airplay) [ "$pcm_pid" = "$(read_file "$RUN/dsp-bridge.pid")" ] && pcm_ok=1;;
+                            esac
+                        fi
+                        [ "$pcm_ok" = 1 ] && continue
+                    fi
+                    if state_lock; then
+                        lease_fault_state "$snapshot_source" "$snapshot_pid" \
+                            "$snapshot_start" "$snapshot_token" "$snapshot_time" \
+                            "$marker" "$snapshot_phase"
+                        if [ "$_fault_state" != current ]; then
+                            state_unlock
+                            log_action "clock fault superseded under the state lock; no latch"
+                            sleep 1
+                            continue
+                        fi
+                        pcm_pid=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$pcm" 2>/dev/null)
+                        pcm_ok=0
+                        if grep -q '^state: RUNNING' "$pcm" 2>/dev/null; then
+                            case "$snapshot_source" in
+                                bluetooth) audio_bt_valid && pcm_ok=1;;
+                                voice) [ "$(cat "$AUDIO_PROC/$pcm_pid/comm" 2>/dev/null)" = aplay ] && pcm_ok=1;;
+                                airplay) [ "$pcm_pid" = "$(read_file "$RUN/dsp-bridge.pid")" ] && pcm_ok=1;;
+                            esac
+                        fi
+                        if [ "$pcm_ok" = 1 ]; then
+                            state_unlock
+                            log_action "clock recovered under the state lock; no latch"
+                            sleep 1
+                            continue
+                        fi
+                        hard_mute
+                        write_file "$SAFE/tripped" "PCM owner or clock lost" || true
+                        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" "$SAFE/lease"
+                        state_unlock
+                        log_action "PCM owner or clock lost; hard mute"
+                    else
+                        log_action "clock fault latch deferred; lock unavailable"
+                    fi
                     sleep 1
                     continue
                 fi
             fi
             if [ "$lease_source" = voice ] && [ $((current - lease_time)) -gt 180 ]; then
-                write_file "$SAFE/tripped" "voice lease expired" || true
-                hard_mute
-                rm -f "$SAFE/play.started" "$SAFE/lease"
+                latch_generation_fault "voice lease expired" "$snapshot_source" \
+                    "$snapshot_pid" "$snapshot_start" "$snapshot_token" \
+                    "$snapshot_time" "$marker" "$snapshot_phase" || true
+                deadline=
+                last_marker=
+                last_ack_nonce=
+                sleep 1
+                continue
+            fi
+            if ! lease_snapshot_current; then
+                log_action "lease changed before mixer policy; previous observation discarded"
+                sleep 1
                 continue
             fi
             # Bluetooth follows the stock 0..32 Master control. The AP2
@@ -365,7 +1413,7 @@ watchdog_loop() {
             master_limit=$MASTER_SAFE
             digital_limit=$DIGITAL_SAFE
             playback_safe="$PLAYBACK_SAFE,$PLAYBACK_SAFE"
-            if [ -f "$BT_OWNER" ]; then
+            if [ "$lease_source" = bluetooth ]; then
                 master_limit=32
                 digital_limit=$BT_DIGITAL_SAFE
                 playback_safe="$BT_PLAYBACK_SAFE,$BT_PLAYBACK_SAFE"
@@ -373,13 +1421,21 @@ watchdog_loop() {
             master=$(mixer_master)
             case "$master" in
                 ''|*[!0-9]*)
-                    write_file "$SAFE/tripped" "invalid Master reading" || true
-                    hard_mute
-                    rm -f "$SAFE/play.started"
-                    log_action "watchdog tripped: invalid Master"
-                    deadline=
-                    sleep 1
-                    continue
+                    audio_delay 100000
+                    master=$(mixer_master)
+                    case "$master" in
+                        ''|*[!0-9]*)
+                            latch_generation_fault "invalid Master reading" \
+                                "$snapshot_source" "$snapshot_pid" "$snapshot_start" \
+                                "$snapshot_token" "$snapshot_time" "$marker" \
+                                "$snapshot_phase" || true
+                            deadline=
+                            last_marker=
+                            last_ack_nonce=
+                            sleep 1
+                            continue
+                            ;;
+                    esac
                     ;;
                 *)
                     if [ "$master" -gt "$master_limit" ]; then
@@ -394,13 +1450,23 @@ watchdog_loop() {
             digital_right="${digital#*,}"
             case "$digital_left:$digital_right" in
                 *[!0-9:]*|:|*:)
-                    write_file "$SAFE/tripped" "invalid digital volume reading" || true
-                    hard_mute
-                    rm -f "$SAFE/play.started"
-                    log_action "watchdog tripped: invalid digital volume"
-                    deadline=
-                    sleep 1
-                    continue
+                    audio_delay 100000
+                    digital="$(mixer_values 1)"
+                    digital_left="${digital%%,*}"
+                    digital_right="${digital#*,}"
+                    case "$digital_left:$digital_right" in
+                        *[!0-9:]*|:|*:)
+                            latch_generation_fault "invalid digital volume reading" \
+                                "$snapshot_source" "$snapshot_pid" "$snapshot_start" \
+                                "$snapshot_token" "$snapshot_time" "$marker" \
+                                "$snapshot_phase" || true
+                            deadline=
+                            last_marker=
+                            last_ack_nonce=
+                            sleep 1
+                            continue
+                            ;;
+                    esac
                     ;;
                 *)
                     if [ "$digital_left" -gt "$digital_limit" ] ||
@@ -425,13 +1491,27 @@ watchdog_loop() {
                    [ "$(switch_state 'Ext Spk')" = off ]; then
                     case "$playback" in 0,0|1,1) analog_transition=1;; esac
                 fi
+                if [ "$analog_transition" = 1 ] &&
+                   { [ "$(mixer_values 1)" != "0,0" ] ||
+                     [ "$(switch_state 'Ext Spk')" != off ]; }; then
+                    # The first gate reads can race the hook into its audible
+                    # baseline. Reconfirm both independent mute gates before
+                    # accepting the now-obsolete analogue step.
+                    analog_transition=0
+                fi
                 # The hook can finish its muted baseline while we sample the
                 # gates. Re-read before latching a fault from an old value.
                 if [ "$analog_transition" = 0 ] &&
                    [ "$(mixer_values 2)" != "$playback_safe" ]; then
-                    write_file "$SAFE/tripped" "analog baseline changed" || true
-                    hard_mute
-                    log_action "analog baseline changed; muted without switching gain"
+                    latch_generation_fault "analog baseline changed" \
+                        "$snapshot_source" "$snapshot_pid" "$snapshot_start" \
+                        "$snapshot_token" "$snapshot_time" "$marker" \
+                        "$snapshot_phase" || true
+                    deadline=
+                    last_marker=
+                    last_ack_nonce=
+                    sleep 1
+                    continue
                 fi
             fi
         fi
@@ -439,7 +1519,9 @@ watchdog_loop() {
     done
 
     hard_mute
-    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.heartbeat" "$SAFE/deadline"
+    rm -f "$SAFE/watchdog.pid" "$SAFE/watchdog.identity" \
+        "$SAFE/watchdog.heartbeat" "$SAFE/deadline" \
+        "$LEASE_REQUEST" "$LEASE_ACK" "$RELEASE_INTENT"
     log_action "watchdog loop stopped"
 }
 
@@ -447,7 +1529,7 @@ status() {
     mode=$(read_file "$RUN/mode")
     [ -n "$mode" ] || mode="stopped"
     echo "AP2 mode: $mode"
-    if [ -f "$SAFE/armed" ]; then
+    if audio_regular_file "$SAFE/armed"; then
         echo "armed: yes"
     else
         echo "armed: no"
@@ -463,7 +1545,7 @@ status() {
     [ -f "$SAFE/deadline" ] &&
         echo "hard-mute deadline: $(read_file "$SAFE/deadline")" ||
         echo "hard-mute deadline: none"
-    [ -f "$SAFE/tripped" ] &&
+    audio_marker_present "$SAFE/tripped" &&
         echo "tripped: $(read_file "$SAFE/tripped")" ||
         echo "tripped: no"
     echo "Master: $(mixer_master)"
@@ -475,11 +1557,11 @@ status() {
 }
 
 arm() {
-    if [ -f "$SAFE/armed" ] || watchdog_alive; then
+    if audio_regular_file "$SAFE/armed" || watchdog_alive; then
         echo "safe test is already armed" >&2
         return 1
     fi
-    if [ -f "$SAFE/tripped" ]; then
+    if audio_marker_present "$SAFE/tripped"; then
         echo "previous watchdog trip is latched; disarm first" >&2
         return 1
     fi
@@ -488,7 +1570,8 @@ arm() {
     "$AP2CTL" stop >/dev/null 2>&1 || true
     hard_mute
     safe_baseline
-    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped" "$RELEASE_INTENT"
     : >"$SAFE/armed"
 
     if ! start_watchdog; then
@@ -500,7 +1583,7 @@ arm() {
     # A maintenance hold survives runtime-directory cleanup. Latch it before
     # starting Shairport, so a reconnect cannot open the speaker during an
     # installation or recovery restart.
-    if [ -f "$HOLD_MUTE" ]; then
+    if audio_marker_present "$HOLD_MUTE"; then
         if ! write_file "$SAFE/tripped" "manual mute"; then
             rm -f "$SAFE/armed"
             stop_watchdog
@@ -533,7 +1616,8 @@ disarm() {
     rm -f "$SAFE/armed"
     "$AP2CTL" stop >/dev/null 2>&1 || true
     stop_watchdog
-    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped" "$RELEASE_INTENT"
     safe_baseline
     log_action "safe test disarmed"
     echo "AP2 stopped; output hard-muted; safe baseline restored"
@@ -542,7 +1626,8 @@ disarm() {
 mute_now() {
     hard_mute
     write_file "$SAFE/tripped" "manual mute" || true
-    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline"
+    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$SAFE/deadline" "$RELEASE_INTENT"
     log_action "manual hard mute"
     echo "output hard-muted"
 }
@@ -563,7 +1648,8 @@ selftest() {
     echo "running non-audio watchdog selftest"
     hard_mute
     safe_baseline
-    rm -f "$SAFE/armed" "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/armed" "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped" "$RELEASE_INTENT"
     rm -f "$RUN/shairport.pid"
     sleep 10 >/dev/null 2>&1 &
     selftest_pid=$!
@@ -602,7 +1688,8 @@ selftest() {
         cleanup_selftest_process
         hard_mute
         safe_baseline
-        rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
+        rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+            "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped" "$RELEASE_INTENT"
         log_action "watchdog selftest passed"
         echo "watchdog selftest: PASS (speaker never enabled)"
         return 0
@@ -612,7 +1699,8 @@ selftest() {
     cleanup_selftest_process
     hard_mute
     safe_baseline
-    rm -f "$SAFE/play.started" "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped"
+    rm -f "$SAFE/play.started" "$LEASE_REQUEST" "$LEASE_ACK" \
+        "$SAFE/lease" "$SAFE/deadline" "$SAFE/tripped" "$RELEASE_INTENT"
     log_action "watchdog selftest failed"
     echo "watchdog selftest: FAIL" >&2
     return 1

@@ -239,4 +239,27 @@ For takeover the bridge uses the existing generation-checked hook to fade and cl
 
 最终本地完整 **227 项 Linux/BusyBox 回归通过**，包括快速播放、单个残留包、查询失败或采样间断、用户再次暂停、维护 hold 与语音介入、不同 AirPlay 租约/播放器代次、无效时间戳和远程命令失败等情况。ARM 产物为 hard-float，最高 GLIBC 符号需求为 2.17。本地 QEMU 使用原厂 ALSA 库、glibc 2.28 和独占合成共享上下文，只向 AirPlay 正占用的虚拟 PCM 写全零帧：`activity` 从 0 增至 512，返回 0；没有打开真实声卡。此检查不代替固件环境、Harman DSP 和用户试听。
 
-English: All **227 local Linux/BusyBox regressions pass**, covering quick play, a single residual packet, query failures or sampling gaps, phone pause, hold or voice interference, changed AirPlay/player generations, invalid timestamps and remote-command failure. The ARM artifact uses the hard-float ABI and requires GLIBC symbols no newer than 2.17. Offline QEMU with the stock ALSA library, glibc 2.28 and an isolated synthetic shared context wrote zero frames only to a blocked virtual PCM: the `activity` count advanced from 0 to 512 and the probe returned 0, without opening hardware. This does not replace validation on the firmware, real Harman DSP or user listening.
+English: At that point, all **227 local Linux/BusyBox regressions passed**, covering quick play, a single residual packet, query failures or sampling gaps, phone pause, hold or voice interference, changed AirPlay/player generations, invalid timestamps and remote-command failure. The ARM artifact uses the hard-float ABI and requires GLIBC symbols no newer than 2.17. Offline QEMU with the stock ALSA library, glibc 2.28 and an isolated synthetic shared context wrote zero frames only to a blocked virtual PCM: the `activity` count advanced from 0 to 512 and the probe returned 0, without opening hardware. This does not replace validation on the firmware, real Harman DSP or user listening.
+
+
+## 2026-11-18：手机仅连接蓝牙时的 AirPlay 静音与旧状态修复
+
+最新实机顺序为：AirPlay 已经正常播放，手机随后连接蓝牙但尚未点击播放，AirPlay 随后无声。原厂蓝牙状态可能仍报告 `status=play`，连接动作也可能改变 AirPlay 正在使用的原厂功放静音。旧逻辑把陈旧状态当作真实播放，既可能错误抢占，也无法可靠识别“只是连接”。
+
+修正后，后端持续增长的新鲜 PCM 帧决定是否真的存在手机音频。没有新帧时保持或恢复当前 AirPlay；功放被连接动作改成静音时，在同一有效 AirPlay 租约和运行时钟下先数字归零，再通过官方状态接口恢复，最后恢复同一租约保存的增益。暂停 RPC 暂时失败时，AirPlay 不被强制留成静音，待办暂停由桥接器安全重试。旧租约的临时增益记录不会写入新租约。
+
+完整 **335 项 Linux/BusyBox 回归通过**，日志路径为 `build/full-audio-handoff-phone-connect-redeploy-linux-20261118-r2.log`，SHA-256 为 `e10c554e3598648b2745bbda62318ce7e83f4f636071e81d84efbc109228baef`。三文件事务 `/vendor/airplay2/.updates/20261118T035933-27009` 已在维护静音下提交并核验：返回 0、无 pending、哈希一致、`verify=0`，AirPlay 5.6/端口 7000、watchdog、蓝牙桥和语音监督正常，AirPlay 配置仍为 `flat / 24 dB / -30…-6 dB / default -30`。设备当前保持维护静音，没有播放租约，PCM closed。
+
+这不是组合听感验收。下一次用户在场测试应保持低音量，按以下顺序记录所有故障：
+
+1. AirPlay 正常播放时手机只连接、保持暂停；AirPlay 不得中断。
+2. 手机开始播放：Mac AirPlay 自动暂停，蓝牙正常出声。
+3. 手机暂停、Mac 继续播放：AirPlay 正常接管。
+4. 连续双向切换 2–3 次，确认没有爆音、音量突增和持续无声。
+5. AirPlay 和蓝牙各唤醒一次 Alexa，确认回复清楚、音乐最终恢复。
+
+English: Live reproduction was AirPlay playing normally, followed by a phone connecting over Bluetooth without starting playback, after which AirPlay became silent. Stock Bluetooth may retain stale `status=play`, and the connection may alter AirPlay's stock amplifier mute. The old logic treated the stale string as real playback, so it could neither take over safely nor identify a connect-only event.
+
+The private backend's continuously increasing PCM frame counter now determines whether phone audio is actually present. Without fresh frames, current AirPlay output is retained or its stock amplifier state is repaired under the same live lease and clock. Gain restoration is tied to that lease, and a temporarily failed stock pause RPC leaves AirPlay audible while a retry marker is retained. All **335 Linux/BusyBox tests pass**; the log SHA-256 is `e10c554e3598648b2745bbda62318ce7e83f4f636071e81d84efbc109228baef`. The three-file maintenance-muted transaction committed with return 0, no pending journal, exact hashes and `verify=0`. Shairport 5.6/port 7000, watchdog, Bluetooth bridge and voice supervision are healthy; AirPlay configuration remains byte-identical at `flat / 24 dB / -30…-6 dB / default -30`. The speaker remains muted with no lease and a closed PCM.
+
+This is not listening acceptance. The next user-present sequence must keep volume low and test: connect-only during AirPlay; phone playback taking over; AirPlay taking back after phone pause; 2–3 repeated switches; Alexa from both sources; and final music restoration, with any pop, gain jump or sustained silence recorded as a failure.

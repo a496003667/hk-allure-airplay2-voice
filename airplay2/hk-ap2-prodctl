@@ -36,13 +36,13 @@ SPS56_SHA1=ca936a0d88197258aa251f698811e49adf7e6313
 NQPTP56_SHA1=ea5785e47f215cc9d89192a653aa616e3fb0e4f1
 CONF56_SHA1=c6922924190f4a8cb7f0d37c888da6c53c0519f2
 DEVICE_PINS=${HK_AP2_DEVICE_PINS:-$BASE/ap2-device.env}
-AUDIO_HOOK_OVERRIDE_SHA1=fb3d1ebaa10be227279a1db6f0a197c5d6a4219c
+AUDIO_HOOK_OVERRIDE_SHA1=5c772eb584083d03057575eb2ad58b1cd17ac4e7
 SAFE_TEST_OVERRIDE="$BASE/hk-ap2-safe-test.bt"
-SAFE_TEST_OVERRIDE_SHA1=64917b26427d4ec86c1e2a309c39da3e2868fcaa
+SAFE_TEST_OVERRIDE_SHA1=89b4a0dddf53f2401dc6ec119b84a3ce9efbf6d5
 BT_BRIDGE="$BASE/hk-bt-bridge.sh"
-BT_BRIDGE_SHA1=1cc9be71daf335e4709701dc6cfc86b452a8fd81
+BT_BRIDGE_SHA1=2ceeadabff9834c2f77891935344b6ac2a127990
 BT_PARK="$BASE/libasound_module_pcm_hkbtpark.so"
-BT_PARK_SHA1=780a8d0ca0225de911487aee630896c6ec749fa4
+BT_PARK_SHA1=253ba59d72e01ca61e730c45024ba44da6f570dd
 STOCK_AUDIO_STATE="$BASE/hk-stock-audio-state"
 STOCK_AUDIO_STATE_SHA1=764a35a14a312d63080ff368e12ec50086c475de
 DSP_ALSA_CONF="$BASE/hk-dsp-alsa.conf"
@@ -57,9 +57,9 @@ GUARD_OVERRIDE="$BASE/hk-ap2-guard.sh"
 GUARD_OVERRIDE_SHA1=3495b059131cb236ae9b822c315abee3e5dacaa5
 VOLUME_OVERRIDE="$BASE/hk-ap2-volume-log"
 VOLUME_OVERRIDE_SHA1=101d967969d614059b426bdd93512e739c1b7b84
-COMMON_SHA1=6a7a2613ec9f8a61d283dfba35a337417f35ce3b
+COMMON_SHA1=04576e2e76c8b4c4364e4a1ed8bd4d0d38ff5966
 VOICE_SCRIPT="$BASE/../hk-voice/hk-voice.sh"
-VOICE_SCRIPT_SHA1=65f3b4d248dc0339a489087c66b28495c2ed41ae
+VOICE_SCRIPT_SHA1=991098f9b0884fd9e17030bfe4dd2ab670453d7f
 VOICE_RUN=/tmp/hk-voice
 MIN_START_FREE_KIB=${HK_AP2_MIN_START_FREE_KIB:-8192}
 MIN_START_AVAILABLE_KIB=${HK_AP2_MIN_START_AVAILABLE_KIB:-49152}
@@ -592,6 +592,23 @@ ensure_voice_supervisor() {
     log "voice supervisor restarted pid=$!"
 }
 
+watchdog_supervision_state() {
+    if audio_watchdog_live; then
+        printf 'live\n'
+        return 0
+    fi
+    if audio_watchdog_transition_live; then
+        printf 'transition\n'
+        return 0
+    fi
+    if audio_watchdog_pid >/dev/null; then
+        printf 'stale\n'
+    else
+        printf 'dead\n'
+    fi
+    return 1
+}
+
 supervisor_run() {
     if supervisor_alive; then
         log "supervisor already running pid=$(supervisor_pid)"
@@ -658,6 +675,7 @@ supervisor_run() {
     fi
 
     stock_failures=0
+    watchdog_transition_logged=0
     while :; do
         ensure_voice_supervisor
         [ -f "$STOPFILE" ] && {
@@ -665,16 +683,29 @@ supervisor_run() {
             break
         }
         mode=$(cat "$RUN/mode" 2>/dev/null || true)
-        watchdog=$(cat "$RUN/safe/watchdog.pid" 2>/dev/null || true)
-        case "$watchdog" in
-            ''|*[!0-9]*)
-                log "safe watchdog pid is missing"
+        supervision_state=$(watchdog_supervision_state || true)
+        case "$supervision_state" in
+            live) ;;
+            transition)
+                if [ "$watchdog_transition_logged" = 0 ]; then
+                    log "safe watchdog heartbeat delayed during source transition; keeping AP2 runtime"
+                    watchdog_transition_logged=1
+                fi
+                sleep 1
+                continue
+                ;;
+            stale)
+                log "safe watchdog heartbeat stale outside a source transition"
+                break
+                ;;
+            *)
+                log "safe watchdog exited"
                 break
                 ;;
         esac
-        if ! kill -0 "$watchdog" 2>/dev/null; then
-            log "safe watchdog exited"
-            break
+        if [ "$watchdog_transition_logged" = 1 ]; then
+            log "safe watchdog heartbeat recovered"
+            watchdog_transition_logged=0
         fi
 
         bt_bridge_pid=$(cat "$RUN/bt-bridge.pid" 2>/dev/null || true)
@@ -812,8 +843,11 @@ verify_active() {
         bind_mounted_at "$path" &&
             [ "$(sha1sum "$path" 2>/dev/null | awk '{print $1}')" = "$expected" ] || return 1
     done
+    audio_watchdog_live || return 1
+    watchdog_pid=$(audio_watchdog_pid) || return 1
+    tr '\000' ' ' <"/proc/$watchdog_pid/cmdline" 2>/dev/null |
+        grep -Fq 'hk-ap2-safe-test' || return 1
     for entry in \
-        "$SAFE/watchdog.pid:hk-ap2-safe-test" \
         "$RUN/shairport.pid:$OPT/bin/shairport-sync" \
         "$RUN/guard.pid:hk-ap2-guard.sh" \
         "$RUN/bt-bridge.pid:$BT_BRIDGE" \
@@ -824,10 +858,6 @@ verify_active() {
         kill -0 "$pid" 2>/dev/null &&
             tr '\000' ' ' <"/proc/$pid/cmdline" | grep -Fq "$command" || return 1
     done
-    beat=$(cat "$SAFE/watchdog.heartbeat" 2>/dev/null)
-    current=$(audio_now) || return 1
-    case "$beat:$current" in *[!0-9:]*|:*|*:) return 1;; esac
-    [ "$beat" -le "$current" ] && [ $((current - beat)) -le 4 ] || return 1
     "$AP2CTL" status 2>/dev/null | grep -q 'airplay port 7000: listening' || return 1
     echo 'verified: Shairport 5.6, exact runtime/config pins, DSP, Bluetooth bridge and watchdog'
 }

@@ -101,6 +101,21 @@ exit 0
         self.assertEqual(tx.read_text().strip(), 'committed')
         self.assertEqual((tx.parent / '1.bak').read_text(), 'old')
 
+    def test_update_restart_uses_the_bounded_low_memory_floor(self):
+        self.env.pop('HK_AP2_MIN_START_AVAILABLE_KIB', None)
+        ctl = self.base / 'hk-ap2-prodctl'
+        ctl.write_text('''#!/bin/sh
+case "$1" in
+ start)
+    [ "$HK_AP2_MIN_START_AVAILABLE_KIB" = 47104 ] || exit 1
+    ;;
+esac
+exit 0
+''')
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.target.read_text(), 'candidate')
+
     def test_wrong_mode_aborts_before_mutation(self):
         self.staged.chmod(0o755)
         self.assertNotEqual(self.run_update().returncode, 0)

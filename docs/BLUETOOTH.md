@@ -301,4 +301,25 @@ For takeover the bridge uses the existing generation-checked hook to fade and cl
 
 最终本地完整 **227 项 Linux/BusyBox 回归通过**，包括快速播放、单个残留包、查询失败或采样间断、用户再次暂停、维护 hold 与语音介入、不同 AirPlay 租约/播放器代次、无效时间戳和远程命令失败等情况。ARM 产物为 hard-float，最高 GLIBC 符号需求为 2.17。本地 QEMU 使用原厂 ALSA 库、glibc 2.28 和独占合成共享上下文，只向 AirPlay 正占用的虚拟 PCM 写全零帧：`activity` 从 0 增至 512，返回 0；没有打开真实声卡。此检查不代替固件环境、Harman DSP 和用户试听。
 
-English: All **227 local Linux/BusyBox regressions pass**, covering quick play, a single residual packet, query failures or sampling gaps, phone pause, hold or voice interference, changed AirPlay/player generations, invalid timestamps and remote-command failure. The ARM artifact uses the hard-float ABI and requires GLIBC symbols no newer than 2.17. Offline QEMU with the stock ALSA library, glibc 2.28 and an isolated synthetic shared context wrote zero frames only to a blocked virtual PCM: the `activity` count advanced from 0 to 512 and the probe returned 0, without opening hardware. This does not replace validation on the firmware, real Harman DSP or user listening.
+English: At that point, all **227 local Linux/BusyBox regressions passed**, covering quick play, a single residual packet, query failures or sampling gaps, phone pause, hold or voice interference, changed AirPlay/player generations, invalid timestamps and remote-command failure. The ARM artifact uses the hard-float ABI and requires GLIBC symbols no newer than 2.17. Offline QEMU with the stock ALSA library, glibc 2.28 and an isolated synthetic shared context wrote zero frames only to a blocked virtual PCM: the `activity` count advanced from 0 to 512 and the probe returned 0, without opening hardware. This does not replace validation on the firmware, real Harman DSP or user listening.
+
+## 手机只连接不播放与 AirPlay 功放恢复（2026-11-18）
+
+最新现场组合是：Mac 已经通过 AirPlay 2 正常播放，手机随后连接蓝牙，但用户尚未点击手机播放。原厂蓝牙状态可能残留 `status=play`；仅凭该字符串判断会把一次连接误当成真实播放，导致错误暂停 AirPlay 或切换输出。同时，蓝牙连接动作可能改变 AirPlay 正在使用的原厂功放静音。
+
+桥接器的活动判据现以后端持续增长的新鲜 PCM 帧为准，原厂状态只是附加确认：
+
+- 没有新鲜手机帧时，不进入蓝牙接管；如果 AirPlay 功放被连接动作改成静音，就在同一有效 AirPlay 租约和运行时钟下，经数字级先归零再恢复原厂全局/PA 状态。
+- 有连续新鲜帧时，才按既有暂停基线、租约代次和播放器身份进入受保护的蓝牙抢占。
+- 原厂播放器暂停 RPC 暂时失败时，AirPlay 继续正常出声，同时保留待办暂停标记供桥接器稍后安全重试；不能为了发送暂停命令而让 AirPlay 留在静音。
+- AirPlay 的增益恢复记录绑定租约 token 与租约时间。旧租约留下的临时零增益不会应用到新租约。
+
+完整 **335 项 Linux/BusyBox 回归通过**，日志 SHA-256 为 `e10c554e3598648b2745bbda62318ce7e83f4f636071e81d84efbc109228baef`。覆盖 AirPlay 播放时手机仅连接、陈旧 play、真实新鲜帧、暂停 RPC 失败、维护 hold、新租约、旧增益记录、双向抢占、语音、watchdog 和更新事务。三文件事务 `/vendor/airplay2/.updates/20261118T035933-27009` 已在维护静音下部署：返回 0、committed、无 pending、三个文件 SHA-256 一致、`hk-ap2-prodctl verify=0`，AirPlay 5.6 和端口 7000、watchdog、蓝牙桥、语音监督均正常，AirPlay 配置 SHA-1 仍为 `1a4b6e188135e61ae99e32c3ed4578d5c7404bc1`。当前仍为维护静音、无播放租约、PCM closed。
+
+**以上是自动化与静默部署证据，不是组合听感验收。** 下一步仍需用户在场、低音量依次验证：AirPlay 播放时手机只连接不影响声音；手机开始播放后 AirPlay 暂停且蓝牙出声；反向接管；连续穿插 2–3 次；两种来源各唤醒一次语音；最终恢复、爆音、音量突增和持续无声检查。
+
+English: The latest live sequence had AirPlay playing when a phone connected over Bluetooth without starting playback. Stock Bluetooth can retain `status=play`, so that string alone is unsafe; the connection action can also change the amplifier mute already used by AirPlay. The bridge now treats continuously increasing fresh frames from the private PCM backend as the decisive activity evidence. Without fresh frames it restores AirPlay's stock amplifier state under the same valid lease and running clock; with fresh frames it follows the guarded takeover path. A failed stock-player pause RPC no longer makes AirPlay fail closed: AirPlay keeps playing and a pause-retry marker is retained. AirPlay gain restoration is tied to the lease token and timestamp so an old temporary zero cannot be applied to a new session.
+
+All **335 Linux/BusyBox regressions pass**. The log SHA-256 is `e10c554e3598648b2745bbda62318ce7e83f4f636071e81d84efbc109228baef`. Coverage includes phone-connect-only while AirPlay plays, stale play, real fresh frames, pause RPC failure, hold, changed leases, old gain state, bidirectional takeover, voice, watchdog and update transactions. The three-file transaction `/vendor/airplay2/.updates/20261118T035933-27009` committed under maintenance mute with return 0, no pending journal, exact hashes and `verify=0`. AirPlay 5.6, port 7000, watchdog, Bluetooth bridge and voice supervision are healthy. The byte-identical AirPlay configuration retains SHA-1 `1a4b6e188135e61ae99e32c3ed4578d5c7404bc1`. The device remains muted with no lease and a closed PCM.
+
+This is automated and muted-deployment evidence, not listening acceptance. User-present low-volume tests still need to cover phone-connect-only, each takeover direction, several interleaved switches, Alexa from each source, final music restoration, pops, gain jumps and sustained silence.

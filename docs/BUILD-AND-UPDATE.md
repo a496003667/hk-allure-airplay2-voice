@@ -82,7 +82,7 @@ python3 tools/make-runtime.py \
 
 这台小内存设备需要释放上传/解包副本的 tmpfs 占用。暂存并核对全部 `.new` 后，把已校验的候选更新器和 manifest 复制到独立临时路径，再清理上传压缩包及解包目录；电脑上保留完整私有包。可用 `HK_AP2_UPDATE_RELEASE_STAGING=1 sh <已校验更新器> --manifest <manifest>`，在整批安装文件通过哈希/权限校验后、启动前释放 `.new` 副本。回退使用独立事务备份；重试须从原包重新暂存。不要清理未完成事务或唯一回滚副本。
 
-启动检查同时要求至少 8192 KiB 原始空闲和 49152 KiB 估算可用内存。Linux 3.10 的估算只计入扣除 Shmem、Dirty、Writeback 后的文件缓存，加 Buffers 和一半 SReclaimable；字段缺失或无效时拒绝启动。运行期原有 4096 KiB 空闲 / 32768 KiB 可用门槛保持，不能把这项改动理解为取消内存保护。
+正常 AP2 启动仍要求至少 8192 KiB 原始空闲和 49152 KiB 估算可用内存。Linux 3.10 的估算只计入扣除 Shmem、Dirty、Writeback 后的文件缓存，加 Buffers 和一半 SReclaimable；字段缺失或无效时拒绝启动。维护停服后的更新事务使用有界 `HK_AP2_MIN_START_AVAILABLE_KIB=47104` 覆盖值：实测停服后的可用内存有时略低于正常门槛，而旧值会让候选和回滚都拒绝启动。更新器从不把该下限继续降低；运行期原有 4096 KiB 空闲 / 32768 KiB 可用门槛保持不变，不能把它理解为取消内存保护。
 
 失败会恢复整批文件；即使回退成功，原更新命令仍返回非零。回退失败保留 hold 与 `/vendor/airplay2/.updates/pending`，日志给出：
 
@@ -124,7 +124,7 @@ Finish receiver restarts and temporary diagnostics before establishing the final
 
 Stock BusyBox lacks `stat`, so permissions are decoded from POSIX `ls`, including special bits. Recovery recreates the runtime lock directory after failed startup. A controller lacking `verify` is accepted only during rollback and only after matching the saved files, active 5.6 bindings, live process identities, watchdog heartbeat and status. New candidates must pass their own `verify` command.
 
-After verified staging, retain a separate verified updater/manifest and remove uploaded/extracted tmpfs copies while preserving the original private package on the host. `HK_AP2_UPDATE_RELEASE_STAGING=1` additionally removes `.new` duplicates after the complete installed set is verified and before startup; rollback still uses transaction backups. Startup requires both 8 MiB raw free and 48 MiB conservatively estimated available memory, excluding tmpfs and dirty/writeback cache and crediting half the reclaimable slab. Invalid counters fail closed. The existing 4 MiB free / 32 MiB available runtime protection remains unchanged.
+After verified staging, retain a separate verified updater/manifest and remove uploaded/extracted tmpfs copies while preserving the original private package on the host. `HK_AP2_UPDATE_RELEASE_STAGING=1` additionally removes `.new` duplicates after the complete installed set is verified and before startup; rollback still uses transaction backups. Normal AP2 startup requires both 8 MiB raw free and 48 MiB conservatively estimated available memory, excluding tmpfs and dirty/writeback cache and crediting half the reclaimable slab. A maintenance-stop update uses a bounded 46 MiB available-memory override because the stopped stack can sit just below the normal 48 MiB admission floor; this prevents both candidate and rollback startup from refusing at the same boundary. The updater never lowers it further. Invalid counters fail closed, and the existing 4 MiB free / 32 MiB available runtime protection remains unchanged.
 
 Disabling AirPlay retains shared Bluetooth/voice protection. Other modules have distinct persistent-disable and reload behavior as listed above. Automated and emulated tests do not establish audible pop prevention, bass output, physical-button loudness or sustained playback acceptance. The simulator's Shairport `-X` crash is shared by the old baseline; persistent startup remains an on-device test.
 

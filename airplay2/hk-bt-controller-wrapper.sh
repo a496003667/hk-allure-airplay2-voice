@@ -13,7 +13,7 @@ SHIM_SHA256=${HK_BT_REDIRECT_SHA256:-f26226b3b03a4ec08d257ff4cede090f1f62be2aedd
 CONF=${HK_BT_PRIVATE_CONF:-/vendor/airplay2/hk-bt-alsa.conf}
 CONF_SHA256=${HK_BT_PRIVATE_CONF_SHA256:-2693ecef47f57f4f9df526114018d5c2ad2dfe0b6b36aba9cb7192235590ebf2}
 PARK=${HK_BT_PARK_LIB:-/vendor/airplay2/libasound_module_pcm_hkbtpark.so}
-PARK_SHA256=${HK_BT_PARK_SHA256:-01c52e424693a2cf4a81d63adc340f9cf9689a0b1e5ae77f5c1332ec5dd14c79}
+PARK_SHA256=${HK_BT_PARK_SHA256:-91cb76b051fe2cffdc4472f22b1b4801007c033dfa37d2818d7027c1d60434c6}
 
 hash_of() {
     sha256sum "$1" 2>/dev/null | awk '{print $1}'

@@ -387,6 +387,28 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
                          'parked samples must not be replayed after takeover ends')
         self.assertFalse(self.control.exists())
 
+    def test_pause_marker_blocks_late_frames_until_a_new_generation_clears_it(self):
+        proc = self.launch()
+        self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+        (self.run / 'ap2-claim').write_text('1\n')
+        self.assertEqual(self.park(), b'parked\n')
+        (self.run / 'ap2-claim').unlink()
+        (self.run / 'bt-wait-pcm').write_text('bt-42-1-1\n')
+        self.write(proc, 2222)
+        self.assertFalse(
+            self.holds_capture(proc),
+            'a release/pause marker must discard late phone frames',
+        )
+        (self.run / 'bt-wait-pcm').unlink()
+        self.write(proc, 3333)
+        self.assertTrue(self.holds_capture(proc))
+        proc.stdin.write('q\n'); proc.stdin.flush(); proc.wait(timeout=2)
+        self.assertEqual(
+            self.capture.read_bytes(),
+            (3333).to_bytes(2, 'little', signed=True) * 512,
+        )
+
     def test_park_requires_current_marker_and_revoked_lease_and_owner(self):
         proc = self.launch(); self.write(proc)
         self.assertEqual(self.park(marker=False), b'refused\n')
@@ -411,6 +433,84 @@ pcm.test_bt {{ type hkbtpark slave "capture" }}
             path.unlink()
         self.write(proc)
         self.assertTrue(self.holds_capture(proc))
+
+    def test_malformed_voice_marker_fails_closed(self):
+        now = str(int(float(Path('/proc/uptime').read_text().split()[0])))
+        malformed = ('', 'not-a-clock\n', now + 'x\n',
+                     '184467440737095516160\n')
+        for value in malformed:
+            with self.subTest(value=value):
+                (self.run / 'voice-owns').write_text(value)
+                proc = self.launch()
+                self.write(proc)
+                self.assertFalse(self.holds_capture(proc))
+                proc.stdin.write('q\n'); proc.stdin.flush()
+                proc.wait(timeout=2)
+                (self.run / 'voice-owns').unlink()
+        proc = self.launch()
+        self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+
+    def test_irregular_armed_marker_never_authorizes_output(self):
+        armed = self.run / 'safe/armed'
+        target = self.root / 'fake-armed'
+        target.touch()
+        variants = ('symlink', 'fifo', 'directory')
+        for kind in variants:
+            with self.subTest(kind=kind):
+                armed.unlink(missing_ok=True)
+                if kind == 'symlink':
+                    armed.symlink_to(target)
+                elif kind == 'fifo':
+                    os.mkfifo(armed)
+                else:
+                    armed.mkdir()
+                proc = self.launch()
+                self.write(proc)
+                self.assertFalse(self.holds_capture(proc))
+                proc.stdin.write('q\n'); proc.stdin.flush()
+                proc.wait(timeout=2)
+                if kind == 'directory':
+                    armed.rmdir()
+                else:
+                    armed.unlink()
+        armed.touch()
+        proc = self.launch()
+        self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+
+    def test_release_and_bad_lease_markers_block_initial_and_live_open(self):
+        release = self.run / 'bt-release'
+        release.touch()
+        proc = self.launch()
+        self.write(proc)
+        self.assertFalse(self.holds_capture(proc))
+        release.unlink()
+        self.write(proc)
+        self.assertTrue(self.holds_capture(proc))
+        lease = self.run / 'safe/lease'
+        for value in ('bluetooth 42 1 token 0 active extra\n',
+                      'airplay 42 1 token 0 active\n',
+                      'bluetooth 42 1 token 0 unknown\n'):
+            with self.subTest(value=value):
+                lease.write_text(value)
+                self.write(proc, 2222)
+                self.assertTrue(
+                    self.holds_capture(proc),
+                    'an already-open slave must stay parked while the lease is invalid',
+                )
+        lease.write_text('bluetooth 42 1 token 0 active\n')
+        self.write(proc, 3333)
+        self.assertTrue(self.holds_capture(proc))
+        lease.unlink()
+        proc.stdin.write('q\n'); proc.stdin.flush()
+        proc.wait(timeout=2)
+        self.assertEqual(
+            self.capture.read_bytes(),
+            (1111).to_bytes(2, 'little', signed=True) * 512
+            + (3333).to_bytes(2, 'little', signed=True) * 512,
+            'invalid leases must discard samples without closing or replaying the slave',
+        )
 
     def test_poll_wait_is_bounded_and_reports_playback_readiness(self):
         proc = self.launch()

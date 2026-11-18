@@ -60,6 +60,23 @@ class VoiceServiceTest(unittest.TestCase):
             supervise,
         )
 
+    def test_supervisor_has_a_process_safe_singleton_lock(self):
+        script = VOICE.read_text()
+        supervise = script.split("    supervise)\n", 1)[1].split(
+            "    start)\n", 1
+        )[0]
+        self.assertLess(
+            supervise.index('audio_lock "$RUN/supervisor.lock"'),
+            supervise.index('supervisor.pid'),
+        )
+        self.assertIn('trap \'supervisor_cleanup\' 0', supervise)
+        self.assertIn('trap \'exit 0\' HUP INT TERM', supervise)
+        self.assertIn(
+            '[ "$(audio_control_read "$RUN/supervisor.pid")" = "$$" ]',
+            supervise,
+        )
+        self.assertIn('audio_unlock "$RUN/supervisor.lock"', supervise)
+
     def test_start_reaps_a_stale_fifo_reader(self):
         script = VOICE.read_text()
         start = script.split("    start)\n", 1)[1].split("    stop)\n", 1)[0]
@@ -168,6 +185,27 @@ bt_inject_end
         self.assertIn("freshed=paused", round_body)
         self.assertLess(round_body.index("rec_pause_and_drop"), round_body.index("rec_fresh"))
         self.assertIn("round timed out after 60s", round_body)
+
+    def test_prepare_failure_publishes_a_terminal_fail_marker(self):
+        script = VOICE.read_text()
+        prepare = 'prepare_output() {' + script.split('prepare_output() {', 1)[1].split(
+            '\n# Close the speaker path', 1
+        )[0]
+        shell = '''
+voice_round_current() { return 1; }
+audio_write_control() { printf '%s\\n' "$2" >"$PREPARED"; }
+''' + prepare + '''
+prepare_output
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            prepared = pathlib.Path(directory) / 'prepared'
+            result = subprocess.run(
+                ['sh', '-c', shell],
+                env={'PREPARED': str(prepared), 'PATH': '/usr/bin:/bin'},
+                capture_output=True, text=True, timeout=4,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(prepared.read_text().strip(), 'fail')
 
     def test_stale_prepare_after_a_valid_output_does_not_restart_the_round(self):
         script = VOICE.read_text()

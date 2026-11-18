@@ -201,7 +201,16 @@ ap2_up() {
     done
     return 1
 }
-start_ap2() { env HK_AP2_UPDATE_START=1 "$CTL" start >>"$LOG" 2>&1 && ap2_up "$@"; }
+start_ap2() {
+    # A maintenance stop can leave clean page cache just below the normal
+    # boot admission threshold. Use a bounded lower start floor only while a
+    # transaction is restarting either candidate or rollback; runtime safety
+    # checks remain at their original 32768 KiB available-memory floor.
+    _start_available=${HK_AP2_MIN_START_AVAILABLE_KIB:-47104}
+    env HK_AP2_MIN_START_AVAILABLE_KIB="$_start_available" \
+        HK_AP2_UPDATE_START=1 "$CTL" start >>"$LOG" 2>&1 &&
+        ap2_up "$@"
+}
 backup_all() {
     index=0
     : >"$TX/restore.manifest" || return 1

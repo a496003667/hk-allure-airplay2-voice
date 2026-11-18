@@ -3,6 +3,71 @@
 AUDIO_PROC=${HK_AP2_PROC_ROOT:-${HK_BT_PROC_ROOT:-/proc}}
 AUDIO_UPTIME=${HK_AUDIO_UPTIME_FILE:-/proc/uptime}
 AUDIO_ID_PROC=${HK_AUDIO_ID_PROC_ROOT:-/proc}
+audio_regular_file() {
+    [ -f "$1" ] && [ ! -L "$1" ]
+}
+audio_marker_present() {
+    # Safety markers fail closed for any filesystem object, including a FIFO,
+    # directory or dangling symlink. Authorizing markers must additionally use
+    # audio_regular_file and a strict parser.
+    [ -e "$1" ] || [ -L "$1" ]
+}
+audio_control_read() {
+    audio_regular_file "$1" || return 1
+    sed -n '1p' "$1" 2>/dev/null
+}
+audio_write_control() {
+    _awc_path=$1
+    _awc_value=$2
+    audio_set_self || return 1
+    _awc_start=$(audio_pid_start "$AUDIO_SELF_PID") || return 1
+    # Include the process start time in the temporary name. A dead writer's
+    # lock marker can then be distinguished from an unrelated process that has
+    # inherited the same numeric PID.
+    _awc_tmp="$_awc_path.tmp.$AUDIO_SELF_PID.$_awc_start"
+    rm -f "$_awc_tmp" || return 1
+    if ! (set -C; printf '%s\n' "$_awc_value" >"$_awc_tmp"); then
+        rm -f "$_awc_tmp"
+        return 1
+    fi
+    if ! mv "$_awc_tmp" "$_awc_path"; then
+        rm -f "$_awc_tmp"
+        return 1
+    fi
+}
+audio_play_marker_live() {
+    audio_regular_file "$SAFE/play.started" &&
+        [ -s "$SAFE/play.started" ]
+}
+audio_claim_recent() {
+    # A live hook keeps priority for the full guarded-start window. Legacy
+    # claims contained only an uptime second and expire after eight seconds.
+    _acr_value=$(audio_control_read "$1") || return 1
+    _acr_time=
+    _acr_pid=
+    _acr_start=
+    _acr_nonce=
+    _acr_extra=
+    read -r _acr_time _acr_pid _acr_start _acr_nonce _acr_extra <<EOF
+$_acr_value
+EOF
+    [ -z "$_acr_extra" ] || return 1
+    _acr_now=$(audio_now) || return 1
+    case "$_acr_time:$_acr_now" in *[!0-9:]*|:*|*:) return 1;; esac
+    [ "$_acr_time" -le "$_acr_now" ] || return 1
+    if [ -z "$_acr_pid" ] && [ -z "$_acr_start" ] && [ -z "$_acr_nonce" ]; then
+        [ $((_acr_now - _acr_time)) -lt 8 ]
+        return
+    fi
+    case "$_acr_pid:$_acr_start" in
+        *[!0-9:]*|:*|*:|*::*) return 1;;
+    esac
+    case "$_acr_nonce" in
+        ''|*[!a-zA-Z0-9:_-]*) return 1;;
+    esac
+    [ $((_acr_now - _acr_time)) -le 30 ] || return 1
+    audio_pid_live "$_acr_pid" "$_acr_start"
+}
 audio_now() {
     _an_time=$(cut -d. -f1 "$AUDIO_UPTIME" 2>/dev/null) || return 1
     case "$_an_time" in ''|*[!0-9]*) return 1;; esac
@@ -38,13 +103,51 @@ audio_set_self() {
 audio_lock() {
     _al_path=$1
     _al_count=0
+    AUDIO_LOCK_WAITED=0
     while ! mkdir "$_al_path" 2>/dev/null; do
+        AUDIO_LOCK_WAITED=1
         if [ -s "$_al_path/owner" ]; then
-            read -r _al_pid _al_start <"$_al_path/owner" || return 1
+            _al_owner=$(audio_control_read "$_al_path/owner") || return 1
+            read -r _al_pid _al_start <<EOF
+$_al_owner
+EOF
             if ! audio_pid_live "$_al_pid" "$_al_start"; then
                 rm -f "$_al_path/owner"
                 rmdir "$_al_path" 2>/dev/null || true
             fi
+        elif [ "$_al_count" -ge 5 ] &&
+             { [ ! -e "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] ||
+               { [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
+                 [ ! -s "$_al_path/owner" ]; }; }; then
+            # A process killed between mkdir and publishing owner used to
+            # leave a permanent ownerless lock. Give the creator five
+            # scheduling intervals, then remove only temporary owner files
+            # whose writer is gone. A live creator is never disturbed.
+            for _al_tmp in "$_al_path"/owner.tmp.*; do
+                [ -e "$_al_tmp" ] || [ -L "$_al_tmp" ] || continue
+                _al_tmp_name=${_al_tmp##*/}
+                _al_tmp_suffix=${_al_tmp_name#owner.tmp.}
+                _al_tmp_pid=${_al_tmp_suffix%%.*}
+                _al_tmp_start=
+                case "$_al_tmp_suffix" in
+                    *.*) _al_tmp_start=${_al_tmp_suffix#*.};;
+                esac
+                case "$_al_tmp_pid" in
+                    ''|*[!0-9]*) continue;;
+                esac
+                if [ -n "$_al_tmp_start" ]; then
+                    audio_pid_live "$_al_tmp_pid" "$_al_tmp_start" ||
+                        rm -f "$_al_tmp"
+                else
+                    # Backward compatibility for a temp left by an older build.
+                    kill -0 "$_al_tmp_pid" 2>/dev/null || rm -f "$_al_tmp"
+                fi
+            done
+            if [ -f "$_al_path/owner" ] && [ ! -L "$_al_path/owner" ] &&
+               [ ! -s "$_al_path/owner" ]; then
+                rm -f "$_al_path/owner"
+            fi
+            rmdir "$_al_path" 2>/dev/null || true
         fi
         _al_count=$((_al_count + 1))
         [ "$_al_count" -lt 30 ] || return 1
@@ -53,27 +156,37 @@ audio_lock() {
     audio_set_self || return 1
     _al_start=$(audio_pid_start "$AUDIO_SELF_PID")
     [ -n "$_al_start" ] || { rmdir "$_al_path"; return 1; }
-    printf '%s %s\n' "$AUDIO_SELF_PID" "$_al_start" >"$_al_path/owner" || return 1
+    # Publish the complete owner record atomically. A contender used to be
+    # able to read a half-written "pid" line, treat it as stale, and steal a
+    # lock whose creator was still alive.
+    audio_write_control "$_al_path/owner" "$AUDIO_SELF_PID $_al_start" ||
+        { rmdir "$_al_path" 2>/dev/null || true; return 1; }
 }
 audio_unlock() {
     audio_set_self || return 1
-    [ "$(cat "$1/owner" 2>/dev/null)" = "$AUDIO_SELF_PID $(audio_pid_start "$AUDIO_SELF_PID")" ] || return 1
+    [ "$(audio_control_read "$1/owner")" = "$AUDIO_SELF_PID $(audio_pid_start "$AUDIO_SELF_PID")" ] || return 1
     rm -f "$1/owner" && rmdir "$1"
 }
 audio_trim_log() {
     _at_file=$1
     _at_max=${2:-65536}
-    [ -f "$_at_file" ] || return 0
+    audio_regular_file "$_at_file" || return 0
     _at_size=$(wc -c <"$_at_file" 2>/dev/null) || return 1
     [ "$_at_size" -gt "$_at_max" ] || return 0
     audio_set_self || return 1
     _at_identity="$AUDIO_SELF_PID $(audio_pid_start "$AUDIO_SELF_PID")"
     _at_owner="$_at_file.trim-owner.$AUDIO_SELF_PID"
-    printf '%s\n' "$_at_identity" >"$_at_owner" || return 1
+    rm -f "$_at_owner" || return 1
+    (set -C; printf '%s\n' "$_at_identity" >"$_at_owner") || return 1
     # A hard link publishes an initialized owner atomically. A killed
     # rotator cannot leave an ownerless directory that disables rotation.
     if ! ln "$_at_owner" "$_at_file.trim-lock" 2>/dev/null; then
-        read -r _at_pid _at_start <"$_at_file.trim-lock" 2>/dev/null || true
+        _at_lock_owner=$(audio_control_read "$_at_file.trim-lock") || _at_lock_owner=
+        _at_pid=
+        _at_start=
+        read -r _at_pid _at_start <<EOF
+$_at_lock_owner
+EOF
         if ! audio_pid_live "${_at_pid:-}" "${_at_start:-}"; then
             rm -f "$_at_file.trim-lock"
             ln "$_at_owner" "$_at_file.trim-lock" 2>/dev/null || { rm -f "$_at_owner"; return 0; }
@@ -83,15 +196,21 @@ audio_trim_log() {
     rm -f "$_at_owner"
     # Writers use O_APPEND. Keep the inode; rename leaves a hidden unbounded
     # file behind when a daemon still owns its stdout descriptor.
+    rm -f "$_at_file.trim"
     tail -c "$((_at_max / 2))" "$_at_file" >"$_at_file.trim" &&
         cat "$_at_file.trim" >"$_at_file"
     rm -f "$_at_file.trim"
-    [ "$(cat "$_at_file.trim-lock" 2>/dev/null)" != "$_at_identity" ] || rm -f "$_at_file.trim-lock"
+    [ "$(audio_control_read "$_at_file.trim-lock")" != "$_at_identity" ] || rm -f "$_at_file.trim-lock"
 }
 audio_voice_pending() {
-    _av_stamp=$(sed -n '1p' "${HK_AP2_RUN:-$RUN}/voice-owns" 2>/dev/null)
-    _av_now=$(audio_now) || return 1
-    case "$_av_stamp:$_av_now" in *[!0-9:]*|:*|*:) return 1;; esac
+    _av_path="${HK_AP2_RUN:-$RUN}/voice-owns"
+    if [ ! -e "$_av_path" ] && [ ! -L "$_av_path" ]; then return 1; fi
+    # A present but malformed ownership marker fails closed. It could be a
+    # torn/corrupted hand-off and must not silently grant the speaker to a
+    # lower-priority source.
+    _av_stamp=$(audio_control_read "$_av_path") || return 0
+    _av_now=$(audio_now) || return 0
+    case "$_av_stamp:$_av_now" in *[!0-9:]*|:*|*:) return 0;; esac
     [ "$_av_stamp" -le "$_av_now" ] && [ $((_av_now - _av_stamp)) -lt 300 ]
 }
 
@@ -101,9 +220,12 @@ audio_source() {
     else printf 'airplay\n'; fi
 }
 audio_read_lease() {
-    [ -s "$SAFE/lease" ] || return 1
-    read -r lease_source lease_pid lease_start lease_token lease_time lease_phase <"$SAFE/lease" || return 1
+    audio_regular_file "$SAFE/lease" && [ -s "$SAFE/lease" ] || return 1
+    read -r lease_source lease_pid lease_start lease_token lease_time \
+        lease_phase lease_extra <"$SAFE/lease" || return 1
+    [ -z "${lease_extra:-}" ] || return 1
     case "$lease_source" in airplay|bluetooth|voice) ;; *) return 1;; esac
+    case "$lease_pid:$lease_start" in *[!0-9:]*|:*|*:) return 1;; esac
     case "$lease_time:$lease_token" in *[!a-zA-Z0-9:_-]*|:*|*:) return 1;; esac
     case "$lease_time" in ''|*[!0-9]*) return 1;; esac
     case "$lease_phase" in priming|active|draining) ;; *) return 1;; esac
@@ -116,17 +238,24 @@ audio_voice_generation_valid() {
     [ "$(audio_source)" != voice ] && return 0
     [ -z "${HK_AUDIO_TOKEN:-}" ] && return 0
     _vg_run=${SAFE%/safe}
-    [ "$(cat "$_vg_run/current-voice-token" 2>/dev/null)" = "$HK_AUDIO_TOKEN" ] &&
-        [ "$(cat "$_vg_run/voice-token" 2>/dev/null)" = "$HK_AUDIO_TOKEN" ]
+    [ "$(audio_control_read "$_vg_run/current-voice-token")" = "$HK_AUDIO_TOKEN" ] &&
+        [ "$(audio_control_read "$_vg_run/voice-token")" = "$HK_AUDIO_TOKEN" ]
 }
 
 audio_reserve() {
     audio_voice_generation_valid || return 1
     _ar_source=$(audio_source)
     case "$_ar_source" in
-        bluetooth) _ar_pid=$(cat "$RUN/bt-owner.pid" 2>/dev/null);;
-        voice) _ar_pid=${HK_AP2_VOICE_OWNER:-$(cat "${HK_VOICE_RUN:-/tmp/hk-voice}/voice.pid" 2>/dev/null)};;
-        airplay) _ar_pid=$(cat "$RUN/shairport.pid" 2>/dev/null);;
+        bluetooth) _ar_pid=$(audio_control_read "$RUN/bt-owner.pid") || return 1;;
+        voice)
+            if [ -n "${HK_AP2_VOICE_OWNER:-}" ]; then
+                _ar_pid=$HK_AP2_VOICE_OWNER
+            else
+                _ar_pid=$(audio_control_read "${HK_VOICE_RUN:-/tmp/hk-voice}/voice.pid") ||
+                    return 1
+            fi
+            ;;
+        airplay) _ar_pid=$(audio_control_read "$RUN/shairport.pid") || return 1;;
     esac
     _ar_start=$(audio_pid_start "$_ar_pid")
     audio_pid_live "$_ar_pid" "$_ar_start" || return 1
@@ -136,6 +265,8 @@ audio_reserve() {
         audio_read_lease || return 1
         [ "$lease_source:$lease_pid:$lease_start" = "$_ar_source:$_ar_pid:$_ar_start" ] || return 1
         [ -z "${HK_AUDIO_TOKEN:-}" ] || [ "$lease_token" = "$HK_AUDIO_TOKEN" ] || return 1
+        [ -z "${HK_AUDIO_LEASE_TIME:-}" ] ||
+            [ "$lease_time" = "$HK_AUDIO_LEASE_TIME" ] || return 1
         return 0
     fi
     lease_source=$_ar_source
@@ -146,24 +277,25 @@ audio_reserve() {
     lease_time=$_ar_now
     lease_phase=priming
     audio_write_lease || return 1
-    printf '%s\n' "$_ar_now" >"$SAFE/play.started.tmp" &&
-        mv "$SAFE/play.started.tmp" "$SAFE/play.started"
+    audio_write_control "$SAFE/play.started" "$_ar_now"
 }
 audio_write_lease() {
-    printf '%s %s %s %s %s %s\n' "$lease_source" "$lease_pid" "$lease_start" \
-        "$lease_token" "$lease_time" "$lease_phase" >"$SAFE/lease.tmp" &&
-        mv "$SAFE/lease.tmp" "$SAFE/lease"
+    audio_write_control "$SAFE/lease" \
+        "$lease_source $lease_pid $lease_start $lease_token $lease_time $lease_phase"
 }
 audio_lease_is_caller() {
     audio_read_lease || return 1
     [ "$lease_source" = "$(audio_source)" ] || return 1
-    [ -z "${HK_AUDIO_TOKEN:-}" ] || [ "$lease_token" = "$HK_AUDIO_TOKEN" ]
+    [ -z "${HK_AUDIO_TOKEN:-}" ] ||
+        [ "$lease_token" = "$HK_AUDIO_TOKEN" ] || return 1
+    [ -z "${HK_AUDIO_LEASE_TIME:-}" ] ||
+        [ "$lease_time" = "$HK_AUDIO_LEASE_TIME" ] || return 1
 }
 audio_bt_bridge_live() {
-    [ -s "$SAFE/play.started" ] && audio_read_lease &&
+    audio_play_marker_live && audio_read_lease &&
         [ "$lease_source" = bluetooth ] || return 1
-    [ "$(cat "$RUN/bt-owner.pid" 2>/dev/null)" = "$lease_pid" ] || return 1
-    _ab_beat=$(cat "$RUN/bt-heartbeat" 2>/dev/null)
+    [ "$(audio_control_read "$RUN/bt-owner.pid")" = "$lease_pid" ] || return 1
+    _ab_beat=$(audio_control_read "$RUN/bt-heartbeat") || return 1
     _ab_now=$(audio_now) || return 1
     case "$_ab_beat:$_ab_now" in *[!0-9:]*|:*|*:) return 1;; esac
     [ "$_ab_beat" -le "$_ab_now" ] && [ $((_ab_now - _ab_beat)) -le 4 ]
@@ -213,4 +345,65 @@ audio_bt_clock_stopped() {
     _abc_owner=$(sed -n 's/^owner_pid[[:space:]]*:[[:space:]]*//p' "$_abc_pcm" 2>/dev/null)
     case "$_abc_owner" in ''|*[!0-9]*) return 1;; esac
     audio_bt_pcm_owned "$_abc_owner"
+}
+
+# The watchdog may carry a separate start identity so PID reuse cannot make an
+# unrelated process look like the live safety loop. Older installations only
+# have watchdog.pid; retain that form as a compatibility fallback.
+audio_watchdog_pid() {
+    _awp_identity_file="$SAFE/watchdog.identity"
+    if [ -e "$_awp_identity_file" ] || [ -L "$_awp_identity_file" ]; then
+        _awp_identity=$(audio_control_read "$_awp_identity_file") || return 1
+        read -r _awp_pid _awp_start _awp_extra <<EOF
+$_awp_identity
+EOF
+        [ -z "${_awp_extra:-}" ] || return 1
+        audio_pid_live "$_awp_pid" "$_awp_start" || return 1
+        printf '%s\n' "$_awp_pid"
+        return 0
+    fi
+    _awp_pid=$(audio_control_read "$SAFE/watchdog.pid") || return 1
+    case "$_awp_pid" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$_awp_pid" 2>/dev/null || return 1
+    printf '%s\n' "$_awp_pid"
+}
+
+audio_watchdog_live() {
+    _awl_pid=$(audio_watchdog_pid) || return 1
+    _awl_heartbeat=$(audio_control_read "$SAFE/watchdog.heartbeat") || return 1
+    _awl_now=$(audio_now) || return 1
+    case "$_awl_heartbeat:$_awl_now" in
+        *[!0-9:]*|:*|*:) return 1;;
+    esac
+    [ "$_awl_heartbeat" -le "$_awl_now" ] &&
+        [ $((_awl_now - _awl_heartbeat)) -le 4 ]
+}
+
+# A source hand-off can hold the speaker lock long enough for the watchdog's
+# four-second heartbeat window to expire even though its exact process is still
+# alive. Permit a bounded delay only while a real source transition exists;
+# active playback never receives this grace and must keep the strict heartbeat.
+audio_watchdog_transition_live() {
+    audio_watchdog_pid >/dev/null || return 1
+    _awtl_heartbeat=$(audio_control_read "$SAFE/watchdog.heartbeat") || return 1
+    _awtl_now=$(audio_now) || return 1
+    _awtl_grace=${HK_AP2_WATCHDOG_TRANSITION_GRACE_SECONDS:-15}
+    case "$_awtl_heartbeat:$_awtl_now:$_awtl_grace" in
+        *[!0-9:]*|:*|*:|*::*) return 1;;
+    esac
+    [ "$_awtl_grace" -ge 1 ] && [ "$_awtl_grace" -le 60 ] || return 1
+    [ "$_awtl_heartbeat" -le "$_awtl_now" ] &&
+        [ $((_awtl_now - _awtl_heartbeat)) -le "$_awtl_grace" ] ||
+        return 1
+
+    if audio_read_lease; then
+        case "$lease_phase" in
+            priming|draining) return 0;;
+            *) return 1;;
+        esac
+    fi
+    # AirPlay publishes a live claim before releasing Bluetooth and before its
+    # guard creates the priming lease. The claim's PID identity and 30-second
+    # cap prevent an abandoned file from extending the grace indefinitely.
+    audio_claim_recent "${HK_AP2_RUN:-$RUN}/ap2-claim"
 }

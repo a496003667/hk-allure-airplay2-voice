@@ -53,7 +53,16 @@ static int path_for(struct bt_pcm *p, const char *leaf, char path[256])
 static int exists(struct bt_pcm *p, const char *leaf)
 {
     char path[256];
-    return path_for(p, leaf, path) && access(path, F_OK) == 0;
+    struct stat st;
+    return path_for(p, leaf, path) && lstat(path, &st) == 0;
+}
+
+static int regular_exists(struct bt_pcm *p, const char *leaf)
+{
+    char path[256];
+    struct stat st;
+    return path_for(p, leaf, path) && lstat(path, &st) == 0 &&
+           S_ISREG(st.st_mode);
 }
 
 static int read_marker(struct bt_pcm *p, const char *leaf, char value[128])
@@ -176,10 +185,13 @@ static void close_slave(struct bt_pcm *p)
 static int voice_pending(struct bt_pcm *p)
 {
     char value[128];
-    if (read_marker(p, "voice-owns", value) < 0) return 0;
+    if (!exists(p, "voice-owns")) return 0;
+    /* A malformed ownership marker fails closed rather than silently
+     * granting the speaker to Bluetooth. */
+    if (read_marker(p, "voice-owns", value) < 0) return 1;
     uint64_t stamp = 0;
     for (const char *c = value; *c; ++c) {
-        if (*c < '0' || *c > '9' || stamp > UINT64_MAX / 10 - 10) return 0;
+        if (*c < '0' || *c > '9' || stamp > UINT64_MAX / 10 - 10) return 1;
         stamp = stamp * 10 + (unsigned)(*c - '0');
     }
     struct timespec now;
@@ -187,18 +199,59 @@ static int voice_pending(struct bt_pcm *p)
     return *value && stamp <= (uint64_t)now.tv_sec && (uint64_t)now.tv_sec - stamp < 300;
 }
 
-static int open_allowed(struct bt_pcm *p)
+static int decimal_token(const char *value)
+{
+    if (!value || !*value) return 0;
+    for (const char *c = value; *c; ++c)
+        if (*c < '0' || *c > '9') return 0;
+    return 1;
+}
+
+static int lease_token_valid(const char *value)
+{
+    if (!value || !*value) return 0;
+    for (const char *c = value; *c; ++c) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == ':' || *c == '_' || *c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int bluetooth_lease_allowed(struct bt_pcm *p)
 {
     char value[128];
-    if (!exists(p, "safe/armed") || exists(p, "safe/tripped") || exists(p, "ap2-claim") ||
-        voice_pending(p)) return 0;
+    if (!exists(p, "safe/lease")) return 1;
+    if (read_marker(p, "safe/lease", value) < 0) return 0;
+    char copy[128];
+    snprintf(copy, sizeof(copy), "%s", value);
+    char *save = NULL;
+    char *field[7] = {0};
+    unsigned count = 0;
+    for (char *part = strtok_r(copy, " \t\r\n", &save);
+         part && count < sizeof(field) / sizeof(field[0]);
+         part = strtok_r(NULL, " \t\r\n", &save))
+        field[count++] = part;
+    if (count != 6 || strcmp(field[0], "bluetooth") ||
+        !decimal_token(field[1]) || !decimal_token(field[2]) ||
+        !lease_token_valid(field[3]) || !decimal_token(field[4]) ||
+        (strcmp(field[5], "priming") && strcmp(field[5], "active") &&
+         strcmp(field[5], "draining")))
+        return 0;
+    return 1;
+}
+
+static int open_allowed(struct bt_pcm *p)
+{
+    if (!regular_exists(p, "safe/armed") ||
+        exists(p, "safe/tripped") || exists(p, "ap2-claim") ||
+        exists(p, "bt-release") || exists(p, "bt-wait-pcm") || voice_pending(p)) return 0;
     char hold[256];
     int n = snprintf(hold, sizeof(hold), "%.*s-hold-mute",
                      (int)strlen(p->run) - 4, p->run);
-    if (n <= 0 || n >= (int)sizeof(hold) || access(hold, F_OK) == 0) return 0;
-    if (!exists(p, "safe/lease")) return 1;
-    return read_marker(p, "safe/lease", value) == 0 &&
-           strncmp(value, "bluetooth ", 10) == 0;
+    struct stat hold_stat;
+    if (n <= 0 || n >= (int)sizeof(hold) || lstat(hold, &hold_stat) == 0) return 0;
+    return bluetooth_lease_allowed(p);
 }
 
 static int open_slave(struct bt_pcm *p)
@@ -271,9 +324,12 @@ static int transfer_blocked(struct bt_pcm *p)
 {
     char hold[256];
     snprintf(hold, sizeof(hold), "%.*s-hold-mute", (int)strlen(p->run) - 4, p->run);
-    return !exists(p, "safe/armed") || exists(p, "safe/tripped") ||
+    struct stat hold_stat;
+    return !regular_exists(p, "safe/armed") || exists(p, "safe/tripped") ||
            exists(p, "ap2-claim") || exists(p, "bt-release") ||
-           access(hold, F_OK) == 0 ||
+           exists(p, "bt-wait-pcm") ||
+           lstat(hold, &hold_stat) == 0 ||
+           !bluetooth_lease_allowed(p) ||
            (voice_pending(p) && !exists(p, "bt-owner.pid"));
 }
 

@@ -12,6 +12,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 COMMON = REPO / 'airplay2/hk-audio-common.sh'
 HOOK = REPO / 'airplay2/hk-ap2-audio-hook.sh'
+WATCHDOG = REPO / 'airplay2/runtime/hk-ap2-safe-test'
 
 
 class LifecycleTest(unittest.TestCase):
@@ -93,6 +94,15 @@ else: print('Front Left: Playback ['+s[k]+']')
             end=time.monotonic()+4
             while not (self.safe/'play.started').exists() and time.monotonic()<end: time.sleep(.01)
             if self.safe.exists():
+                lease = self.safe/'lease'
+                if not lease.exists():
+                    return
+                request = self.safe/'lease.request'
+                while not request.exists() and time.monotonic()<end: time.sleep(.01)
+                if not request.exists():
+                    return
+                token, nonce = (self.safe/'lease.request').read_text().split()
+                (self.safe/'lease.ack').write_text(token+' '+nonce+'\n')
                 # /proc/uptime reads and the real watchdog's rename never
                 # expose a truncated empty value to a concurrent reader.
                 clock_next = self.root/'clock.next'
@@ -114,7 +124,35 @@ else: print('Front Left: Playback ['+s[k]+']')
         self.assertLess(events.index('1 0,0'),events.index('Ext Spk off'))
         self.assertLess(events.index('Ext Spk off'),events.index('aml audio i2s mute on'))
         self.assertFalse((self.safe/'lease').exists())
-        self.assertNotIn('2 0,0',events,'normal stop must not toggle analog gain')
+        self.assertNotIn('2 0,0', events, 'normal stop must not toggle analog gain')
+
+    def test_repeated_stop_is_idempotent_and_leaves_no_lease(self):
+        self.start('voice')
+        self.assertEqual(self.call('stop').returncode, 0)
+        events_after_first = self.events.read_text()
+        result = self.call('stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.safe / 'lease').exists())
+        self.assertFalse((self.safe / 'play.started').exists())
+        self.assertGreaterEqual(
+            len(self.events.read_text().splitlines()),
+            len(events_after_first.splitlines()),
+        )
+
+    def test_airplay_stop_clears_only_its_wait_marker(self):
+        wait = self.run/'bt-wait-pcm'
+        pending = self.run/'bt-pause-pending'
+        wait.write_text('airplay-100\n')
+        pending.write_text('airplay-100\n')
+        self.assertEqual(self.call('stop').returncode, 0)
+        self.assertFalse(wait.exists())
+        self.assertFalse(pending.exists())
+
+        wait.write_text('backend-clock-stopped\n')
+        pending.write_text('airplay-other\n')
+        self.assertEqual(self.call('stop').returncode, 0)
+        self.assertEqual(wait.read_text(), 'backend-clock-stopped\n')
+        self.assertEqual(pending.read_text(), 'airplay-other\n')
 
     def test_ap2_resource_trip_preserves_valid_bluetooth(self):
         self.start('bluetooth')
@@ -157,6 +195,18 @@ else: print('Front Left: Playback ['+s[k]+']')
                 self.assertNotEqual(result.returncode,0)
                 self.assertEqual(self.events.read_text(),'')
                 self.assertTrue(lease.exists())
+        lease = self.safe / 'lease'
+        fields = lease.read_text().split()
+        fields[-1] = 'active'
+        lease.write_text(' '.join(fields) + '\n')
+        result = self.call('stop', env=self.env | {
+            'HK_AUDIO_TOKEN': 'new-generation',
+            'HK_AUDIO_LEASE_TIME': str(int(fields[4]) + 1),
+            'HK_AP2_REVERSE_STOP': '1',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.events.read_text(), '')
+        self.assertTrue(lease.exists())
 
     def test_reverse_stop_mutes_the_matching_active_airplay_lease(self):
         (self.run/'shairport.pid').write_text(str(os.getpid()))
@@ -164,7 +214,8 @@ else: print('Front Left: Playback ['+s[k]+']')
         shell += 'audio_reserve && lease_phase=active && audio_write_lease'
         env=self.env|{'HK_AUDIO_TOKEN':'current-generation','HK_AP2_REVERSE_STOP':'1'}
         subprocess.run(['sh','-c',shell],env=env,check=True,capture_output=True,text=True)
-        result=self.call('stop',env=env)
+        lease_time=(self.safe/'lease').read_text().split()[4]
+        result=self.call('stop',env=env|{'HK_AUDIO_LEASE_TIME':lease_time})
         self.assertEqual(result.returncode,0,result.stderr)
         events=self.events.read_text().splitlines()
         self.assertLess(events.index('1 0,0'),events.index('Ext Spk off'))
@@ -179,6 +230,25 @@ else: print('Front Left: Playback ['+s[k]+']')
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(self.events.read_text(),'')
         self.assertIn('new-generation',(self.safe/'lease').read_text())
+
+    def test_bluetooth_start_preserves_a_live_airplay_claim(self):
+        (self.run/'bt-owner.pid').write_text(str(os.getpid()))
+        (self.run/'bt-heartbeat').write_text('100')
+        start = subprocess.check_output(
+            ['sh','-c','. "$HK_AUDIO_COMMON"; audio_pid_start "$1"','sh',
+             str(os.getpid())],
+            env=self.env,
+            text=True,
+        ).strip()
+        claim = f'100 {os.getpid()} {start} {os.getpid()}-100'
+        (self.run/'ap2-claim').write_text(claim+'\n')
+        result = self.call('start', env=self.env | {
+            'HK_AP2_BT':'1', 'HK_AUDIO_TOKEN':'bt-token',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.run/'ap2-claim').read_text().strip(), claim)
+        self.assertIn('AirPlay start claim is active',
+                      (self.run/'hook.log').read_text())
 
     def test_bluetooth_mix_guard_borrows_its_original_lease(self):
         self.start('bluetooth')
@@ -200,6 +270,331 @@ else: print('Front Left: Playback ['+s[k]+']')
         self.assertNotEqual(result.returncode,0)
         self.assertTrue((lock/'owner').exists())
         self.assertEqual(self.events.read_text(),'')
+
+    def test_ownerless_lock_is_recovered_after_the_creation_grace(self):
+        lock = self.run / 'ownerless.lock'
+        lock.mkdir()
+        result = subprocess.run(
+            ['sh', '-c',
+             '. "$HK_AUDIO_COMMON"; audio_lock "$1"; rc=$?; '
+             'audio_unlock "$1" 2>/dev/null || true; exit "$rc"',
+             'sh', str(lock)],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_ownerless_lock_recovers_from_a_dead_writer_temp(self):
+        dead = subprocess.Popen(['sleep', '30'])
+        dead_pid = dead.pid
+        dead.kill()
+        dead.wait(timeout=3)
+
+        lock = self.run / 'dead-writer.lock'
+        lock.mkdir()
+        (lock / 'owner').touch()
+        (lock / f'owner.tmp.{dead_pid}').write_text('partial')
+        result = subprocess.run(
+            ['sh', '-c',
+             '. "$HK_AUDIO_COMMON"; audio_lock "$1"; rc=$?; '
+             'audio_unlock "$1" 2>/dev/null || true; exit "$rc"',
+             'sh', str(lock)],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_watchdog_identity_and_heartbeat_must_be_current(self):
+        shell = '. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; SAFE=$RUN/safe; audio_watchdog_live'
+
+        def live():
+            return subprocess.run(
+                ['sh', '-c', shell], env=self.env,
+                capture_output=True, text=True, timeout=3,
+            )
+
+        start = subprocess.check_output(
+            ['sh', '-c', '. "$HK_AUDIO_COMMON"; audio_pid_start "$1"',
+             'sh', str(os.getpid())],
+            env=self.env, text=True,
+        ).strip()
+        (self.safe / 'watchdog.identity').write_text(
+            f'{os.getpid()} {start}\n')
+        (self.safe / 'watchdog.heartbeat').write_text('100\n')
+        self.assertEqual(live().returncode, 0)
+        (self.safe / 'watchdog.heartbeat').write_text('101\n')
+        self.assertNotEqual(live().returncode, 0)
+        (self.safe / 'watchdog.heartbeat').write_text('95\n')
+        self.assertNotEqual(live().returncode, 0)
+        (self.safe / 'watchdog.identity').write_text(
+            f'{os.getpid()} {int(start) + 1}\n')
+        (self.safe / 'watchdog.heartbeat').write_text('100\n')
+        self.assertNotEqual(live().returncode, 0)
+
+    def test_watchdog_transition_grace_is_bounded_and_source_scoped(self):
+        shell = (
+            '. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; SAFE=$RUN/safe; '
+            'audio_watchdog_transition_live'
+        )
+
+        def transition_live():
+            return subprocess.run(
+                ['sh', '-c', shell], env=self.env,
+                capture_output=True, text=True, timeout=4,
+            )
+
+        start = subprocess.check_output(
+            ['sh', '-c', '. "$HK_AUDIO_COMMON"; audio_pid_start "$1"',
+             'sh', str(os.getpid())],
+            env=self.env, text=True,
+        ).strip()
+        (self.safe / 'watchdog.identity').write_text(
+            f'{os.getpid()} {start}\n')
+        (self.safe / 'watchdog.heartbeat').write_text('90\n')
+        (self.root / 'clock').write_text('100.00 0.00\n')
+        self.assertNotEqual(
+            transition_live().returncode, 0,
+            'a stale heartbeat without a source transition must fail',
+        )
+
+        lease = self.safe / 'lease'
+        lease.write_text(
+            f'airplay {os.getpid()} {start} prime 90 priming\n')
+        (self.safe / 'play.started').write_text('90\n')
+        self.assertEqual(transition_live().returncode, 0)
+        lease.write_text(
+            f'airplay {os.getpid()} {start} active 90 active\n')
+        self.assertNotEqual(
+            transition_live().returncode, 0,
+            'active playback must retain the strict heartbeat',
+        )
+        lease.write_text(
+            f'airplay {os.getpid()} {start} drain 90 draining\n')
+        self.assertEqual(transition_live().returncode, 0)
+
+        lease.unlink()
+        (self.safe / 'play.started').unlink()
+        (self.run / 'ap2-claim').write_text(
+            f'100 {os.getpid()} {start} claim-100\n')
+        self.assertEqual(transition_live().returncode, 0)
+        (self.safe / 'watchdog.heartbeat').write_text('84\n')
+        self.assertNotEqual(
+            transition_live().returncode, 0,
+            'the transition grace must have a hard upper bound',
+        )
+
+    def test_supervisor_distinguishes_dead_watchdog_from_a_transition_delay(self):
+        source = (REPO / 'airplay2/hk-ap2-prodctl').read_text()
+        function = 'watchdog_supervision_state() {' + source.split(
+            'watchdog_supervision_state() {', 1
+        )[1].split('\n}\n\nsupervisor_run() {', 1)[0] + '\n}\n'
+        shell = '. "$HK_AUDIO_COMMON"\nRUN=$HK_AP2_RUN\nSAFE=$RUN/safe\n' + function
+
+        def state():
+            return subprocess.run(
+                ['sh', '-c', shell + '\nwatchdog_supervision_state'],
+                env=self.env, capture_output=True, text=True, timeout=4,
+            )
+
+        start = subprocess.check_output(
+            ['sh', '-c', '. "$HK_AUDIO_COMMON"; audio_pid_start "$1"',
+             'sh', str(os.getpid())],
+            env=self.env, text=True,
+        ).strip()
+        (self.safe / 'watchdog.identity').write_text(
+            f'{os.getpid()} {start}\n')
+        (self.safe / 'watchdog.heartbeat').write_text('100\n')
+        self.assertEqual(state().stdout.strip(), 'live')
+
+        (self.root / 'clock').write_text('108.00 0.00\n')
+        (self.safe / 'watchdog.heartbeat').write_text('100\n')
+        (self.run / 'ap2-claim').write_text(
+            f'100 {os.getpid()} {start} claim-100\n')
+        self.assertEqual(state().stdout.strip(), 'transition')
+
+        (self.safe / 'lease').write_text(
+            f'airplay {os.getpid()} {start} active 100 active\n')
+        (self.safe / 'play.started').write_text('100\n')
+        self.assertEqual(state().stdout.strip(), 'stale')
+
+        (self.safe / 'watchdog.identity').write_text(
+            f'{os.getpid()} {int(start) + 1}\n')
+        self.assertEqual(state().stdout.strip(), 'dead')
+
+    def test_no_lease_reaper_defers_to_a_live_airplay_transition_claim(self):
+        source = (WATCHDOG).read_text()
+        function = 'mute_without_active_generation() {' + source.split(
+            'mute_without_active_generation() {', 1
+        )[1].split('\nread_lease_request() {', 1)[0]
+        shell = '''
+RUN=$HK_AP2_RUN
+SAFE=$RUN/safe
+HOLD_MUTE=$HK_AP2_HOLD_MUTE_FILE
+audio_claim_recent() { return 0; }
+state_lock() { echo unexpected-lock; return 0; }
+state_unlock() { :; }
+hard_mute() { echo unexpected-mute; }
+read_file() { :; }
+BT_OWNER=$RUN/bt-owner.pid
+BT_HEARTBEAT=$RUN/bt-heartbeat
+''' + function + '\nmute_without_active_generation\n'
+        result = subprocess.run(
+            ['sh', '-c', shell], env=self.env,
+            capture_output=True, text=True, timeout=4,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_lease_token_and_time_must_both_match_the_exact_generation(self):
+        start = subprocess.check_output(
+            ['sh', '-c', '. "$HK_AUDIO_COMMON"; audio_pid_start "$1"',
+             'sh', str(os.getpid())],
+            env=self.env, text=True,
+        ).strip()
+        lease = self.safe / 'lease'
+        lease.write_text(
+            f'bluetooth {os.getpid()} {start} token123 100 active\n'
+        )
+        script = '''
+. "$HK_AUDIO_COMMON"
+RUN=$HK_AP2_RUN
+SAFE=$RUN/safe
+audio_lease_is_caller
+'''
+        for token, lease_time, expected in (
+                ('wrong', '100', False),
+                ('token123', '99', False),
+                ('token123', '100', True)):
+            with self.subTest(token=token, lease_time=lease_time):
+                result = subprocess.run(
+                    ['sh', '-c', script], env=self.env | {
+                        'HK_AP2_BT': '1', 'HK_AUDIO_TOKEN': token,
+                        'HK_AUDIO_LEASE_TIME': lease_time,
+                    }, capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+        lease.write_text(
+            f'bluetooth {os.getpid()} {start} token123 100 active extra\n'
+        )
+        result = subprocess.run(
+            ['sh', '-c',
+             '. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; SAFE=$RUN/safe; audio_read_lease'],
+            env=self.env, capture_output=True, text=True, timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_watchdog_term_releases_speaker_lock_and_identity(self):
+        for name in ('lease', 'play.started', 'tripped', 'watchdog.identity'):
+            (self.safe / name).unlink(missing_ok=True)
+        (self.safe / 'watchdog.pid').write_text(str(os.getpid()))
+        (self.safe / 'watchdog.heartbeat').write_text('100')
+        (self.run / 'bt-owner.pid').write_text(str(os.getpid()))
+        (self.run / 'bt-heartbeat').write_text('100')
+        state = json.loads((self.root / 'mixer').read_text())
+        state.update({'1': '100,100', '2': '1,1', 'Ext Spk': 'off'})
+        (self.root / 'mixer').write_text(json.dumps(state))
+        result = self.call('reserve', env=self.env | {'HK_AP2_BT': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        watchdog = subprocess.Popen(
+            ['sh', str(REPO / 'airplay2/runtime/hk-ap2-safe-test'), '__watchdog'],
+            env=self.env | {
+                'HK_AP2_DIGITAL_SAFE': '192',
+                'HK_AP2_PLAYBACK_SAFE': '1',
+                'HK_AP2_BT_PLAYBACK_SAFE': '0',
+                'HK_AP2_MAX_PLAY_SECONDS': '0',
+            },
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 4
+            while not (self.safe / 'tripped').exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+        finally:
+            watchdog.terminate()
+            watchdog.wait(4)
+
+        self.assertFalse((self.run / 'speaker.lock').exists())
+        self.assertFalse((self.safe / 'watchdog.lock').exists())
+        self.assertFalse((self.safe / 'watchdog.identity').exists())
+        self.assertFalse((self.safe / 'watchdog.pid').exists())
+        self.assertFalse((self.safe / 'watchdog.heartbeat').exists())
+
+    def test_watchdog_installs_cleanup_before_acquiring_its_startup_lock(self):
+        loop = WATCHDOG.read_text().split('watchdog_loop() {', 1)[1].split(
+            '\nstatus() {', 1
+        )[0]
+        self.assertLess(loop.index("trap 'watchdog_cleanup' 0"),
+                        loop.index('audio_lock "$SAFE/watchdog.lock"'))
+        self.assertIn('[ -n "${watchdog_self_identity:-}" ]', loop)
+
+    def test_irregular_safety_markers_fail_closed_without_blocking(self):
+        armed = self.safe / 'armed'
+        fake_armed = self.root / 'fake-armed'
+        fake_armed.touch()
+        armed.unlink()
+        armed.symlink_to(fake_armed)
+        try:
+            result = self.call('reserve')
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            armed.unlink()
+            armed.touch()
+
+        hold = self.root / 'hold'
+        os.mkfifo(hold)
+        try:
+            result = self.call('reserve')
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            hold.unlink()
+
+        trip = self.safe / 'tripped'
+        trip.mkdir()
+        try:
+            result = self.call('reserve')
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            trip.rmdir()
+
+    def test_bluetooth_clock_stop_states_require_the_factory_owner(self):
+        (self.root / 'proc/42/comm').write_text('a01controller\n')
+        shell = '. "$HK_AUDIO_COMMON"; audio_bt_clock_stopped'
+        for state in ('XRUN', 'SETUP', 'PREPARED', 'PAUSED', 'SUSPENDED', 'DRAINING'):
+            with self.subTest(state=state):
+                (self.root / 'pcm').write_text(f'state: {state}\nowner_pid : 42\n')
+                result = subprocess.run(
+                    ['sh', '-c', shell], env=self.env,
+                    capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / 'pcm').write_text('closed\n')
+        result = subprocess.run(
+            ['sh', '-c', shell], env=self.env,
+            capture_output=True, text=True, timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for state, comm in (
+            ('RUNNING', 'a01controller'),
+            ('UNKNOWN', 'a01controller'),
+            ('XRUN', 'aplay'),
+        ):
+            with self.subTest(state=state, comm=comm):
+                (self.root / 'pcm').write_text(f'state: {state}\nowner_pid : 42\n')
+                (self.root / 'proc/42/comm').write_text(comm + '\n')
+                result = subprocess.run(
+                    ['sh', '-c', shell], env=self.env,
+                    capture_output=True, text=True, timeout=3,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_log_rotation_keeps_open_writer_inode_and_bounds_storage(self):
         log=self.root/'long.log'
@@ -237,10 +632,90 @@ else: print('Front Left: Playback ['+s[k]+']')
             time.sleep(.3)
             owner.terminate();owner.wait(3)
             deadline=time.monotonic()+5
-            while (self.safe/'play.started').exists() and time.monotonic()<deadline: time.sleep(.05)
+            actions=self.safe/'actions.log'
+            while ((self.safe/'play.started').exists() or
+                   'recoverable' not in
+                   (actions.read_text() if actions.exists() else '')) \
+                    and time.monotonic()<deadline:
+                time.sleep(.05)
             self.assertFalse((self.safe/'play.started').exists())
             self.assertFalse((self.safe/'tripped').exists(),'AP2 recovery must not leave a manual-mute latch')
-            self.assertIn('recoverable',(self.safe/'actions.log').read_text())
+            self.assertIn('recoverable',actions.read_text())
+        finally:
+            if owner.poll() is None: owner.kill();owner.wait()
+            (self.safe/'armed').unlink(missing_ok=True)
+            if watchdog:
+                try: watchdog.wait(3)
+                except subprocess.TimeoutExpired: watchdog.kill();watchdog.wait()
+
+    def test_optional_airplay_already_exited_before_watchdog_sample_is_recoverable(self):
+        owner=subprocess.Popen(['sleep','30'])
+        watchdog=None
+        try:
+            (self.run/'shairport.pid').write_text(str(owner.pid))
+            reserve='. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; SAFE=$RUN/safe; audio_reserve'
+            result=subprocess.run(['sh','-c',reserve],env=self.env,
+                                  capture_output=True,text=True,timeout=3)
+            self.assertEqual(result.returncode,0,result.stderr)
+            owner.terminate();owner.wait(3)
+            self.assertTrue((self.safe/'lease').exists())
+            (self.safe/'lease.request').write_text('airplay-request request-1\n')
+            (self.safe/'lease.ack').write_text('stale ack\n')
+            watchdog=subprocess.Popen(
+                ['sh',str(REPO/'airplay2/runtime/hk-ap2-safe-test'),'__watchdog'],
+                env=self.env|{'HK_AP2_MAX_PLAY_SECONDS':'0'},
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            deadline=time.monotonic()+5
+            actions=self.safe/'actions.log'
+            expected='AP2 stream process ended; hard mute (recoverable)'
+            while ((self.safe/'play.started').exists() or
+                   (self.safe/'lease').exists() or
+                   expected not in (actions.read_text() if actions.exists() else '')) \
+                    and time.monotonic()<deadline:
+                time.sleep(.05)
+            self.assertFalse((self.safe/'play.started').exists())
+            self.assertFalse((self.safe/'lease').exists())
+            self.assertFalse((self.safe/'lease.request').exists())
+            self.assertFalse((self.safe/'lease.ack').exists())
+            self.assertFalse(
+                (self.safe/'tripped').exists(),
+                (self.safe/'tripped').read_text() if (self.safe/'tripped').exists() else '',
+            )
+            self.assertIn(expected, actions.read_text())
+        finally:
+            if owner.poll() is None: owner.kill();owner.wait()
+            (self.safe/'armed').unlink(missing_ok=True)
+            if watchdog:
+                try: watchdog.wait(3)
+                except subprocess.TimeoutExpired: watchdog.kill();watchdog.wait()
+
+    def test_release_intent_finishes_a_play_marker_removed_before_lease(self):
+        owner=subprocess.Popen(['sleep','30'])
+        watchdog=None
+        try:
+            (self.run/'shairport.pid').write_text(str(owner.pid))
+            reserve='. "$HK_AUDIO_COMMON"; RUN=$HK_AP2_RUN; SAFE=$RUN/safe; audio_reserve'
+            result=subprocess.run(['sh','-c',reserve],env=self.env,
+                                  capture_output=True,text=True,timeout=3)
+            self.assertEqual(result.returncode,0,result.stderr)
+            fields=(self.safe/'lease').read_text().split()
+            (self.run/'release-intent').write_text(
+                f'{fields[0]} {fields[3]} {fields[4]}\n')
+            (self.safe/'play.started').unlink()
+            watchdog=subprocess.Popen(
+                ['sh',str(REPO/'airplay2/runtime/hk-ap2-safe-test'),'__watchdog'],
+                env=self.env|{'HK_AP2_MAX_PLAY_SECONDS':'0'},
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            deadline=time.monotonic()+5
+            actions=self.safe/'actions.log'
+            expected='source release in progress; hard mute (recoverable)'
+            while ((self.safe/'lease').exists() or
+                   expected not in (actions.read_text() if actions.exists() else '')) \
+                    and time.monotonic()<deadline:
+                time.sleep(.05)
+            self.assertFalse((self.safe/'lease').exists())
+            self.assertFalse((self.safe/'tripped').exists())
+            self.assertIn(expected, actions.read_text())
         finally:
             if owner.poll() is None: owner.kill();owner.wait()
             (self.safe/'armed').unlink(missing_ok=True)
@@ -288,6 +763,14 @@ mx_get() { "$HK_AP2_AMIXER" -c 0 sget "$1" | sed -n 's/.*\\[\\(on\\|off\\)\\].*/
                     observed.append(True)
                     (self.root / 'pcm').write_text('state: RUNNING\nowner_pid : 42\n')
                     (self.root / 'clock').write_text('101.00 0.00\n')
+                    request = self.safe / 'lease.request'
+                    end = time.monotonic() + 4
+                    while not request.exists() and time.monotonic() < end:
+                        time.sleep(.01)
+                    if not request.exists():
+                        return
+                    token, nonce = (self.safe / 'lease.request').read_text().split()
+                    (self.safe / 'lease.ack').write_text(token + ' ' + nonce + '\n')
                     (self.safe / 'watchdog.heartbeat').write_text('101')
                     return
         thread = threading.Thread(target=bridge_and_watchdog)
@@ -459,6 +942,13 @@ fi
                         self.assertLess(time.monotonic(), deadline)
                         time.sleep(.02)
                     self.assertEqual((self.safe / 'tripped').read_text().strip(), 'analog baseline changed')
+                    action_log = self.safe / 'actions.log'
+                    while not (
+                        action_log.exists() and
+                        'analog baseline changed; hard mute' in action_log.read_text()
+                    ):
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.02)
                     self.assertFalse(any(s.startswith('2 ') for s in self.events.read_text().splitlines()))
                 finally:
                     watchdog.terminate()

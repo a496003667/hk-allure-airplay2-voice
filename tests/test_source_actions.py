@@ -67,7 +67,7 @@ esac
         queue=self.root/'queues';queue.mkdir()
         marker=self.root/'current'
         functions='voice_round_current() {'+VOICE.split('voice_round_current() {',1)[1].split('\nrun_round()',1)[0]
-        shell='audio_now() { echo 100; };\n'+functions+'''
+        shell='. "$HK_AUDIO_COMMON"; audio_now() { echo 100; };\n'+functions+'''
 new_round_queue || exit 1
 old=$QD
 printf old >"$QD/q.1.raw"
@@ -77,9 +77,32 @@ test -d "$QD" || exit 3
 test "$(cat "$VOICE_CURRENT")" = "$HK_AUDIO_TOKEN" || exit 4
 '''
         env=self.env|{'QUEUE_ROOT':str(queue),'QD':str(queue),'RUN':str(self.root),
-            'VOICE_CURRENT':str(marker),'PIDFILE':str(self.root/'absent-pid')}
+            'VOICE_CURRENT':str(marker),'PIDFILE':str(self.root/'absent-pid'),
+            'HK_AUDIO_COMMON':str(ROOT/'airplay2/hk-audio-common.sh'),
+            'HK_AUDIO_UPTIME_FILE':str(self.root/'clock')}
+        (self.root/'clock').write_text('100.00 0.00\n')
         result=subprocess.run(['sh','-c',shell],env=env,capture_output=True,text=True,timeout=4)
         self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_voice_respects_a_live_structured_airplay_claim(self):
+        claim=self.root/'ap2-claim'
+        function='ap2_claimed() {'+VOICE.split('ap2_claimed() {',1)[1].split('\n# Drop voice-owns',1)[0]
+        env=self.env|{'HK_AUDIO_COMMON':str(ROOT/'airplay2/hk-audio-common.sh'),
+                      'HK_AUDIO_UPTIME_FILE':str(self.root/'clock'),
+                      'AP2_CLAIM':str(claim)}
+        (self.root/'clock').write_text('100.00 0.00\n')
+        start=subprocess.check_output(
+            ['sh','-c','. "$HK_AUDIO_COMMON"; audio_pid_start "$1"','sh',str(os.getpid())],
+            env=env,text=True).strip()
+        claim.write_text(f'100 {os.getpid()} {start} claim-1\n')
+        result=subprocess.run(['sh','-c','. "$HK_AUDIO_COMMON"; '+function+'\nap2_claimed'],
+                              env=env,capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+        claim.write_text('100 999999999 1 dead-claim\n')
+        result=subprocess.run(['sh','-c','. "$HK_AUDIO_COMMON"; '+function+'\nap2_claimed'],
+                              env=env,capture_output=True,text=True,timeout=3)
+        self.assertNotEqual(result.returncode,0)
 
     def test_abort_has_priority_over_queued_bluetooth_reply(self):
         queue=self.root/'queue';queue.mkdir()
@@ -94,6 +117,72 @@ test "$(cat "$VOICE_CURRENT")" = "$HK_AUDIO_TOKEN" || exit 4
         self.assertTrue((inject/'abort').exists())
         self.assertTrue((queue/'aborted').exists())
         self.assertFalse((queue/'q.1.raw').exists())
+
+    def run_release_airplay(self, replacement=False):
+        source=(ROOT/'voice/hk-voice.sh').read_text()
+        function='release_airplay() {'+source.split('release_airplay() {',1)[1].split(
+            '\n# Bluetooth also holds',1)[0]
+        lease=self.root/'lease'
+        lease.write_text('airplay 42 1 token123 100 active\n')
+        calls=self.root/'hook-calls'
+        self.script('release-hook',f'''#!/bin/sh
+printf '%s %s\\n' "$HK_AUDIO_TOKEN" "$HK_AUDIO_LEASE_TIME" >>"{calls}"
+if [ "${{REPLACE_LEASE:-0}}" = 1 ]; then
+  printf 'airplay 42 1 token123 101 active\\n' >"{lease}"
+else
+  rm -f "{lease}"
+fi
+''')
+        self.script('release-mqtt',f'#!/bin/sh\necho "$*" >>"{self.log}"\n')
+        shell=function+'''
+log() { :; }
+airplay_owns_dac() { return 0; }
+release_airplay
+rc=$?
+printf '%s\\n' "$PAUSED"
+exit "$rc"
+'''
+        env=self.env|{
+            'HK_AUDIO_COMMON':str(ROOT/'airplay2/hk-audio-common.sh'),
+            'HK_AP2_RUN':str(self.root/'run'),
+            'LEASE_FILE':str(lease),
+            'HOOK':str(self.root/'release-hook'),
+            'HOOK_ENV':'',
+            'MQTT':str(self.root/'release-mqtt'),
+            'RELEASE':str(self.root/'release-dac'),
+            'PAUSED':'0',
+            'RELEASED':'0',
+            'BT_OWNER':str(self.root/'bt-owner.pid'),
+            'AP2_CLAIM':str(self.root/'ap2-claim'),
+            'REPLACE_LEASE':'1' if replacement else '0',
+        }
+        prefix='''. "$HK_AUDIO_COMMON"
+audio_read_lease() {
+[ -r "$LEASE_FILE" ] || return 1
+IFS=' ' read -r lease_source lease_pid lease_start lease_token lease_time lease_phase <"$LEASE_FILE"
+[ -n "${lease_token:-}" ]
+}
+'''
+        result=subprocess.run(['sh','-c',prefix+shell],env=env,
+                              capture_output=True,text=True,timeout=4)
+        return result,calls,lease
+
+    def test_voice_airplay_release_uses_the_exact_observed_generation(self):
+        result,calls,_=self.run_release_airplay()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(calls.read_text().strip(),'token123 100')
+        self.assertEqual(result.stdout.strip(),'1')
+        self.assertTrue((self.root/'release-dac').exists())
+        self.assertEqual(self.log.read_text().strip(),'hk-ap2/remote pause')
+
+    def test_replacement_airplay_generation_survives_an_old_voice_release(self):
+        result,calls,lease=self.run_release_airplay(replacement=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(calls.read_text().strip(),'token123 100')
+        self.assertEqual(lease.read_text().split()[4],'101')
+        self.assertEqual(result.stdout.strip(),'0')
+        self.assertFalse((self.root/'release-dac').exists())
+        self.assertEqual(self.log.read_text(),'')
 
 
 if __name__=='__main__': unittest.main()
